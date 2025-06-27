@@ -304,7 +304,6 @@ def plot_particle_trajectories_with_histograms(
         
         for label_tuple in all_labels:
             label = label_tuple[1]
-            print(label)
             if observation_cpu is None and 'Observation' in label:
                 continue
                 

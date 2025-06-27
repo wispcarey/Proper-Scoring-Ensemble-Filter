@@ -24,3 +24,7 @@ env/
 
 # Ignore JetBrains IDE project-specific settings
 .idea/
+
+# Ignore HPC job output and error files
+*.err
+*.out

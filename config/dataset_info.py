@@ -15,7 +15,8 @@ DATASET_INFO = {
         'batch_size': 1024,
         'train_steps': 60,
         'train_traj_num': 8192,
-        'sigma_ens': 0.1,
+        'sigma_ens': 1,
+        'sigma_v': 0,
         'colorbar_range': None,
     },
     'lorenz96': {
@@ -33,6 +34,7 @@ DATASET_INFO = {
         'train_steps': 60,
         'train_traj_num': 8192,
         'sigma_ens': 1,
+        'sigma_v': 0,
         'colorbar_range': (-10,15),
     },
     'ks': {
@@ -50,6 +52,21 @@ DATASET_INFO = {
         'train_steps': 60,
         'train_traj_num': 8192,
         'sigma_ens': 1,
+        'sigma_v': 0,
         'colorbar_range': (-6,6)
-    }
+    },
+    'linear': {
+        'dim': 20,
+        'obs_dim': 10,
+        'test_steps': 100,
+        'test_traj_num': 64,
+        'hidden_dim': 64,
+        'learning_rate': 1e-3, 
+        'batch_size': 1024,
+        'train_steps': 60,
+        'train_traj_num': 8192,
+        'sigma_ens': 1,
+        'sigma_v': 1e-2,
+        'sigma_y': 1,
+    },
 }

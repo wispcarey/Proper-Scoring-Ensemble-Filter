@@ -8,7 +8,7 @@ from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
 from utils import partial_obs_operator, get_dataloader, redirect_output
 
-from train_test_utils import test_model, set_models
+from train_test_utils import test_model, set_models, print_test_results
 
 
 if __name__ == "__main__":
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     folder_name = os.path.dirname(args.cp_load_path)
     
     # redirect output
-    with redirect_output(folder_name, filename="test_output.txt"):
+    with redirect_output(save_output=not args.normal_output, save_folder=args.save_folder, filename="test_output.txt"):
         if args.seed is not None and args.seed != "None":
             torch.manual_seed(int(args.seed))
 
@@ -33,14 +33,6 @@ if __name__ == "__main__":
         
         # print test information
         print(f"Test on {args.test_traj_num} trajectories with the length {args.test_steps} and ensemble size {args.N}. Observation noise sigma_y={args.sigma_y}.")
-        
-        # EnKF
-        # print("Original EnKF with localization")
-
-        # mean_rmse_enkf, std_rmse_enkf, mean_rmv_enkf, std_rmv_enkf, no_nan_percent_enkf = test_SequentialEnKF(test_loader, args, infl=1.09, H_info=H_info, localization=False)
-        # print(f"RMSE: {mean_rmse_enkf:.3f} ± {std_rmse_enkf:.3f}")
-        # print(f"RMV: {mean_rmv_enkf:.3f} ± {std_rmv_enkf:.3f}")
-        # print(f'No NAN Percentage: {no_nan_percent_enkf * 100: .2f}%')
 
         # set model
         model_list = set_models(args)
@@ -55,41 +47,31 @@ if __name__ == "__main__":
 
         # test
         print("Test NN Results")
-        loss_list_nn = []
-        mean_rmse_nn, std_rmse_nn, mean_rmv_nn, std_rmv_nn, mean_rrmse_nn, std_rrmse_nn, mean_crps_nn, std_crps_nn, no_nan_percent_nn, loc_tensor = \
-            test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}', save_pdf=True)
-        print(f"RMSE: {mean_rmse_nn:.3f} ± {std_rmse_nn:.3f}")
-        print(f"RRMSE: {mean_rrmse_nn:.3f} ± {std_rrmse_nn:.3f}")
-        print(f"RMV: {mean_rmv_nn:.3f} ± {std_rmv_nn:.3f}")
-        print(f"CRPS: {mean_crps_nn:.3f} ± {std_crps_nn:.3f}")
-        print(f'No NAN Percentage: {no_nan_percent_nn * 100: .2f}%')
+        test_results = test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/ft_test_{args.N}_0', save_pdf=False)
+        print_test_results(test_results)
         
+        loc_tensor= test_results['loc_tensor']
         if args.no_localization:
             loc_mean = loc_tensor
             loc_std = loc_tensor
         else:
             loc_mean = torch.mean(loc_tensor, dim=(0,1)) 
             loc_std = torch.std(loc_tensor, dim=(0,1)) 
-            
+        
         # save results
         tensor_dict = {
-            # 'enkf':{
-            #     'mean_rmse':mean_rmse_enkf,
-            #     'std_rmse':std_rmse_enkf,
-            #     'mean_rmv':mean_rmv_enkf,
-            #     'std_rmv':std_rmv_enkf,
-            #     'valid_percent':no_nan_percent_enkf,
-            # },
             'nn':{
-                'mean_rmse':mean_rmse_nn,
-                'std_rmse':std_rmse_nn,
-                'mean_rrmse':mean_rrmse_nn,
-                'std_rrmse':std_rrmse_nn,
-                'mean_rmv':mean_rmv_nn,
-                'std_rmv':std_rmv_nn,
-                'mean_crps':mean_crps_nn,
-                'std_crps':std_crps_nn,
-                'valid_percent':no_nan_percent_nn,
+                'mean_rmse':test_results['mean_rmse'],
+                'std_rmse':test_results['std_rmse'],
+                'mean_rrmse':test_results['mean_rrmse'],
+                'std_rrmse':test_results['std_rrmse'],
+                'mean_rmv':test_results['mean_rmv'],
+                'std_rmv':test_results['mean_rmv'],
+                'mean_crps':test_results['mean_crps'],
+                'std_crps':test_results['std_crps'],
+                'mean_rcrps':test_results['mean_rcrps'],
+                'std_rcrps':test_results['std_rcrps'],
+                'valid_percent':test_results['no_nan_percent'],
                 'loc_mean':loc_mean,
                 'loc_std':loc_std,
                 'loc_diff_dist':args.diff_dist,

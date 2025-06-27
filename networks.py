@@ -1,35 +1,6 @@
 import torch
 import torch.nn as nn
 
-class MLP_L63(nn.Module):
-    def __init__(self, d, latent_dim):
-        super(MLP_L63, self).__init__()
-        self.d = d
-        self.latent_dim = latent_dim
-
-        self.layer1 = nn.Linear(2 * d, latent_dim)
-        self.layer2 = nn.Linear(latent_dim, latent_dim)
-        # self.layer3 = nn.Linear(latent_dim, latent_dim)
-        self.layer4 = nn.Linear(latent_dim, d)
-
-        self.relu = nn.ReLU()
-
-    # def init_weights(self, m):
-    #     if isinstance(m, nn.Linear):
-    #         if m == self.layer4:
-    #             nn.init.zeros_(m.weight)
-    #             nn.init.zeros_(m.bias)
-    #         else:
-    #             nn.init.normal_(m.weight, mean=0, std=1e-4)
-    #             nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        out = self.relu(self.layer1(x))
-        out = self.relu(self.layer2(out))
-        # out = self.relu(self.layer3(out))
-        out = self.layer4(out)
-        return out
-
 class Simple_MLP(nn.Module):
     def __init__(self, d_input, d_output, latent_dim=64, num_hidden_layers=2):
         super(Simple_MLP, self).__init__()
@@ -60,134 +31,7 @@ class NaiveNetwork(nn.Module):
 
     def forward(self, v):
         return torch.zeros(v.shape[0], self.d).to(v.device)
-    
-class AttentionModel(nn.Module):
-    def __init__(self, input_dim, output_dim, num_attention_layers=1, hidden_dim=64):
-        super(AttentionModel, self).__init__()
-        # Input linear layer
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        # Variable number of attention layers
-        self.attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4)
-            for _ in range(num_attention_layers)
-        ])
-        # Additional fully connected layers
-        self.fc2 = nn.Linear(hidden_dim, 32)
-        self.fc3 = nn.Linear(32, output_dim)
-        self.relu = nn.ReLU()
-        # Initialize weights
-        self._init_weights()
 
-    def _init_weights(self):
-        # Initialize weights for linear layers
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.fc1.bias, 0)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.fc2.bias, 0)
-        nn.init.normal_(self.fc3.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.fc3.bias, 0)
-        # Initialize weights for attention layers
-        for attention in self.attention_layers:
-            nn.init.normal_(attention.in_proj_weight, mean=0.0, std=1e-3)
-            nn.init.constant_(attention.in_proj_bias, 0)
-            nn.init.normal_(attention.out_proj.weight, mean=0.0, std=1e-3)
-            nn.init.constant_(attention.out_proj.bias, 0)
-
-    def forward(self, x):
-        # Apply the first linear layer and activation
-        x = self.relu(self.fc1(x))
-        # Prepare for attention layers (requires sequence dimension)
-        x = x.unsqueeze(0)  # Shape: [1, batch_size, hidden_dim]
-        # Apply each attention layer
-        for attention in self.attention_layers:
-            x, _ = attention(x, x, x)
-        # Remove the sequence dimension
-        x = x.squeeze(0)  # Shape: [batch_size, hidden_dim]
-        # Apply the remaining fully connected layers
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
-    
-class ComplexAttentionModel(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(ComplexAttentionModel, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, 32)
-        
-        self.attention1 = nn.MultiheadAttention(embed_dim=32, num_heads=2)
-        self.attention2 = nn.MultiheadAttention(embed_dim=32, num_heads=2)
-
-        self.fc4 = nn.Linear(32, 16)
-        self.fc5 = nn.Linear(16, output_dim)
-        
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.1)
-        self.norm = nn.LayerNorm(32)
-    
-    def _init_weights(self):
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.fc3.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.fc4.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.fc5.weight, mean=0.0, std=1e-3)
-        
-        nn.init.constant_(self.fc1.bias, 0)
-        nn.init.constant_(self.fc2.bias, 0)
-        nn.init.constant_(self.fc3.bias, 0)
-        nn.init.constant_(self.fc4.bias, 0)
-        nn.init.constant_(self.fc5.bias, 0)
-
-        nn.init.normal_(self.attention1.in_proj_weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.attention1.out_proj.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.attention2.in_proj_weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.attention2.out_proj.weight, mean=0.0, std=1e-3)
-
-    def forward(self, x):
-        x = self.relu(self.fc1(x))  
-        x = self.relu(self.fc2(x))  
-        x = self.dropout(x)  
-        x = self.relu(self.fc3(x))  
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention1(x, x, x)
-        x = self.norm(x)
-        x, _ = self.attention2(x, x, x)
-        x = self.norm(x)
-        x = x.squeeze(0)
-
-        x = self.relu(self.fc4(x))
-        x = self.fc5(x)
-        return x
-
-# class MAB(nn.Module):
-#     """
-#     Multihead Attention Block (MAB)
-#     """
-#     def __init__(self, dim_Q, dim_KV, num_heads):
-#         super(MAB, self).__init__()
-#         self.dim_V = dim_Q  # Output dimension matches the query dimension
-#         self.multihead_attn = nn.MultiheadAttention(embed_dim=self.dim_V, num_heads=num_heads)
-#         self.ln1 = nn.LayerNorm(self.dim_V)
-#         self.ln2 = nn.LayerNorm(self.dim_V)
-#         self.ffn = nn.Sequential(
-#             nn.Linear(self.dim_V, self.dim_V),
-#             nn.ReLU(),
-#             nn.Linear(self.dim_V, self.dim_V)
-#         )
-
-#     def forward(self, Q, K):
-#         # Q, K: [batch_size, N, dim]
-#         Q_norm = self.ln1(Q)
-#         K_norm = self.ln1(K)
-#         Q_norm = Q_norm.transpose(0, 1)  # Convert to [N, batch_size, dim]
-#         K_norm = K_norm.transpose(0, 1)
-#         attn_output, _ = self.multihead_attn(Q_norm, K_norm, K_norm)
-#         attn_output = attn_output.transpose(0, 1)  # Convert back to [batch_size, N, dim]
-#         H = Q + attn_output  # Residual connection
-#         H_norm = self.ln2(H)
-#         H = H + self.ffn(H_norm)  # Residual connection
-#         return H
 
 class MAB(nn.Module):
     """
@@ -303,106 +147,224 @@ class SetTransformer(nn.Module):
         output = self.fc_out(H)
         return output
 
-class TransformerBlock(nn.Module):
+class CustomTransformerBlock(nn.Module):
     """
-    Standard Transformer Block without positional encoding.
-    """
-    def __init__(self, dim, num_heads, dim_feedforward):
-        super(TransformerBlock, self).__init__()
-        self.self_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads)
-        self.linear1 = nn.Linear(dim, dim_feedforward)
-        self.dropout = nn.Dropout(p=0.1)  # Adjusted dropout
-        self.linear2 = nn.Linear(dim_feedforward, dim)
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)  # Adjusted eps value
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)  # Adjusted eps value
-        self.dropout1 = nn.Dropout(p=0.1)  # Adjusted dropout
-        self.dropout2 = nn.Dropout(p=0.1)  # Adjusted dropout
-        self.activation = nn.GELU()  # ReLU replaced with GELU
-
-    def forward(self, src):
-        # src shape: [N, batch_size, dim]
-        src2, _ = self.self_attn(src, src, src)
-        src = src + 0.1 * self.dropout1(src2)  # Scaled residual connection
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + 0.1 * self.dropout2(src2)  # Scaled residual connection
-        src = self.norm2(src)
-        return src
-
-class EquivariantTransformer(nn.Module):
-    """
-    Transformer model that maps input tensors of shape [batch_size, N, D_1] to output tensors of shape [batch_size, N, D_2].
-    """
-    def __init__(self, input_dim, output_dim, num_heads, num_layers, dim_feedforward, hidden_dim):
-        super(EquivariantTransformer, self).__init__()
-        self.embedding = nn.Linear(input_dim, hidden_dim)
-        self.layers = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, dim_feedforward)
-            for _ in range(num_layers)
-        ])
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, X):
-        # X: [batch_size, N, input_dim]
-        H = self.embedding(X)  # [batch_size, N, hidden_dim]
-        H = H.transpose(0, 1)  # Transpose to [N, batch_size, hidden_dim]
-        for layer in self.layers:
-            H = layer(H)
-        H = H.transpose(0, 1)  # Back to [batch_size, N, hidden_dim]
-        output = self.fc_out(H)  # [batch_size, N, output_dim]
-        return output
+    Custom Transformer Block with self-attention and cross-attention
     
+    Architecture:
+    u_1 = LayerNorm_1(u + SelfAttention(u))
+    u_2 = LayerNorm_2(u_1 + FeedForward(u_1))
+    u_3 = LayerNorm_3(u_2 + CrossAttention(u_2, [y]))
+    output = LayerNorm_4(u_3 + FeedForward(u_3))
+    """
+    def __init__(self, u_dim, y_dim, hidden_dim=None, num_heads=8, ff_expansion=4):
+        super(CustomTransformerBlock, self).__init__()
+        
+        self.u_dim = u_dim
+        self.y_dim = y_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else u_dim
+        self.num_heads = num_heads
+        
+        # Ensure dimension is divisible by number of heads
+        assert self.hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        
+        # Input projection layers (if u_dim != hidden_dim)
+        self.u_projection = nn.Linear(u_dim, self.hidden_dim) if u_dim != self.hidden_dim else nn.Identity()
+        self.y_projection = nn.Linear(y_dim, self.hidden_dim) if y_dim != self.hidden_dim else nn.Identity()
+        
+        # Self-attention mechanism
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        
+        # Cross-attention mechanism
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        
+        # Feed-forward networks
+        ff_hidden_dim = self.hidden_dim * ff_expansion
+        self.feed_forward_1 = nn.Sequential(
+            nn.Linear(self.hidden_dim, ff_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(ff_hidden_dim, self.hidden_dim)
+        )
+        
+        self.feed_forward_2 = nn.Sequential(
+            nn.Linear(self.hidden_dim, ff_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(ff_hidden_dim, self.hidden_dim)
+        )
+        
+        # Layer Normalization layers
+        self.layer_norm_1 = nn.LayerNorm(self.hidden_dim)
+        self.layer_norm_2 = nn.LayerNorm(self.hidden_dim)
+        self.layer_norm_3 = nn.LayerNorm(self.hidden_dim)
+        self.layer_norm_4 = nn.LayerNorm(self.hidden_dim)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize network weights"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.bias, 0)
+                nn.init.constant_(module.weight, 1.0)
+    
+    def forward(self, u, y):
+        """
+        Forward pass
+        
+        Args:
+            u: Input sequence [batch_size, seq_len, u_dim]
+            y: Single vector [batch_size, y_dim] or [batch_size, 1, y_dim]
+            
+        Returns:
+            output: [batch_size, seq_len, hidden_dim]
+        """
+        batch_size = u.size(0)
+        seq_len = u.size(1)
+        
+        # Project to unified dimension
+        u_proj = self.u_projection(u)  # [batch_size, seq_len, hidden_dim]
+        
+        # Handle y dimension: ensure y is [batch_size, 1, hidden_dim]
+        if y.dim() == 2:
+            y = y.unsqueeze(1)  # [batch_size, 1, y_dim]
+        y_proj = self.y_projection(y)  # [batch_size, 1, hidden_dim]
+        
+        # Step 1: u_1 = LayerNorm_1(u + SelfAttention(u))
+        attn_output, _ = self.self_attention(u_proj, u_proj, u_proj)
+        u_1 = self.layer_norm_1(u_proj + attn_output)
+        
+        # Step 2: u_2 = LayerNorm_2(u_1 + FeedForward(u_1))
+        ff_output_1 = self.feed_forward_1(u_1)
+        u_2 = self.layer_norm_2(u_1 + ff_output_1)
+        
+        # Step 3: u_3 = LayerNorm_3(u_2 + CrossAttention(u_2, [y]))
+        # Cross-attention: u_2 as query, y_proj as key and value
+        cross_attn_output, _ = self.cross_attention(u_2, y_proj, y_proj)
+        u_3 = self.layer_norm_3(u_2 + cross_attn_output)
+        
+        # Step 4: output = LayerNorm_4(u_3 + FeedForward(u_3))
+        ff_output_2 = self.feed_forward_2(u_3)
+        output = self.layer_norm_4(u_3 + ff_output_2)
+        
+        return output
+
+
+class ConditionTransformerNetwork(nn.Module):
+    """
+    Complete network structure based on CustomTransformerBlock
+    """
+    def __init__(self, 
+                 u_dim,           # Input sequence u feature dimension
+                 y_dim,           # Input vector y feature dimension
+                 output_dim,      # Output sequence feature dimension
+                 hidden_dim=512,  # Hidden layer dimension
+                 num_blocks=4,    # Number of Transformer blocks
+                 num_heads=8,     # Number of attention heads
+                 ff_expansion=4): # Feed-forward network expansion factor
+        super(ConditionTransformerNetwork, self).__init__()
+        
+        self.u_dim = u_dim
+        self.y_dim = y_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
+        
+        # Input embedding layers
+        self.input_embedding = nn.Linear(u_dim, hidden_dim)
+        self.y_embedding = nn.Linear(y_dim, hidden_dim)
+        
+        # Multiple Transformer blocks
+        self.transformer_blocks = nn.ModuleList([
+            CustomTransformerBlock(
+                u_dim=hidden_dim,  # After first block, all are hidden_dim
+                y_dim=hidden_dim,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                ff_expansion=ff_expansion
+            ) for _ in range(num_blocks)
+        ])
+        
+        # Output projection layer
+        self.output_projection = nn.Linear(hidden_dim, output_dim)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize network weights"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+    
+    def forward(self, u, y):
+        """
+        Forward pass
+        
+        Args:
+            u: Input sequence [batch_size, seq_len, u_dim]
+            y: Input vector [batch_size, y_dim]
+            
+        Returns:
+            output: [batch_size, seq_len, output_dim]
+        """
+        # Input embedding
+        u_embedded = self.input_embedding(u)  # [batch_size, seq_len, hidden_dim]
+        y_embedded = self.y_embedding(y)      # [batch_size, hidden_dim]
+        
+        # Pass through multiple Transformer blocks
+        current_u = u_embedded
+        for block in self.transformer_blocks:
+            current_u = block(current_u, y_embedded)
+        
+        # Output projection
+        final_output = self.output_projection(current_u)  # [batch_size, seq_len, output_dim]
+        
+        return final_output
+
+
+# Usage example and test code
 if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Initialize the model with the specified parameters
-    model = EquivariantTransformer(
-        input_dim=80,
-        output_dim=40,
-        num_heads=8,
-        num_layers=16,
-        dim_feedforward=64,
-        hidden_dim=64
-    ).to(device)
-
-    # Define a simple test input and target
+    # Set parameters
     batch_size = 4
-    N = 10  # Number of elements in the set
-    input_dim = 80
-    output_dim = 40
-
-    # Generate random input tensor
-    X = torch.randn(batch_size, N, input_dim, requires_grad=True).to(device)
-
-    # Generate random target tensor
-    target = torch.randn(batch_size, N, output_dim).to(device)
-
-    # Define a simple loss function
-    criterion = nn.MSELoss()
-
+    seq_len = 10
+    u_dim = 32
+    y_dim = 16
+    output_dim = 16
+    hidden_dim = 64
+    
+    # Create network
+    model = ConditionTransformerNetwork(
+        u_dim=u_dim,
+        y_dim=y_dim,
+        output_dim=output_dim,
+        hidden_dim=hidden_dim,
+        num_blocks=3,
+        num_heads=8,
+        ff_expansion=2
+    )
+    
+    # Create test data
+    u = torch.randn(batch_size, seq_len, u_dim)
+    y = torch.randn(batch_size, y_dim)
+    
     # Forward pass
-    output = model(X)
-
-    # Compute loss
-    loss = criterion(output, target)
-
-    # Backward pass
-    loss.backward()
-
-    # Function to check gradients
-    def check_gradients(model):
-        gradients_exist = True
-        for name, param in model.named_parameters():
-            if param.grad is None:
-                print(f"Parameter '{name}' has no gradient!")
-                gradients_exist = False
-            else:
-                grad_norm = param.grad.data.norm()
-                print(f"Gradient norm for parameter '{name}': {grad_norm}")
-        if gradients_exist:
-            print("\nAll parameters have gradients.")
-        else:
-            print("\nSome parameters do not have gradients!")
-
-    # Check gradients
-    check_gradients(model)
+    output = model(u, y)
+    print(f"Input u shape: {u.shape}")
+    print(f"Input y shape: {y.shape}")
+    print(f"Output shape: {output.shape}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")

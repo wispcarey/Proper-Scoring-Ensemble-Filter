@@ -170,44 +170,52 @@ def matrix_sqrt_psd(A, tol=1e-9):
 # ##############################################################################
 
 def bootstrap_particle_filter_analysis(
-    particles_forecast,    # (batch_size, N_particles, d_state)
-    observation_y,         # (batch_size, d_obs) or (d_obs,)
-    observation_operator,  # callable: (d_state,) -> (d_obs,)
-    sigma_y,               # float (std dev of observation noise)
-    resampling_method="multinomial"
+    particles_forecast,      # (batch_size, N_particles, d_state)
+    observation_y,           # (batch_size, d_obs) or (d_obs,)
+    observation_operator,    # callable: (d_state,) -> (d_obs,)
+    sigma_y,                 # float (std dev of observation noise)
+    resampling_method="multinomial",
+    sigma_reg=None           # float (std dev for regularization noise)
 ):
     """
-    Performs batch analysis (update & resampling) for Bootstrap Particle Filter.
+    Performs batch analysis (update & resampling) for a Bootstrap Particle Filter.
+    Includes an optional regularization step to mitigate particle impoverishment.
 
     Args:
-        particles_forecast (torch.Tensor): Forecasted particles (batch_size, N_particles, d_state).
-        observation_y (torch.Tensor): Observation. Expected (batch_size, d_obs).
-                                     If (d_obs,), it's applied to all batches.
-        observation_operator (callable): Obs. mapping y_pred = h(x_forecast). (d_state,) -> (d_obs,).
-        sigma_y (float): Std deviation of observation noise (isotropic Gaussian).
-        resampling_method (str): "multinomial" or "systematic".
+        particles_forecast (torch.Tensor): Forecasted particles of shape (batch_size, N_particles, d_state).
+        observation_y (torch.Tensor): Observation tensor. Expected shape is (batch_size, d_obs) or (d_obs,).
+                                      If shape is (d_obs,), the same observation is applied to all batches.
+        observation_operator (callable): The observation mapping function, y_pred = h(x_forecast),
+                                         which maps a state of shape (d_state,) to an observation of shape (d_obs,).
+        sigma_y (float): Standard deviation of the observation noise (assumed to be isotropic Gaussian).
+        resampling_method (str): The resampling method to use, either "multinomial" or "systematic".
+        sigma_reg (float, optional): Standard deviation for the isotropic Gaussian regularization noise.
+                                     If provided and greater than zero, it adds noise N(0, sigma_reg^2 * I)
+                                     to the resampled particles to increase diversity. Defaults to None.
 
     Returns:
-        torch.Tensor: Analysis particles (batch_size, N_particles, d_state).
+        torch.Tensor: The analysis particles after resampling and optional regularization,
+                      of shape (batch_size, N_particles, d_state).
     """
     batch_size, N_particles, d_state = particles_forecast.shape
     device = particles_forecast.device
     dtype = particles_forecast.dtype
 
-    # Handle empty particle sets
+    # Handle cases with no particles to avoid errors.
     if N_particles == 0:
         return particles_forecast
 
-    # 1. Update (Compute Weights based on forecast particles)
+    # 1. Update (Compute Weights)
+    # ---------------------------
     log_weights = torch.zeros(batch_size, N_particles, device=device, dtype=dtype)
 
     if observation_y is not None:
-        # Determine d_obs and prepare observation_y for broadcasting
-        if observation_y.ndim == 1: # Shape (d_obs,)
+        # --- Prepare observation_y for broadcasting ---
+        if observation_y.ndim == 1:  # Shape (d_obs,)
             d_obs = observation_y.shape[0]
-            # Reshape to (1, 1, d_obs) for broadcasting over (B, N, d_obs)
+            # Reshape to (1, 1, d_obs) to broadcast against (B, N, d_obs)
             obs_y_broadcastable = observation_y.view(1, 1, d_obs)
-        elif observation_y.ndim == 2: # Shape (batch_size, d_obs) or (1, d_obs)
+        elif observation_y.ndim == 2:  # Shape (batch_size, d_obs) or (1, d_obs)
             if observation_y.shape[0] != batch_size and observation_y.shape[0] != 1:
                 raise ValueError(
                     f"Batch size of observation_y ({observation_y.shape[0]}) "
@@ -219,72 +227,89 @@ def bootstrap_particle_filter_analysis(
         else:
             raise ValueError("observation_y must be a 1D or 2D tensor.")
 
-        # Predict observations for all particles in all batches
+        # --- Predict observations for all particles ---
+        # This loop can be slow. For performance, consider vectorizing the observation_operator
+        # if possible (e.g., using torch.vmap).
         y_forecast = torch.empty(batch_size, N_particles, d_obs, device=device, dtype=dtype)
         for b_idx in range(batch_size):
             for p_idx in range(N_particles):
                 y_forecast[b_idx, p_idx] = observation_operator(particles_forecast[b_idx, p_idx])
 
-        # Calculate log likelihoods (log_weights before normalization)
-        # diff shape: (B, N, d_obs)
+        # --- Calculate log-likelihoods (unnormalized log-weights) ---
+        # diff_sq has shape: (B, N, d_obs)
         diff_sq = ((obs_y_broadcastable - y_forecast) / sigma_y) ** 2
-        log_weights = -0.5 * torch.sum(diff_sq, dim=2) # Sum over d_obs -> (B, N)
+        # Sum over the observation dimension to get log-likelihood for each particle.
+        log_weights = -0.5 * torch.sum(diff_sq, dim=2)  # Shape: (B, N)
 
-        # Normalize weights per batch (log-sum-exp trick for stability)
-        max_log_w = torch.max(log_weights, dim=1, keepdim=True)[0] # (B, 1)
-        # Subtract max for stability before exp
-        weights_unnormalized = torch.exp(log_weights - max_log_w) # (B, N)
-        sum_weights = torch.sum(weights_unnormalized, dim=1, keepdim=True) # (B, 1)
+        # --- Normalize weights using log-sum-exp trick for numerical stability ---
+        max_log_w = torch.max(log_weights, dim=1, keepdim=True)[0]  # Shape: (B, 1)
+        weights_unnormalized = torch.exp(log_weights - max_log_w)   # Shape: (B, N)
+        sum_weights = torch.sum(weights_unnormalized, dim=1, keepdim=True) # Shape: (B, 1)
 
-        # Handle batches where all weights might be zero (or very small)
-        # Mask for batches with non-negligible total weight
-        good_batches_mask = (sum_weights > 1e-9).squeeze(-1) # (B,)
-
-        # Default to uniform weights
+        # --- Create final normalized weights tensor ---
+        # Default to uniform weights in case a batch has all zero weights.
         uniform_dist = torch.full((N_particles,), 1.0 / N_particles, device=device, dtype=dtype)
-        weights = uniform_dist.unsqueeze(0).expand(batch_size, -1).clone() # (B,N)
+        weights = uniform_dist.unsqueeze(0).expand(batch_size, -1).clone() # Shape: (B, N)
+        
+        # Mask for batches with non-negligible total weight.
+        good_batches_mask = (sum_weights > 1e-9).squeeze(-1) # Shape: (B,)
 
-        # Apply normalized weights for good batches
+        # Apply normalized weights only for the good batches.
         if good_batches_mask.any():
             # Ensure division is only for good batches to avoid nan/inf
             normalized_w_good = weights_unnormalized[good_batches_mask] / sum_weights[good_batches_mask]
             weights[good_batches_mask] = normalized_w_good
     else:
-        # No observation: uniform weights for all batches
+        # If no observation is provided, all particles have uniform weight.
         weights = torch.full((batch_size, N_particles), 1.0 / N_particles, device=device, dtype=dtype)
 
-    # 2. Resampling (per batch)
+    # 2. Resampling
+    # -------------
+    # Prepare a tensor to store the indices of the resampled particles.
     indices = torch.empty(batch_size, N_particles, dtype=torch.long, device=device)
+
     if resampling_method == "multinomial":
-        # torch.multinomial samples N_particles for each row in weights (B,N)
-        indices = torch.multinomial(weights, N_particles, replacement=True) # (B, N)
+        # For each batch, sample N_particles indices with replacement.
+        indices = torch.multinomial(weights, N_particles, replacement=True) # Shape: (B, N)
     elif resampling_method == "systematic":
-        # cdf: (B, N) cumulative sum along particle dimension
+        # Calculate the cumulative distribution function (CDF) for each batch.
         cdf = torch.cumsum(weights, dim=1)
-        # Ensure last cdf value is 1.0 for robustness
+        # Ensure the last element of the CDF is exactly 1.0 for robustness.
         cdf[:, -1] = 1.0
 
-        # Generate stratified samples for each batch
-        # u_start: (B, 1) random start for each batch's strata
+        # Generate stratified uniform samples for each batch.
+        # u_start is a random starting point for the strata in each batch. Shape: (B, 1)
         u_start = torch.rand(batch_size, 1, device=device, dtype=dtype) / N_particles
-        # u_uniform_strata: (N,) base points for strata
+        # u_uniform_strata are the base points for the strata. Shape: (N,)
         u_uniform_strata = torch.arange(N_particles, device=device, dtype=dtype) / N_particles
-        # u_samples: (B, N) samples for each batch by broadcasting
+        # u_samples combines the start and base points via broadcasting. Shape: (B, N)
         u_samples = u_start + u_uniform_strata.unsqueeze(0)
 
-        # Find indices using searchsorted for each batch
-        # right=True: cdf[idx-1] < val <= cdf[idx]
+        # Find the corresponding indices for the samples using the CDF.
+        # right=True means we find `idx` such that cdf[idx-1] < sample <= cdf[idx].
         indices = torch.searchsorted(cdf, u_samples, right=True)
-        # Clamp indices to be safe, though cdf[:, -1]=1.0 should handle u_samples near 1.0
+        # Clamp indices to be safe, although cdf[:, -1]=1.0 should prevent out-of-bounds.
         indices.clamp_(0, N_particles - 1)
     else:
         raise ValueError(f"Unknown resampling method: {resampling_method}")
 
-    # Gather resampled particles for each batch
-    # particles_forecast is (B, N, d_state), indices is (B, N)
-    # We select particles_forecast[b, indices[b, p]] for each b, p
+    # Gather the resampled particles.
+    # We need to select particles_forecast[b, indices[b, p]] for each batch b and particle p.
+    # This can be done efficiently using advanced indexing.
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(indices)
     particles_analysis = particles_forecast[batch_indices, indices]
+
+    # 3. Regularization (Optional)
+    # ----------------------------
+    # This step adds noise to the resampled particles to combat particle impoverishment.
+    if sigma_reg is not None and sigma_reg > 0:
+        # Sample from a standard normal distribution N(0, 1).
+        # torch.randn_like creates a tensor with the same shape, device, and dtype as particles_analysis.
+        noise = torch.randn_like(particles_analysis)
+        
+        # Scale the noise by the standard deviation sigma_reg and add it to the particles.
+        # The resulting noise follows N(0, sigma_reg^2 * I).
+        particles_analysis = particles_analysis + noise * sigma_reg
 
     return particles_analysis
 

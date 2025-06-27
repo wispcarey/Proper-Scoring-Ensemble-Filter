@@ -29,21 +29,37 @@ def float_or_default(value):
     try:
         return float(value)
     except ValueError:
-        return "default"
-    
+        if value == "default":
+            return "default"
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}")
+
+def float_or_none_or_default(value):
+    """Custom type for argparse that accepts a float, 'none', or 'default'."""
+    if isinstance(value, str):
+        if value.lower() == 'none':
+            return None
+        if value.lower() == 'default':
+            return 'default'
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}. Must be a float, 'none', or 'default'.")
+
 def int_or_default(value):
     try:
         return int(value)
     except ValueError:
-        return "default"
-    
+        if value == "default":
+            return "default"
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}")
+
 def parse_list_type(s):
     return s.split(',')
 
 def get_parameters():
     parser = argparse.ArgumentParser()
     # dataset setting
-    parser.add_argument('--dataset', type=str, default='lorenz96', choices=['lorenz63', 'lorenz96', 'ks'],
+    parser.add_argument('--dataset', type=str, default='lorenz96', choices=['lorenz63', 'lorenz96', 'ks', 'linear'],
                         help='Dataset name')
     parser.add_argument('--num_loader_workers', type=int, default=16,
                         help='number of workers for the data loader')
@@ -67,25 +83,25 @@ def get_parameters():
                         help='Overlap rate when segmenting learning trajectories')
     parser.add_argument('--new_data', action='store_false',
                         help='do not use the check_dist option when generating training data')
-    parser.add_argument('--sigma_ens', type=float_or_default, default="default",
-                        help='std of initial ensemble samples')
-    parser.add_argument('--sigma_v', type=float, default=0.0,
-                        help='noise std in the latent process')
-    parser.add_argument('--sigma_y', type=float, default=1,
-                        help='noise std in the observation')
-    
+    parser.add_argument('--sigma_ens', type=float_or_none_or_default, default="default",
+                        help='std of initial ensemble samples (can be float, "none", or "default")')
+    parser.add_argument('--sigma_v', type=float_or_none_or_default, default="default",
+                        help='noise std in the latent process (can be float or "none")')
+    parser.add_argument('--sigma_y', type=float_or_none_or_default, default="default",
+                        help='noise std in the observation (can be float or "none")')
+
     # loss function
     parser.add_argument('--ignore_first', type=int, default=0,
                         help='number of first steps ignored in calculating the loss in each training traj')
     parser.add_argument('--loss_warm_up', action='store_true',
                         help='warm-up the loss according to epochs')
-    parser.add_argument('--loss_type', type=parse_list_type, default=["nl2"], 
+    parser.add_argument('--loss_type', type=parse_list_type, default=["nl2"],
                         help='the type of loss function, split by comma, e.g., "l2,rmse,crps"')
     parser.add_argument('--es_p', type=float, default=1,
                         help='the power of energy score')
     parser.add_argument('--kes_sigma', type=lambda x: float(x) if x.lower() != 'none' else None,
-                    default=1e-2,
-                    help='the power of energy score (can be float or None)')
+                        default=1e-2,
+                        help='the power of energy score (can be float or None)')
 
     # training setting
     parser.add_argument('--cp_load_path', type=str, default="no",
@@ -100,6 +116,8 @@ def get_parameters():
                         help='test batch size')
     parser.add_argument('--detach_training_epoch', type=int, default=10000,
                         help='detach training epochs')
+    parser.add_argument('--detach_steps', type=int, default=5,
+                        help='Number of steps after which to detach gradients in the trajectory (1 means detach every step)')
     parser.add_argument('--no_localization', action='store_true',
                         help='do not apply localization')
     parser.add_argument('--st_output_dim', type=int, default=64,
@@ -133,7 +151,6 @@ def get_parameters():
     parser.add_argument('--zero_infl', action='store_true',
                         help='set inflation to zero')
     
-
     # optimization setting
     parser.add_argument('--learning_rate', type=float_or_default, default='default',
                         help='learning rate')
@@ -157,17 +174,26 @@ def get_parameters():
                         help='number of epochs in the beginning to warm up the learning rate')
     parser.add_argument('--SGD', action='store_true',
                         help='use SGD optimizer, otherwise use Adam')
+    
+    # test settings
+    parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')
+    parser.add_argument('--pf_N', type=int, default=1000,
+                        help='number particles for PF')
+    parser.add_argument('--sigma_reg', type=float, default=1e-2,
+                        help='the std of noise added to resampling in BPF')
+
 
     # others
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda','cpu'],
                         help='device')
     parser.add_argument('--seed', type=str, default=None, help='Random Seed')
-    parser.add_argument('--test_only', action='store_true', help='Only do the test part')
     parser.add_argument('--test_rounds', type=int, default=1, help='Number of test rounds when selecting --test_only')
     parser.add_argument('--GPU_memory', type=int, default=16, help='GPU memory in GB')
-    
+    parser.add_argument('--normal_output', action='store_true', help='Just print the output without redirecting to a .txt file')
+    parser.add_argument('--suffix', type=str, default="", help='save folder suffix')
+
     # version setting
-    parser.add_argument('--v', type=str, choices=['CorrTerms','EtE','EnKF','ESRF','LETKF'],
+    parser.add_argument('--v', type=str, choices=['CorrTerms','EtE','EtE2','EnKF','ESRF','LETKF'],
                         default='CorrTerms', help='versions')
 
     args = parser.parse_args()
@@ -175,7 +201,7 @@ def get_parameters():
     # iterations = args.lr_decay_epochs.split(',')
     # args.lr_decay_epochs = list([])
     # for it in iterations:
-    #     args.lr_decay_epochs.append(int(it))
+    # 	args.lr_decay_epochs.append(int(it))
 
     if not args.warm_up:
         args.warm_up_rate = 1
@@ -184,48 +210,56 @@ def get_parameters():
     if not args.adjust_lr:
         args.lr_decay_epochs = "0"
         args.lr_decay_rate = 1
-        
+
+    dataset_config = DATASET_INFO.get(args.dataset, {})
+
     if args.dt == 'default':
-        args.dt = DATASET_INFO[args.dataset]['dt']
-    
+        args.dt = dataset_config.get('dt')
+
     if args.dt_iter == 'default':
-        args.dt_iter = DATASET_INFO[args.dataset]['dt_iter']
-    
+        args.dt_iter = dataset_config.get('dt_iter')
+
     if args.test_steps == 'default':
-        args.test_steps = DATASET_INFO[args.dataset]['test_steps']
-    
+        args.test_steps = dataset_config.get('test_steps')
+
     if args.test_traj_num == 'default':
-        args.test_traj_num = DATASET_INFO[args.dataset]['test_traj_num']
-    
+        args.test_traj_num = dataset_config.get('test_traj_num')
+
     if args.train_steps == 'default':
-        args.train_steps = DATASET_INFO[args.dataset]['train_steps']
-    
+        args.train_steps = dataset_config.get('train_steps')
+
     if args.train_traj_num == 'default':
-        args.train_traj_num = DATASET_INFO[args.dataset]['train_traj_num']
-    
+        args.train_traj_num = dataset_config.get('train_traj_num')
+
     if args.hidden_dim == 'default':
-        args.hidden_dim = DATASET_INFO[args.dataset]['hidden_dim']
-    
+        args.hidden_dim = dataset_config.get('hidden_dim')
+
     if args.learning_rate == 'default':
-        args.learning_rate = DATASET_INFO[args.dataset]['learning_rate']
-    
+        args.learning_rate = dataset_config.get('learning_rate')
+
     if args.batch_size == 'default':
-        ori_batch_size = DATASET_INFO[args.dataset]['batch_size']
+        ori_batch_size = dataset_config.get('batch_size')
         args.batch_size = ori_batch_size
     else:
         ori_batch_size = args.batch_size
-        
+
     if args.test_batch_size == 'default':
         args.test_batch_size = args.test_traj_num
-        
+
     if args.sigma_ens == 'default':
-        args.sigma_ens = DATASET_INFO[args.dataset]['sigma_ens']
-    
-    args.ori_dim = DATASET_INFO[args.dataset]['dim']
-    args.obs_dim = DATASET_INFO[args.dataset]['obs_dim']
-    args.obs_inds = DATASET_INFO[args.dataset]['obs_inds']
-    args.clamp = DATASET_INFO[args.dataset]['clamp']
-    
+        args.sigma_ens = dataset_config.get('sigma_ens')
+        
+    if args.sigma_v == 'default':
+        args.sigma_v = dataset_config.get('sigma_v')
+        
+    if args.sigma_y == 'default':
+        args.sigma_y = dataset_config.get('sigma_y')
+
+    args.ori_dim = dataset_config.get('dim')
+    args.obs_dim = dataset_config.get('obs_dim')
+    args.obs_inds = dataset_config.get('obs_inds')
+    args.clamp = dataset_config.get('clamp')
+
     if args.device == 'cuda':
         args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -239,64 +273,70 @@ def get_parameters():
             print(f"Do not Use DataParallel")
     else:
         print("Use CPU")
-    
-        
-    if args.GPU_memory != 16:
+
+
+    if args.GPU_memory != 16 and args.batch_size is not None:
         args.batch_size = args.batch_size * int(args.GPU_memory / 16)
-    
-    if args.print_batch == "auto":
+
+    if args.print_batch == "auto" and args.train_traj_num is not None and args.batch_size is not None and args.batch_size > 0:
         args.print_batch = math.ceil(args.train_traj_num / args.batch_size)
-        
+
     if args.adjust_lr:
         print("[INFO] Learning rate adjustment is ENABLED.")
 
     if args.warm_up:
         print("[INFO] Warm-up is ENABLED.")
-        
-    if ori_batch_size != args.batch_size:
+
+    if ori_batch_size != args.batch_size and all(isinstance(v, (int, float)) for v in [args.learning_rate, args.batch_size, ori_batch_size]):
         args.learning_rate = args.learning_rate * (args.batch_size / ori_batch_size) ** 0.5
-        
+
     if args.st_type == 'state_only':
         print("Only apply an ST on the ensemble state data.")
         args.input_dim = args.ori_dim + 2 * args.obs_dim + args.st_output_dim
         args.local_input_dim = args.st_output_dim
-    elif args.st_type == "separate": 
+    elif args.st_type == "separate":
         print("Apply STs separately on the ensemble state data and observation data.")
-        args.input_dim = args.ori_dim + 2 * args.obs_dim + args.st_output_dim * 2 
+        args.input_dim = args.ori_dim + 2 * args.obs_dim + args.st_output_dim * 2
         args.local_input_dim = args.st_output_dim * 2
     elif args.st_type == 'joint':
         print("Apply an ST on the joint distribution of ensemble state data and observation data.")
-        args.input_dim = args.ori_dim + 2 * args.obs_dim + args.st_output_dim * 2 
+        args.input_dim = args.ori_dim + 2 * args.obs_dim + args.st_output_dim * 2
         args.local_input_dim = args.st_output_dim * 2
     else:
         raise ValueError("Please use a valid st_type.")
-    
+
     if args.obs_in_loc:
         args.local_input_dim += args.obs_dim
-        
+
     # localization
-    full_inds = torch.arange(0, args.ori_dim)
-    Lvy = pairwise_distances(full_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
-    Lyy = pairwise_distances(args.obs_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
-    args.diff_dist = torch.unique(torch.cat((Lvy.flatten(), Lyy.flatten())))
-    args.num_dist = len(args.diff_dist)
-    args.Lvy = Lvy
-    args.Lyy = Lyy
-    
+    if args.ori_dim and args.obs_inds is not None:
+        full_inds = torch.arange(0, args.ori_dim)
+        Lvy = pairwise_distances(full_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
+        Lyy = pairwise_distances(args.obs_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
+        args.diff_dist = torch.unique(torch.cat((Lvy.flatten(), Lyy.flatten())))
+        args.num_dist = len(args.diff_dist)
+        args.Lvy = Lvy
+        args.Lyy = Lyy
+    else:
+        args.diff_dist = None
+        args.num_dist = 0
+        args.Lvy = None
+        args.Lyy = None
+
     # for benchmark
     if args.v in ['EnKF','ESRF','LETKF']:
-        args.colorbar_range = DATASET_INFO[args.dataset]['colorbar_range']
+        args.colorbar_range = dataset_config.get('colorbar_range')
     else:
         args.colorbar_range = None
-    
+
     # Save folder
     if args.cp_load_path != "no":
-        suffix = "_tuned"
+        args.suffix += "_tuned"
     else:
-        suffix = ""
+        args.suffix = ""
     folder_name = os.path.join("save", datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
     loss_type_name = "_".join([loss_type for loss_type in args.loss_type])
-    folder_name += f"{args.dataset}_{args.sigma_y}_{args.N}_{args.train_steps}_{args.train_traj_num}_{loss_type_name}_EnST{suffix}_{args.st_type}_{args.v}"
+    folder_name += f"{args.dataset}_{args.sigma_y}_{args.N}_{args.train_steps}_{args.train_traj_num}_{loss_type_name}_{args.st_type}_{args.v}{args.suffix}"
     args.save_folder = folder_name
-    
+
     return args

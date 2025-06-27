@@ -2,7 +2,10 @@ import numpy as np
 import os
 import sys
 import datetime
+import pickle
+
 from contextlib import contextmanager
+from scipy.linalg import eigvals
 
 from torch.utils.data import Dataset, DataLoader
 import torch
@@ -13,36 +16,48 @@ from torch.optim.lr_scheduler import LambdaLR
 from dapper.mods.KS import Model as DapperKS
 
 @contextmanager
-def redirect_output(save_folder, filename="output.txt"):
+def redirect_output(save_output=True, save_folder=".", filename="output.txt"):
     """
-    Context manager to redirect all stdout and stderr output to a specified file.
+    Context manager to optionally redirect all stdout and stderr output to a file.
     
     Args:
+        save_output (bool): If True (default), redirect output to the specified file.
+                            If False, output will be printed to the console as normal.
         save_folder (str): The folder where the output file should be saved.
         filename (str): The name of the output file (default: "output.txt").
     """
-    os.makedirs(save_folder, exist_ok=True)  # Ensure the directory exists
-    output_file = os.path.join(save_folder, filename)
-    
-    # Backup original stdout and stderr
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    
-    file_exists = os.path.exists(output_file)
-    
-    with open(output_file, "a") as f:  # Open in append mode
-        if file_exists:
-            f.write(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n")
+    if save_output:
+        # This block contains the original logic to save output to a file.
+        os.makedirs(save_folder, exist_ok=True)  # Ensure the directory exists
+        output_file = os.path.join(save_folder, filename)
         
-        sys.stdout = f
-        sys.stderr = f
+        # Backup original stdout and stderr
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        file_exists = os.path.exists(output_file)
+        
+        with open(output_file, "a") as f:  # Open in append mode
+            if file_exists:
+                # Add a timestamp for new output sessions
+                f.write(f"\n--- [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---\n")
+            
+            sys.stdout = f
+            sys.stderr = f
+            try:
+                yield  # Execute the code block within the 'with' statement
+            finally:
+                # Restore original stdout and stderr after execution
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+                print(f"Output appended to {output_file}") # Notify in the console
+    else:
+        # If save_output is False, just execute the code block without redirection.
         try:
-            yield  # Execute the code block within the context
+            yield
         finally:
-            # Restore stdout and stderr after execution
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            print(f"Output appended to {output_file}")  # Notify in the console
+            # No redirection occurred, so no cleanup is needed.
+            pass
 
 def check_nan_in_model(model):
     for param in model.parameters():
@@ -136,131 +151,6 @@ class L96(nn.Module):
         x_p1 = torch.roll(x, 1, -1)
         return (x_p1 - x_m2) * x_m1 - x + F * torch.ones_like(x)
     
-
-
-##### old generate data, not sure if it is correct
-def gen_data_old(dataset, t, steps_test, steps_valid, step=None, check_disk=True, steps_burn=1000, true_v0=None):
-    """ Generates training and test data for given model. Defaults used in experiments
-    are hardcoded making this somewhat longer than it needs to be.
-
-    args
-    -----
-    dataset : string
-        Name of the dynamics to use for data gen
-    steps_test : int
-        Number of steps to use for test set. Steps_test + steps_valid Must be smaller than len(t)
-    steps_valid : int
-        Number of steps to use for valid set. Steps_test + steps_valid Must be smaller than len(t)
-    step : int
-        Step size taken by integrator. If no step size provided, uses t[1] - t[0]
-    check_disk : bool
-        Indicates whether to check if saved first.
-
-    returns
-    -------
-    train : torch.Tensor
-        Training sequence
-    valid : torch.Tensor
-        Validation sequence
-    test : torch.Tensor
-        Test sequence
-    """
-    makedirs('data/%s' % dataset)
-    if step is None:
-        step = t[1] - t[0]
-    rstep = t[1] - t[0]
-    if dataset == 'lorenz96':
-        with torch.no_grad():
-            if check_disk and os.path.exists('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)):
-                true_v = torch.Tensor(np.load('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)))
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(L96(), true_v0_test, t[:steps_burn + steps_valid + steps_test],
-                                     method='rk4', options={'step_size': step})
-            else:
-                if true_v0 is None or true_v0.shape != (1, 40):
-                    true_v0 = torch.randn(1, 40) + 5
-                true_v = odeint(L96(), true_v0, t, method='rk4', options={'step_size': step})
-                if check_disk:
-                    np.save('data/%s/true_v_%.3fstep.npy' % (dataset, rstep), true_v)
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(L96(), true_v0_test, t[:steps_burn + steps_test + steps_valid],
-                                     method='rk4', options={'step_size': step})
-    elif dataset == 'vl20':
-        with torch.no_grad():
-            if check_disk and os.path.exists('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)):
-                true_v = torch.Tensor(np.load('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)))
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(VL20(), true_v0_test, t[:steps_burn + steps_valid + steps_test],
-                                     method='rk4', options={'step_size': step})
-            else:
-                if true_v0 is None or true_v0.shape != (1, 2, 36):
-                    true_v0 = torch.randn(1, 2, 36) + 5
-                true_v = odeint(VL20(), true_v0, t, method='rk4', options={'step_size': step})
-                if check_disk:
-                    np.save('data/%s/true_v_%.3fstep.npy' % (dataset, rstep), true_v)
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(VL20(), true_v0_test, t[:steps_burn + steps_test + steps_valid],
-                                     method='rk4', options={'step_size': step})
-    # Two level Lorenz - just used the DAPPER implementation here since we didn't need the ability to
-    # differentiably forward integrate
-    elif dataset == 'lorenzuv':
-        with torch.no_grad():
-            if check_disk and os.path.exists('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)):
-                true_v = torch.Tensor(np.load('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)))
-
-                true_v_test = true_v[-(steps_test + steps_valid):].unsqueeze(1)
-                true_v = true_v[:-(steps_test + steps_valid)].unsqueeze(1)
-            else:
-                raise NotImplementedError
-    # Not used in paper due to dimensionality making full rank EnKF too simple to compute
-    # Also, there might be an error in this somewhere since it was never debugged
-    elif dataset == 'lorenz63':
-        with torch.no_grad():
-            if check_disk and os.path.exists('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)):
-                true_v = torch.Tensor(np.load('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)))
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(L63(), true_v0_test, t[:steps_burn + steps_valid + steps_test],
-                                     method='rk4', options={'step_size': step})
-            else:
-                if true_v0 is None or true_v0.shape != (1, 3):
-                    true_v0 = torch.Tensor([[1.509, -1.531, 25.46]])
-                true_v = odeint(L63(), true_v0, t, method='rk4', options={'step_size': step})
-                if check_disk:
-                    np.save('data/%s/true_v_%.3fstep.npy' % (dataset, rstep), true_v)
-                true_v0_test = true_v[-1]
-                true_v = true_v[:-1]
-                true_v_test = odeint(L63(), true_v0_test, t[:steps_burn + steps_test + steps_valid],
-                                     method='rk4', options={'step_size': step})
-    elif dataset == 'ks':
-        with torch.no_grad():
-            if check_disk and os.path.exists('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)):
-                true_v = torch.Tensor(np.load('data/%s/true_v_%.3fstep.npy' % (dataset, rstep)))
-                true_v0_test = true_v[-1].unsqueeze(0)
-                # print('EEEEE', true_v0_test.shape)
-                true_v = true_v[:-1].unsqueeze(1)
-                true_v_test = custom_int(true_v0_test, etd_rk4_wrapper(), steps_test + steps_valid).unsqueeze(1)
-            else:
-                # Generate initial point from Dapper
-                grid = 32 * np.pi * torch.linspace(0, 1, 128 + 1)[1:]
-                x0_Kassam = torch.cos(grid / 16) * (1 + torch.sin(grid / 16))
-                x0 = x0_Kassam.clone().unsqueeze(0)
-                for _ in range(150):
-                    x0 = custom_int(x0, etd_rk4_wrapper(), 150)[-1:]
-                true_v0 = custom_int(x0, etd_rk4_wrapper(), 10 ** 3)[-1:]
-                true_v = custom_int(true_v0, etd_rk4_wrapper(), t.shape[0])
-                if check_disk:
-                    np.save('data/%s/true_v_%.3fstep.npy' % (dataset, rstep), true_v)
-                true_v0_test = true_v[-1].unsqueeze(0)
-                true_v = true_v[:-1].unsqueeze(1)
-                true_v_test = custom_int(true_v0_test, etd_rk4_wrapper(), steps_test + steps_valid).unsqueeze(1)
-    else:
-        raise ValueError('Dataset not implemented')
-    return true_v, true_v_test[steps_burn:steps_valid + steps_burn], true_v_test[steps_burn + steps_valid:]
 
 
 def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
@@ -524,41 +414,89 @@ def partial_obs_operator(ori_dim, obs_inds, device, seed=None):
     return inner, proj
 
 def get_dataloader(args, x0=None, test_only=False):
-
-    t = torch.arange(0, args.train_steps * args.train_traj_num * args.dt, args.dt)
-    gen_trajs = gen_data(args.dataset, t, v0=x0, sigma_v=args.sigma_v,
-                                                 steps_test=args.test_steps * args.test_traj_num,
-                                                 steps_valid=args.valid_steps,
-                                                 check_disk=args.new_data,
-                                                 steps_burn=args.burn_steps,
-                                                 dt_iter=args.dt_iter,
-                                                 prefix=f"{args.sigma_v}_{args.train_steps}_{args.train_traj_num}_{args.trail}",
-                                                 test_only=test_only
-                                                 )
-    if test_only:
-        true_v_valid, true_v_test = gen_trajs
-    else:
-        true_v, true_v_valid, true_v_test = gen_trajs
-
-    # training data
-    if not test_only:
-        train_data = ChunkedTimeseries(true_v, args.train_steps, args.overlap_rate)
+    if args.dataset.startswith('linear'):
+        # A = torch.randn(args.ori_dim, args.ori_dim, dtype=torch.float32)
+        # eigs = torch.linalg.eigvals(A)
+        # max_abs_eig = torch.max(torch.abs(eigs))
+        # scaling_factor = 1.1 / max_abs_eig
+        # A = A * scaling_factor
+        
+        J = torch.randn(args.ori_dim, args.ori_dim)
+        A, _ = torch.linalg.qr(J)
+        
+        H = torch.zeros(10,20)
+        for i in range(10):
+            H[i, 2*i] = 1
+            
+        train_data = LinearSystemDataset(
+            d=args.ori_dim, 
+            d_obs=args.obs_dim, 
+            num_samples=args.train_traj_num, 
+            m=None, C=None, A=A, H=H,
+            sigma_v=args.sigma_v, 
+            data_name=f"training_{args.seed}",
+            sigma_y=args.sigma_y,
+            load_existing=True,
+            seed=None
+        )
+        test_data = LinearSystemDataset(
+            d=args.ori_dim, 
+            d_obs=args.obs_dim, 
+            num_samples=args.test_traj_num, 
+            m=None, C=None, A=A, H=H,
+            sigma_v=args.sigma_v, 
+            sigma_y=args.sigma_y,
+            data_name=f"test_{args.seed}",
+            load_existing=True,
+            seed=None
+        )
         train_loader = DataLoader(train_data, batch_size=args.batch_size,
-                                shuffle=True, num_workers=args.num_loader_workers, collate_fn=TimeStack())
+                                shuffle=True, num_workers=args.num_loader_workers)
         print("Train loader length:", len(train_loader))
+        # test data
+        test_loader = DataLoader(test_data, batch_size=args.test_batch_size,
+                                    shuffle=False, num_workers=args.num_loader_workers)
+        print("Dataloader generated.")
+
+        if test_only:
+            return test_loader
+
+        return train_loader, test_loader
+    else:
+        t = torch.arange(0, args.train_steps * args.train_traj_num * args.dt, args.dt)
+        gen_trajs = gen_data(args.dataset, t, v0=x0, sigma_v=args.sigma_v,
+                                                        steps_test=args.test_steps * args.test_traj_num,
+                                                        steps_valid=args.valid_steps,
+                                                        check_disk=args.new_data,
+                                                        steps_burn=args.burn_steps,
+                                                        dt_iter=args.dt_iter,
+                                                        prefix=f"{args.sigma_v}_{args.train_steps}_{args.train_traj_num}_{args.trail}",
+                                                        test_only=test_only
+                                                        )
+        if test_only:
+            _, true_v_test = gen_trajs
+        else:
+            true_v, _, true_v_test = gen_trajs
+
+        # training data
+        if not test_only:
+            train_data = ChunkedTimeseries(true_v, args.train_steps, args.overlap_rate)
+            train_loader = DataLoader(train_data, batch_size=args.batch_size,
+                                    shuffle=True, num_workers=args.num_loader_workers, collate_fn=TimeStack())
+            print("Train loader length:", len(train_loader))
 
 
-    # test data
-    test_data = ChunkedTimeseries(true_v_test, args.test_steps, 0)
-    test_loader = DataLoader(test_data, batch_size=args.test_batch_size,
-                             shuffle=False, num_workers=args.num_loader_workers, collate_fn=TimeStack())
+        # test data
+        test_data = ChunkedTimeseries(true_v_test, args.test_steps, 0)
+        test_loader = DataLoader(test_data, batch_size=args.test_batch_size,
+                                    shuffle=False, num_workers=args.num_loader_workers, collate_fn=TimeStack())
 
-    print("Dataloader generated.")
+        print("Dataloader generated.")
 
-    if test_only:
-        return test_loader
-    
-    return train_loader, test_loader
+        if test_only:
+            return test_loader
+
+        return train_loader, test_loader
 
 def create_optimizer(model, args, apply_multiplier=False):
     # Check if model is a list
@@ -795,3 +733,197 @@ def post_process(E, infl):
         # E = mu + torch.bmm(T, A)
         E = mu + infl * A
     return E
+
+class LinearSystemDataset(Dataset):
+    """
+    PyTorch Dataset for generating random or fixed linear system parameters.
+    
+    Each sample contains:
+    - m: vector of length d
+    - C: d x d symmetric matrix (Cholesky factor)
+    - A: d x d matrix with eigenvalues having absolute values < 1.1
+    - H: d_obs x d matrix
+    - sigma_v: positive scalar (observation noise)
+    - sigma_y: positive scalar (process noise)
+    """
+    
+    def __init__(self, d, d_obs, num_samples, 
+                 m=None, C=None, A=None, H=None,
+                 sigma_v=None, sigma_y=None, 
+                 data_name="default", load_existing=True, seed=None):
+        """
+        Initialize the dataset.
+        
+        Args:
+            d (int): Dimension of the state vector.
+            d_obs (int): Dimension of the observation vector.
+            num_samples (int): Number of samples to generate.
+            m (torch.Tensor or None): Fixed value for m, or None for random generation.
+            C (torch.Tensor or None): Fixed value for C, or None for random generation.
+            A (torch.Tensor or None): Fixed value for A, or None for random generation.
+            H (torch.Tensor or None): Fixed value for H, or None for random generation.
+            sigma_v (float or None): Fixed value for sigma_v, or None for random generation.
+            sigma_y (float or None): Fixed value for sigma_y, or None for random generation.
+            data_name (str): Name for saving/loading data files.
+            load_existing (bool): Whether to load existing data if available.
+            seed (int or None): Random seed for reproducibility.
+        """
+        self.d = d
+        self.d_obs = d_obs
+        self.num_samples = num_samples
+        
+        # Store fixed parameters if provided
+        self.m_fixed = m
+        self.C_fixed = C
+        self.A_fixed = A
+        self.H_fixed = H
+        self.sigma_v_fixed = sigma_v
+        self.sigma_y_fixed = sigma_y
+        
+        self.data_name = data_name
+        self.seed = seed
+        
+        # Create data directory if it doesn't exist
+        os.makedirs("data/linear", exist_ok=True)
+        
+        # Set random seed if provided
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        # File path for saving/loading data
+        self.data_file = f"data/linear/{data_name}_d{d}_dobs{d_obs}_n{num_samples}.pkl"
+        
+        # Try to load existing data if requested
+        if load_existing and os.path.exists(self.data_file):
+            print(f"Loading existing data from {self.data_file}")
+            self._load_data()
+        else:
+            print(f"Generating new data and saving to {self.data_file}")
+            self._generate_data()
+            self._save_data()
+            
+    def _generate_stable_matrix_A(self):
+        """Generates a random matrix A with eigenvalues |eig| < 1."""
+        A = torch.randn(self.d, self.d, dtype=torch.float32)
+        eigs = torch.linalg.eigvals(A)
+        max_abs_eig = torch.max(torch.abs(eigs))
+        
+        # Scale matrix if the largest eigenvalue is too large
+        if max_abs_eig >= 1.0:
+            # Scale to be slightly less than 1.0 for stability
+            scaling_factor = torch.rand(1, dtype=torch.float32) * 0.98 / max_abs_eig
+            A = A * scaling_factor
+        
+        return A
+
+    def _generate_symmetric_matrix_C(self):
+        """Generates a random symmetric positive definite matrix C (as Cholesky factor)."""
+        temp = torch.randn(self.d, self.d, dtype=torch.float32)
+        # Create a symmetric positive semi-definite matrix
+        C_full = temp @ temp.T
+        # Add a small identity matrix to ensure it is positive definite
+        C_full += 1 * torch.eye(self.d, dtype=torch.float32)
+        # Return the Cholesky decomposition
+        return torch.linalg.cholesky(C_full)
+    
+    def _generate_data(self):
+        """Generate all parameters for the dataset, using fixed values if provided."""
+        self.data = []
+        
+        for i in range(self.num_samples):
+            # Use fixed tensors if provided, otherwise generate randomly
+            m = self.m_fixed if self.m_fixed is not None else torch.randn(self.d, dtype=torch.float32)
+            C = self.C_fixed if self.C_fixed is not None else self._generate_symmetric_matrix_C()
+            A = self.A_fixed if self.A_fixed is not None else self._generate_stable_matrix_A()
+            H = self.H_fixed if self.H_fixed is not None else torch.randn(self.d_obs, self.d, dtype=torch.float32)
+            
+            if self.sigma_v_fixed is not None:
+                sigma_v = torch.tensor([self.sigma_v_fixed], dtype=torch.float32)
+            else:
+                sigma_v = torch.rand(1, dtype=torch.float32) * 0.3 # Uniformly sample from [0, 0.3)
+                
+            if self.sigma_y_fixed is not None:
+                sigma_y = torch.tensor([self.sigma_y_fixed], dtype=torch.float32)
+            else:
+                sigma_y = 0.1 + torch.rand(1, dtype=torch.float32) * 0.9 # Uniformly sample from [0.1, 1.0)
+
+            sample = {
+                'm': m, 'C': C, 'A': A, 'H': H,
+                'sigma_v': sigma_v, 'sigma_y': sigma_y
+            }
+            self.data.append(sample)
+
+    def _save_data(self):
+        """Save generated data and metadata to a file."""
+        save_dict = {
+            'data': self.data,
+            'metadata': {
+                'd': self.d, 'd_obs': self.d_obs, 'num_samples': self.num_samples,
+                'm_fixed': self.m_fixed, 'C_fixed': self.C_fixed,
+                'A_fixed': self.A_fixed, 'H_fixed': self.H_fixed,
+                'sigma_v_fixed': self.sigma_v_fixed, 'sigma_y_fixed': self.sigma_y_fixed,
+                'seed': self.seed
+            }
+        }
+        with open(self.data_file, 'wb') as f:
+            pickle.dump(save_dict, f)
+        print(f"Data saved to {self.data_file}")
+    
+    def _load_data(self):
+        """Load data from a file and verify metadata."""
+        try:
+            with open(self.data_file, 'rb') as f:
+                loaded_dict = pickle.load(f)
+            
+            self.data = loaded_dict['data']
+            metadata = loaded_dict['metadata']
+            
+            # Verify that loaded data dimensions match current parameters
+            if (metadata['d'] != self.d or 
+                metadata['d_obs'] != self.d_obs or 
+                metadata['num_samples'] != self.num_samples):
+                print("Warning: Loaded data dimensions do not match current parameters.")
+                print(f"  Loaded:  d={metadata['d']}, d_obs={metadata['d_obs']}, n={metadata['num_samples']}")
+                print(f"  Current: d={self.d}, d_obs={self.d_obs}, n={self.num_samples}")
+            
+            print(f"Successfully loaded {len(self.data)} samples.")
+            
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            print("Generating new data instead...")
+            self._generate_data()
+            self._save_data()
+            
+    def __len__(self):
+        """Return the number of samples in the dataset."""
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        """Get a single sample from the dataset by index."""
+        if not 0 <= idx < len(self.data):
+            raise IndexError(f"Index {idx} is out of range for a dataset of size {len(self.data)}")
+        return self.data[idx]
+
+    def get_sample_info(self, idx=0):
+        """Print detailed information about a specific sample for debugging."""
+        if not 0 <= idx < len(self.data):
+            print(f"Index {idx} out of range.")
+            return
+            
+        sample = self.data[idx]
+        A = sample['A']
+        C = sample['C']
+        C_full = C @ C.T # Reconstruct full covariance matrix from Cholesky factor
+        eigs_A = torch.linalg.eigvals(A)
+        max_abs_eig = torch.max(torch.abs(eigs_A))
+        
+        print(f"--- Sample {idx} Information ---")
+        print(f"  m shape: {sample['m'].shape}")
+        print(f"  C (Cholesky) shape: {C.shape}")
+        print(f"  Is C_full symmetric? {torch.allclose(C_full, C_full.T)}")
+        print(f"  A shape: {A.shape}")
+        print(f"  Max |eigenvalue of A|: {max_abs_eig.item():.4f}")
+        print(f"  H shape: {sample['H'].shape}")
+        print(f"  sigma_v: {sample['sigma_v'].item():.4f}")
+        print(f"  sigma_y: {sample['sigma_y'].item():.4f}")
+        print("--------------------------")
