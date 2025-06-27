@@ -1,7 +1,0 @@
-Detected 4 GPUs
-Use DataParallel. Adjusted Batch Size: 4096
-Apply an ST on the joint distribution of ensemble state data and observation data.
-Train loader length: 2
-Dataloader generated.
-Total number of parameters: 120231
-Training Start
