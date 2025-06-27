@@ -50,7 +50,8 @@ for N in 5 10 15 20; do
         --N $N \
         --sigma_y $sigma_y \
         --seed $seed \
-        --cp_load_path save/${save_dir}/ft_cp_${N}_20.pth 
+        --cp_load_path save/${save_dir}/ft_cp_${N}_20.pth \
+        --normal_output
 done
 
 # sigma_y=0.7
@@ -67,21 +68,21 @@ done
 # done
 
 # ks
-dataset="ks"
+# dataset="ks"
 
-sigma_y=1
-seed=42
-save_dir="2025-04-11_14-02ks_1.0_20_60_8192_norm_EnST_tuned_joint"
+# sigma_y=1
+# seed=42
+# save_dir="2025-04-11_14-02ks_1.0_20_60_8192_norm_EnST_tuned_joint"
 
-# for N in 5 10 15 20 40 60 100; do
-for N in 5 10 15 20; do
-    python evaluate.py \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --cp_load_path save/${save_dir}/ft_cp_${N}_20.pth
-done
+# # for N in 5 10 15 20 40 60 100; do
+# for N in 5 10 15 20; do
+#     python evaluate.py \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --cp_load_path save/${save_dir}/ft_cp_${N}_20.pth
+# done
 
 # sigma_y=0.7
 # seed=42
