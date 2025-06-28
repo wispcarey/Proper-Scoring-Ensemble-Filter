@@ -340,6 +340,181 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     scheduler.step()
     return losses.avg
 
+def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calculate_crps=True):
+    """
+    Runs a particle filter, saves results (means, covariances) to a cache file,
+    and computes performance metrics (RMSE, optional CRPS).
+
+    This version is memory-efficient and conditionally calculates metrics.
+    If calculate_crps is False, CRPS keys are omitted from the output.
+
+    Args:
+        loader (torch.utils.data.DataLoader): DataLoader providing the dataset batches.
+        args (argparse.Namespace): A namespace object containing script arguments.
+        H_info (tuple): A tuple containing the observation operator function and matrix (H_fun, H).
+        check_disk (bool): If True, checks if the cache file already exists and skips computation.
+        calculate_crps (bool): If True, calculates CRPS and RCRPS metrics.
+
+    Returns:
+        dict: A dictionary containing performance metrics. CRPS-related keys are
+              only present if calculate_crps is True.
+    """
+
+    # --- Model and Observation Initialization ---
+    if args.dataset == "lorenz63":
+        forward_fun = L63.forward
+    elif args.dataset == "lorenz96":
+        forward_fun = L96.forward
+    elif args.dataset == "ks":
+        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
+    else:
+        raise NotImplementedError
+
+    if H_info is None:
+        H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
+    else:
+        H_fun, H = H_info
+
+    # --- Cache Filepath Generation ---
+    first_batch_for_shape = next(iter(loader))
+    traj_len = first_batch_for_shape.shape[0]
+    batch_size = first_batch_for_shape.shape[1]
+    cache_dir = os.path.join('data', args.dataset)
+    cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_{args.seed}.pt"
+    cache_filepath = os.path.join(cache_dir, cache_filename)
+
+    # --- Check for Existing Cache ---
+    if check_disk and os.path.exists(cache_filepath):
+        print(f"Particle filter results already exist at: {cache_filepath}")
+        # Return empty metrics if cache exists
+        metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse']
+        if calculate_crps:
+            metrics_keys.extend(['mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps'])
+        return {key: float('nan') for key in metrics_keys}
+
+    print(f"Generating particle filter results and saving to: {cache_filepath}")
+    all_pf_results_to_cache = []
+
+    # --- Initialize Metric Dictionaries ---
+    all_pf_metrics = {
+        'rmse': torch.empty(0, device=args.device),
+        'rrmse': torch.empty(0, device=args.device),
+    }
+    if calculate_crps:
+        all_pf_metrics['crps'] = torch.empty(0, device=args.device)
+        all_pf_metrics['rcrps'] = torch.empty(0, device=args.device)
+
+    with torch.no_grad():
+        for batch_ind, batch_v in enumerate(loader):
+            batch_v = batch_v.to(device=args.device)
+
+            # --- Particle Filter Initialization ---
+            pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)
+            pf_ens_v_a += torch.randn_like(pf_ens_v_a, device=args.device) * args.sigma_ens
+
+            batch_pf_means_to_cache, batch_pf_covs_to_cache = [], []
+            batch_rmse_steps = []
+            if calculate_crps:
+                batch_crps_steps = []
+
+            # --- Calculate metrics for the initial state (t=0) ---
+            true_state_t0 = batch_v[0]
+            rmse_t0 = torch.sqrt(torch.mean((pf_ens_v_a.mean(dim=1) - true_state_t0) ** 2, dim=1))
+            batch_rmse_steps.append(rmse_t0)
+            if calculate_crps:
+                crps_t0 = compute_es(pf_ens_v_a.unsqueeze(0), true_state_t0.unsqueeze(0), norm_p=1)
+                batch_crps_steps.append(crps_t0)
+
+            # --- Generate Observations ---
+            obs_y_list = [H_fun(batch_v[i].unsqueeze(1)) + args.sigma_y * torch.randn_like(H_fun(batch_v[i].unsqueeze(1))) for i in range(len(batch_v))]
+
+            # --- Main Particle Filter Assimilation Loop ---
+            for i in range(len(batch_v) - 1):
+                # Forecast Step
+                pf_ens_v_a_forecast_input = pf_ens_v_a.view(-1, args.ori_dim)
+                for j_iter in range(args.dt_iter):
+                    if args.dataset == 'ks':
+                        pf_ens_v_a_forecast_input = forward_fun(pf_ens_v_a_forecast_input, None, args.dt / args.dt_iter)
+                    else:
+                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+                        pf_ens_v_a_forecast_input = rk4(forward_fun, pf_ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+                pf_ens_v_f = pf_ens_v_a_forecast_input.view(-1, args.pf_N, args.ori_dim)
+                pf_ens_v_f += torch.randn_like(pf_ens_v_f) * args.sigma_v
+
+                # Analysis Step
+                pf_ens_v_a = bootstrap_particle_filter_analysis(
+                    pf_ens_v_f, obs_y_list[i + 1].squeeze(1), H_fun, args.sigma_y,
+                    resampling_method="multinomial", sigma_reg=args.sigma_reg,
+                    max_chunk_size=500000,
+                )
+
+                # Store results for caching and metrics
+                pf_mean_a = torch.mean(pf_ens_v_a, dim=1)
+                batch_pf_means_to_cache.append(pf_mean_a)
+                batch_pf_covs_to_cache.append(get_ens_cov(pf_ens_v_a))
+                
+                true_state_ti = batch_v[i + 1]
+                rmse_ti = torch.sqrt(torch.mean((pf_mean_a - true_state_ti) ** 2, dim=1))
+                batch_rmse_steps.append(rmse_ti)
+                if calculate_crps:
+                    crps_ti = compute_es(pf_ens_v_a.unsqueeze(0), true_state_ti.unsqueeze(0), norm_p=1)
+                    batch_crps_steps.append(crps_ti)
+
+            # --- Aggregate and Cache Batch Results ---
+            all_pf_results_to_cache.append({'means': torch.stack(batch_pf_means_to_cache), 'covs': torch.stack(batch_pf_covs_to_cache)})
+            
+            # --- Calculate and Aggregate Average Metrics for the Batch ---
+            rmse_val = torch.mean(torch.stack(batch_rmse_steps), dim=0)
+            rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
+            all_pf_metrics['rmse'] = torch.cat((all_pf_metrics['rmse'], rmse_val))
+            all_pf_metrics['rrmse'] = torch.cat((all_pf_metrics['rrmse'], rmse_val / rms_val))
+            if calculate_crps:
+                crps_val = torch.mean(torch.stack(batch_crps_steps), dim=0)
+                rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+                all_pf_metrics['crps'] = torch.cat((all_pf_metrics['crps'], crps_val))
+                all_pf_metrics['rcrps'] = torch.cat((all_pf_metrics['rcrps'], rcrps_val))
+            
+            print("update results")
+
+    # --- Save All Results to Cache File ---
+    print(f"Saving PF results to: {cache_filepath}")
+    os.makedirs(cache_dir, exist_ok=True)
+    torch.save(all_pf_results_to_cache, cache_filepath)
+
+    # --- Final Metrics Calculation ---
+    if all_pf_metrics['rrmse'].numel() == 0:
+        return {} # Return empty dict if no results were produced
+
+    valid_B_mask = ~torch.isnan(all_pf_metrics['rrmse'])
+    if not valid_B_mask.any():
+        return {} # Return empty dict if all results are invalid
+
+    # Calculate final metrics only for valid results
+    mean_rrmse, std_rrmse = get_mean_std(all_pf_metrics['rrmse'][valid_B_mask])
+    mean_rmse, std_rmse = get_mean_std(all_pf_metrics['rmse'][valid_B_mask])
+    
+    final_metrics = {
+        'mean_rrmse': mean_rrmse,
+        'std_rrmse': std_rrmse,
+        'mean_rmse': mean_rmse,
+        'std_rmse': std_rmse,
+    }
+
+    if calculate_crps:
+        mean_crps, std_crps = get_mean_std(all_pf_metrics['crps'][valid_B_mask])
+        mean_rcrps, std_rcrps = get_mean_std(all_pf_metrics['rcrps'][valid_B_mask])
+        final_metrics.update({
+            'mean_crps': mean_crps,
+            'std_crps': std_crps,
+            'mean_rcrps': mean_rcrps,
+            'std_rcrps': std_rcrps,
+        })
+        
+    final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_pf_metrics['rrmse'].numel() * 100.0
+
+    return final_metrics
+
+
 def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', save_pdf=False):
     model, infl_model, local_model, st_model1, st_model2 = model_list
 
@@ -368,29 +543,28 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     if hasattr(st_model1, 'eval'): st_model1.eval()
     if hasattr(st_model2, 'eval'): st_model2.eval()
     
-    # --- MODIFIED: PF Caching Logic ---
-    run_pf_computation = True
+    # --- Load Cached Particle Filter (PF) Results ---
     cached_pf_data = None
-    all_pf_results_to_cache = []
-
     if args.pf_verification:
-        # Generate a unique cache filename based on key parameters
+        # Generate the unique cache filename to look for.
         first_batch_for_shape = next(iter(loader))
         traj_len = first_batch_for_shape.shape[0]
         batch_size = first_batch_for_shape.shape[1]
         
         cache_dir = os.path.join('data', args.dataset)
-        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}.pt"
+        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_{args.seed}.pt"
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
         if os.path.exists(cache_filepath):
             print(f"Loading cached PF results from: {cache_filepath}")
             cached_pf_data = torch.load(cache_filepath, map_location=args.device)
-            run_pf_computation = False
         else:
-            print(f"No cached PF results found at {cache_filepath}. Running PF computation...")
-            all_pf_results_to_cache = []
-
+            # If the cache file does not exist, raise an error.
+            # The PF results must be generated beforehand by calling generate_and_cache_pf_results.
+            raise FileNotFoundError(
+                f"Required particle filter cache file not found at: {cache_filepath}. "
+                f"Please run generate_and_cache_pf_results() first."
+            )
 
     # --- Initialize Result Dictionaries ---
     all_results = {
@@ -417,14 +591,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             ens_list = [ens_v_a]
             loc_records = []
             
-            # MODIFIED: Initialize PF-related variables only if needed for computation
-            if args.pf_verification and run_pf_computation:
-                pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)
-                pf_ens_v_a += torch.randn_like(pf_ens_v_a, device=args.device) * args.sigma_ens
-                # Lists to store results for caching
-                batch_pf_means_to_cache = []
-                batch_pf_covs_to_cache = []
-
+            # Generate observations for the batch
             obs_y_list = []
             for i in range(len(batch_v)):
                 obs_y_step = H_fun(batch_v[i].unsqueeze(1))
@@ -444,35 +611,13 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
                 ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
                 
-                # --- MODIFIED: PF Logic with Caching ---
+                # --- Load PF results and calculate related metrics ---
                 if args.pf_verification:
-                    if run_pf_computation:
-                        # --- Scenario 1: Compute PF and prepare results for caching ---
-                        pf_ens_v_a_forecast_input = pf_ens_v_a.view(-1, args.ori_dim)
-                        for j_iter in range(args.dt_iter):
-                            if args.dataset == 'ks':
-                                pf_ens_v_a_forecast_input = forward_fun(pf_ens_v_a_forecast_input, None, args.dt / args.dt_iter)
-                            else:
-                                current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                                pf_ens_v_a_forecast_input = rk4(forward_fun, pf_ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                        pf_ens_v_f = pf_ens_v_a_forecast_input.view(-1, args.pf_N, args.ori_dim)
-                        pf_ens_v_f += torch.randn_like(pf_ens_v_f, device=args.device) * args.sigma_v
-                        
-                        pf_ens_v_a = bootstrap_particle_filter_analysis(pf_ens_v_f, obs_y_list[i + 1].squeeze(1), H_fun, args.sigma_y, 
-                                                                        resampling_method="multinomial", sigma_reg=args.sigma_reg)
-                        
-                        pf_mean_a = torch.mean(pf_ens_v_a, dim=1)
-                        pf_cov_ens_a = get_ens_cov(pf_ens_v_a)
-                        
-                        # Collect results to be cached later
-                        batch_pf_means_to_cache.append(pf_mean_a)
-                        batch_pf_covs_to_cache.append(pf_cov_ens_a)
-                    else:
-                        # --- Scenario 2: Load pre-computed results from cache ---
-                        pf_mean_a = cached_pf_data[batch_ind]['means'][i]
-                        pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
-                    
-                    # Calculate metrics using pf_mean_a and pf_cov_ens_a (regardless of source)
+                    # Load pre-computed results from the cached data structure.
+                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
+                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
+                
+                    # Calculate metrics using pf_mean_a (regardless of source)
                     true_state = batch_v[i + 1]
                     pf_rmse = torch.sqrt(torch.mean((pf_mean_a - true_state)**2, dim=-1))
                     pf_rmse_list.append(pf_rmse)
@@ -505,14 +650,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     cov_diff_list.append(cov_diff)
                     rcov_diff_list.append(rcov_diff)
 
-            # --- MODIFIED: After processing a batch, store its PF results for the final cache file ---
-            if args.pf_verification and run_pf_computation:
-                batch_results_for_cache = {
-                    'means': torch.stack(batch_pf_means_to_cache),
-                    'covs': torch.stack(batch_pf_covs_to_cache)
-                }
-                all_pf_results_to_cache.append(batch_results_for_cache)
-
             # --- Process and Store Batch Results ---
             ens_tensor = torch.stack(ens_list)
 
@@ -531,7 +668,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
             if args.pf_verification:
-                # BUG FIXED: Use stack and mean to correctly aggregate tensors from the list.
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
                 all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
@@ -554,42 +690,36 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             else:
                 print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
     
-    # --- MODIFIED: After all batches are processed, save the PF results to the cache file ---
-    if args.pf_verification and run_pf_computation:
-        print(f"Saving PF results to: {cache_filepath}")
-        os.makedirs(cache_dir, exist_ok=True)
-        torch.save(all_pf_results_to_cache, cache_filepath)
-
     if plot_figures: 
         time_idx_plot = -2 # Example: Plot second to last time state
         num_dims_plot = 4 # Example
         dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
 
         plot_particle_trajectories_with_histograms(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                                true_traj=batch_v[:,time_idx_plot,:], 
-                                                observation=None, #observations[:,time_idx_plot,:],
-                                                dim_indices=dim_indices_plot,
-                                                start_time=0,
-                                                end_time=ens_tensor.shape[0], #Trajectory length
-                                                mode='quantile',
-                                                save_fig=True,
-                                                save_pdf=save_pdf,
-                                                save_name=fig_name + "_hist",
-                                                hist_step=1,
-                                                fontsize=None)
+                                                 true_traj=batch_v[:,time_idx_plot,:], 
+                                                 observation=None, #observations[:,time_idx_plot,:],
+                                                 dim_indices=dim_indices_plot,
+                                                 start_time=0,
+                                                 end_time=ens_tensor.shape[0], #Trajectory length
+                                                 mode='quantile',
+                                                 save_fig=True,
+                                                 save_pdf=save_pdf,
+                                                 save_name=fig_name + "_hist",
+                                                 hist_step=1,
+                                                 fontsize=None)
         plot_particle_trajectories(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                true_traj=batch_v[:,time_idx_plot,:], 
-                                observation=observations[:,time_idx_plot,:],
-                                cmap_name='bwr',
-                                start_time=0,
-                                end_time=ens_tensor.shape[0], 
-                                main_fig_size=(5, 2), 
-                                save_fig=True,
-                                save_pdf=save_pdf,
-                                save_name=fig_name + "_traj",
-                                colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-                                plot_vertical_colorbar=False,
-                                plot_horizontal_colorbar=True)
+                                   true_traj=batch_v[:,time_idx_plot,:], 
+                                   observation=observations[:,time_idx_plot,:],
+                                   cmap_name='bwr',
+                                   start_time=0,
+                                   end_time=ens_tensor.shape[0], 
+                                   main_fig_size=(5, 2), 
+                                   save_fig=True,
+                                   save_pdf=save_pdf,
+                                   save_name=fig_name + "_traj",
+                                   colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+                                   plot_vertical_colorbar=False,
+                                   plot_horizontal_colorbar=True)
 
     # --- Final Metrics Calculation ---
     final_metrics = {}
@@ -635,16 +765,24 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     return final_metrics
 
 def print_test_results(results):
-    """A helper function to format and print the test results dictionary."""
-    print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
-    print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
-    print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
-    print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
-    print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
-    print(f"Cov-Diff: {results['mean_cov_diff']:.3f} ± {results['std_cov_diff']:.3f}")
-    print(f"RCov-Diff: {results['mean_rcov_diff']:.3f} ± {results['std_rcov_diff']:.3f}")
-    print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
-    print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
+    if 'mean_rmse' in results and 'std_rmse' in results:
+        print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
+    if 'mean_rrmse' in results and 'std_rrmse' in results:
+        print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
+    if 'mean_rmv' in results and 'std_rmv' in results:
+        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
+    if 'mean_crps' in results and 'std_crps' in results:
+        print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
+    if 'mean_rcrps' in results and 'std_rcrps' in results:
+        print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
+    if 'mean_cov_diff' in results and 'std_cov_diff' in results:
+        print(f"Cov-Diff: {results['mean_cov_diff']:.3f} ± {results['std_cov_diff']:.3f}")
+    if 'mean_rcov_diff' in results and 'std_rcov_diff' in results:
+        print(f"RCov-Diff: {results['mean_rcov_diff']:.3f} ± {results['std_rcov_diff']:.3f}")
+    if 'mean_pf_rmse' in results and 'std_pf_rmse' in results:
+        print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
+    if 'no_nan_percent' in results:
+        print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
 
 
 def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', loc_radius=None, save_pdf=False):

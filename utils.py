@@ -237,7 +237,7 @@ def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
 
     v0 = v0 if v0 is not None else default_v0
     prefix_path = f'{directory}/{prefix}true_v_withnoise_{dt:.3f}step.npy'
-    test_file_path = f'{directory}/test_{steps_valid}_{steps_test}_v_{dt:.3f}step.npy'
+    test_file_path = f'{directory}/{prefix}test_{steps_valid}_{steps_test}_v_{dt:.3f}step.npy'
     
     # Training data generation
     with torch.no_grad():

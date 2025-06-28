@@ -179,7 +179,7 @@ def get_parameters():
     parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')
     parser.add_argument('--pf_N', type=int, default=1000,
                         help='number particles for PF')
-    parser.add_argument('--sigma_reg', type=float, default=1e-2,
+    parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
                         help='the std of noise added to resampling in BPF')
 
 

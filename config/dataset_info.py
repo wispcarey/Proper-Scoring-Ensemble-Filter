@@ -16,7 +16,7 @@ DATASET_INFO = {
         'train_steps': 60,
         'train_traj_num': 8192,
         'sigma_ens': 1,
-        'sigma_v': 0,
+        'sigma_v': 1e-2,
         'colorbar_range': None,
     },
     'lorenz96': {
