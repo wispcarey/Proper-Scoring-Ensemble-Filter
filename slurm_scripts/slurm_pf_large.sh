@@ -21,7 +21,7 @@
 module load cuda/12.2  # Adjusted to CUDA version 12.2
 
 # Change to the directory containing v2_run_fine_tuning.sh
-cd ../scripts  # Assuming `scripts` folder is one level up from `slurm_script`
+cd .. 
 
 echo "Date: $(date)"
 echo "Job ID: $SLURM_JOB_ID"
