@@ -22,16 +22,16 @@ cd ..
 #     --loss_type nes \
 #     --es_p 1 
 
-python train_v2.py \
-    --epochs 1500 \
-    --dataset linear \
-    --N 10 \
-    --seed 42 \
-    --v EtE \
-    --no_localization \
-    --loss_type es \
-    --es_p 1 \
-    --normal_output
+# python train_v2.py \
+#     --epochs 1500 \
+#     --dataset linear \
+#     --N 10 \
+#     --seed 42 \
+#     --v EtE \
+#     --no_localization \
+#     --loss_type es \
+#     --es_p 1 \
+#     --normal_output
 
 # python train_v2.py \
 #     --epochs 500 \

@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1        # 4 GPUs of any type
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
-#SBATCH -J "bohan-gpu-bpf-large"   # job name
+#SBATCH -J "bpf-large"   # job name
 #SBATCH --mail-user=bhchen@caltech.edu # email address
 #SBATCH --mail-type=BEGIN   # email notification at start
 #SBATCH --mail-type=END     # email notification at end
@@ -29,8 +29,8 @@ echo "Host: $(hostname)"
 echo "Python: $(which python)"
 echo "----------------------------------------------------"
 
-SEEDS=(0 1 2 3 42)
-PARTICLE_NUMBERS=(1000000 200000 5000000)
+SEEDS=(0 1 2 3 4 5 6 7 8 9 42)
+PARTICLE_NUMBERS=(1000000 2000000)
 
 for seed_val in "${SEEDS[@]}"; do
     for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do

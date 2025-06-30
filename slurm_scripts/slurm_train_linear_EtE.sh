@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1        # 4 GPUs of any type
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
-#SBATCH -J "bohan-gpu-LearnLinear"   # job name
+#SBATCH -J "Linear-EtE"   # job name
 #SBATCH --mail-user=bhchen@caltech.edu # email address
 #SBATCH --mail-type=BEGIN   # email notification at start
 #SBATCH --mail-type=END     # email notification at end
@@ -21,7 +21,17 @@
 module load cuda/12.2  # Adjusted to CUDA version 12.2
 
 # Change to the directory containing v2_run_fine_tuning.sh
-cd ../scripts  # Assuming `scripts` folder is one level up from `slurm_script`
+cd ..
 
 # Run your program
-bash run_linear.sh
+python train_v2.py \
+    --epochs 1000 \
+    --dataset linear \
+    --N 10 \
+    --seed 42 \
+    --v EtE \
+    --no_localization \
+    --loss_type es \
+    --es_p 1
+
+

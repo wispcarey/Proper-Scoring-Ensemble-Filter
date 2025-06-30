@@ -424,8 +424,8 @@ def get_dataloader(args, x0=None, test_only=False):
         J = torch.randn(args.ori_dim, args.ori_dim)
         A, _ = torch.linalg.qr(J)
         
-        H = torch.zeros(10,20)
-        for i in range(10):
+        H = torch.zeros(args.obs_dim, args.ori_dim)
+        for i in range(args.obs_dim):
             H[i, 2*i] = 1
             
         train_data = LinearSystemDataset(
