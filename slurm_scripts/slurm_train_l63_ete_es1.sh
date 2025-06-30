@@ -24,15 +24,15 @@ module load cuda/12.2  # Adjusted to CUDA version 12.2
 cd ..
 
 # Run your program
- python train.py \
-    --dataset lorenz63 \
-    --epochs 1000 \
-    --N 10 \
-    --sigma_y 1 \
-    --seed 42 \
-    --v EtE \
-    --no_localization \
-    --loss_type es \
-    --es_p 1 \
-    --test_steps 500 
+python train.py \
+   --dataset lorenz63 \
+   --epochs 1000 \
+   --N 10 \
+   --sigma_y 1 \
+   --seed 42 \
+   --v EtE \
+   --no_localization \
+   --loss_type es \
+   --es_p 1 \
+   --test_steps 500 
 

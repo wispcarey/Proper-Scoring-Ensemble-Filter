@@ -72,6 +72,8 @@ if __name__ == "__main__":
                 'mean_rcrps':test_results['mean_rcrps'],
                 'std_rcrps':test_results['std_rcrps'],
                 'valid_percent':test_results['no_nan_percent'],
+                'cov_diff':test_results['mean_cov_diff'],
+                'pf_rmse':test_results['mean_pf_rmse'],
                 'loc_mean':loc_mean,
                 'loc_std':loc_std,
                 'loc_diff_dist':args.diff_dist,

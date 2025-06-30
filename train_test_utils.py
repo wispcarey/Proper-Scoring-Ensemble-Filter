@@ -24,6 +24,8 @@ def set_models(args):
     elif args.v == 'EtE2':
         model = ConditionTransformerNetwork(u_dim=args.ori_dim + args.obs_dim, y_dim=args.obs_dim, output_dim=args.ori_dim, hidden_dim=args.hidden_dim, 
                                             num_blocks=4, num_heads=8, ff_expansion=2).to(args.device)
+    else:
+        model = NaiveNetwork(1)
     if args.no_localization or args.v.startswith('EtE'):
         local_model = NaiveNetwork(1)
     else:
@@ -31,6 +33,7 @@ def set_models(args):
     if args.v == 'EtE2':
         st_model1 = NaiveNetwork(1)
         st_model2 = NaiveNetwork(1)
+        
         infl_model = NaiveNetwork(1)
     else:
         if args.st_type == 'separate':
@@ -58,6 +61,8 @@ def set_models(args):
                 infl_model = NaiveNetwork(1)
             else:
                 infl_model = Simple_MLP(d_input=args.ori_dim + 2 * args.st_output_dim, d_output=args.ori_dim, num_hidden_layers=2).to(args.device)
+        else:
+            st_model1, st_model2, infl_model, local_model = NaiveNetwork(1), NaiveNetwork(1), NaiveNetwork(1), NaiveNetwork(1)
     if args.use_data_parallel:
         model, infl_model, local_model, st_model1, st_model2 = \
             nn.DataParallel(model), nn.DataParallel(infl_model), nn.DataParallel(local_model), nn.DataParallel(st_model1), nn.DataParallel(st_model2)
@@ -185,12 +190,25 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
         )
         nn_output = model(nn_input).view(B, N_ens, -1)
         current_analyzed_ens_v_a = nn_output
+        
     elif args.v == 'EtE2':
         nn_input, y, _ = _get_model_inputs(
             args, st_model1, st_model2, ens_v_f, hv, obs_y
         )
         nn_output = model(nn_input, y).view(B, N_ens, -1)
         current_analyzed_ens_v_a = nn_output
+        
+    elif args.v == 'EnKF':
+        Vnn1 = ens_v_f
+        Vnn2 = ens_v_f - mean_ens_v_f
+        Ynn = hv - mean_hv
+
+        R_cov = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(d_obs, device=args.device).unsqueeze(0).repeat(B, 1, 1)
+        
+        K1 = torch.bmm(Vnn2.transpose(1, 2), Ynn) 
+        K2 = torch.bmm(Ynn.transpose(1, 2), Ynn) + R_cov * (N_ens - 1)
+        K = torch.bmm(K1, torch.inverse(K2))
+        current_analyzed_ens_v_a = Vnn1 + torch.bmm(ens_i_innov, K.transpose(1, 2))
     else:
         raise NotImplementedError(f"args.v = {args.v} is not implemented.")
 
@@ -517,10 +535,8 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
 
 def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', save_pdf=False):
     model, infl_model, local_model, st_model1, st_model2 = model_list
-
     m = args.N
     
-    # --- Forward Function Initialization ---
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
@@ -530,23 +546,19 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     else:
         raise NotImplementedError
 
-    # --- Observation Operator Initialization ---
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
     else:
         H_fun, H = H_info
     
-    # --- Set Models to Evaluation Mode ---
     model.eval()
     if hasattr(infl_model, 'eval'): infl_model.eval()
     if hasattr(local_model, 'eval'): local_model.eval()
     if hasattr(st_model1, 'eval'): st_model1.eval()
     if hasattr(st_model2, 'eval'): st_model2.eval()
     
-    # --- Load Cached Particle Filter (PF) Results ---
     cached_pf_data = None
     if args.pf_verification:
-        # Generate the unique cache filename to look for.
         first_batch_for_shape = next(iter(loader))
         traj_len = first_batch_for_shape.shape[0]
         batch_size = first_batch_for_shape.shape[1]
@@ -557,16 +569,13 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
         if os.path.exists(cache_filepath):
             print(f"Loading cached PF results from: {cache_filepath}")
-            cached_pf_data = torch.load(cache_filepath, map_location=args.device)
+            cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
         else:
-            # If the cache file does not exist, raise an error.
-            # The PF results must be generated beforehand by calling generate_and_cache_pf_results.
             raise FileNotFoundError(
                 f"Required particle filter cache file not found at: {cache_filepath}. "
                 f"Please run generate_and_cache_pf_results() first."
             )
 
-    # --- Initialize Result Dictionaries ---
     all_results = {
         'rmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
@@ -582,25 +591,20 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
             batch_v = batch_v.to(device=args.device)
-
             ens_v_a = batch_v[0].unsqueeze(1).repeat(1, m, 1)
             ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
             
-            # Initialize lists for the current batch
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
             ens_list = [ens_v_a]
             loc_records = []
             
-            # Generate observations for the batch
             obs_y_list = []
             for i in range(len(batch_v)):
                 obs_y_step = H_fun(batch_v[i].unsqueeze(1))
                 obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
                 obs_y_list.append(obs_y_step)
 
-            # --- Main Assimilation Loop ---
             for i in range(len(batch_v) - 1):
-                # --- Forecast Step ---
                 ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
                 for j_iter in range(args.dt_iter):
                     if args.dataset == 'ks':
@@ -611,18 +615,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
                 ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
                 
-                # --- Load PF results and calculate related metrics ---
-                if args.pf_verification:
-                    # Load pre-computed results from the cached data structure.
-                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
-                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
-                
-                    # Calculate metrics using pf_mean_a (regardless of source)
-                    true_state = batch_v[i + 1]
-                    pf_rmse = torch.sqrt(torch.mean((pf_mean_a - true_state)**2, dim=-1))
-                    pf_rmse_list.append(pf_rmse)
-
-                # --- Prepare for Analysis ---
                 hv = H_fun(ens_v_f)
                 obs_y = obs_y_list[i + 1]
                 r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
@@ -631,7 +623,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 mean_hv = torch.mean(hv, dim=1, keepdim=True)
                 mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
                 
-                # --- Analysis Step (Refactored) ---
                 ens_v_a, loc_nn_output = _process_analysis_step(
                     args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv
                 )
@@ -639,29 +630,32 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 if loc_nn_output is not None:
                     loc_records.append(loc_nn_output)
                     
-                # --- Post-processing and Storing ---
                 ens_v_a = post_process(ens_v_a, infl=infl)
                 ens_list.append(ens_v_a)
                 
                 if args.pf_verification:
+                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
+                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
+
+                    our_method_mean_a = torch.mean(ens_v_a, dim=1)
+                    pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))
+                    pf_rmse_list.append(pf_rmse)
+                    
                     cov_ens_a = get_ens_cov(ens_v_a)
                     cov_diff = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1)) 
                     rcov_diff = cov_diff / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
                     cov_diff_list.append(cov_diff)
                     rcov_diff_list.append(rcov_diff)
 
-            # --- Process and Store Batch Results ---
             ens_tensor = torch.stack(ens_list)
-
-            # --- Metric Calculation for the Batch ---
+            
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.mean(torch.sqrt(args.N / (args.N - 1) * torch.mean((ens_tensor - batch_v.unsqueeze(2)) ** 2, dim=(2,3))),dim=0)
-
-            # --- Aggregate Results ---
+            
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
@@ -671,10 +665,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
                 all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
-
-            # Handle localization tensor if it exists
+            
             if args.v != "EtE" and not args.no_localization and loc_records:
-                current_loc_tensor = torch.stack(loc_records).unsqueeze(0) # Add batch dim
+                current_loc_tensor = torch.stack(loc_records).unsqueeze(0)
                 if loc_tensor_all_batches is None:
                     loc_tensor_all_batches = current_loc_tensor
                 else:
@@ -691,40 +684,42 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
     
     if plot_figures: 
-        time_idx_plot = -2 # Example: Plot second to last time state
-        num_dims_plot = 4 # Example
+        time_idx_plot = -2
+        num_dims_plot = 4
         dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
 
+        if args.pf_verification:
+            batch_v = cached_pf_data[-1]['means']
+            ens_tensor = ens_tensor[1:]
+            observations = observations[1:]
         plot_particle_trajectories_with_histograms(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                                 true_traj=batch_v[:,time_idx_plot,:], 
-                                                 observation=None, #observations[:,time_idx_plot,:],
-                                                 dim_indices=dim_indices_plot,
-                                                 start_time=0,
-                                                 end_time=ens_tensor.shape[0], #Trajectory length
-                                                 mode='quantile',
-                                                 save_fig=True,
-                                                 save_pdf=save_pdf,
-                                                 save_name=fig_name + "_hist",
-                                                 hist_step=1,
-                                                 fontsize=None)
+                                                true_traj=batch_v[:,time_idx_plot,:], 
+                                                observation=None, 
+                                                dim_indices=dim_indices_plot,
+                                                start_time=0,
+                                                end_time=ens_tensor.shape[0],
+                                                mode='quantile',
+                                                save_fig=True,
+                                                save_pdf=save_pdf,
+                                                save_name=fig_name + "_hist",
+                                                hist_step=1,
+                                                fontsize=None)
         plot_particle_trajectories(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                   true_traj=batch_v[:,time_idx_plot,:], 
-                                   observation=observations[:,time_idx_plot,:],
-                                   cmap_name='bwr',
-                                   start_time=0,
-                                   end_time=ens_tensor.shape[0], 
-                                   main_fig_size=(5, 2), 
-                                   save_fig=True,
-                                   save_pdf=save_pdf,
-                                   save_name=fig_name + "_traj",
-                                   colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-                                   plot_vertical_colorbar=False,
-                                   plot_horizontal_colorbar=True)
+                                true_traj=batch_v[:,time_idx_plot,:], 
+                                observation=observations[:,time_idx_plot,:],
+                                cmap_name='bwr',
+                                start_time=0,
+                                end_time=ens_tensor.shape[0], 
+                                main_fig_size=(5, 2), 
+                                save_fig=True,
+                                save_pdf=save_pdf,
+                                save_name=fig_name + "_traj",
+                                colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+                                plot_vertical_colorbar=False,
+                                plot_horizontal_colorbar=True)
 
-    # --- Final Metrics Calculation ---
     final_metrics = {}
     
-    # Check if any results were produced
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
                         'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
@@ -733,12 +728,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
-        # Check for NaN values in a reference metric (e.g., rrmse)
         nan_mask = torch.isnan(all_results['rrmse'])
         valid_B_mask = ~nan_mask
         
         if not valid_B_mask.any():
-            # Return NaNs if all results are invalid
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
                             'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
                             'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
@@ -746,7 +739,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
         else:
-            # Calculate mean and std for valid results
             final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
             final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
             final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
@@ -758,7 +750,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
 
-    # Prepare final localization tensor to return (e.g., from the first batch)
     final_loc_tensor_to_return = loc_tensor_all_batches[0] if loc_tensor_all_batches is not None and loc_tensor_all_batches.shape[0] > 0 else torch.empty(1, device=args.device)
     final_metrics['loc_tensor'] = final_loc_tensor_to_return
 
