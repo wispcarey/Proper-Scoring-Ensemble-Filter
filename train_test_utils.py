@@ -19,7 +19,7 @@ def set_models(args):
     # set models
     if args.v == 'CorrTerms':
         model = Simple_MLP(d_input=args.input_dim, d_output=args.obs_dim + args.ori_dim, num_hidden_layers=3).to(args.device)
-    elif args.v == 'EtE':
+    elif args.v == 'EtE' or args.v == 'EtE-LRes':
         model = Simple_MLP(d_input=args.input_dim, d_output=args.ori_dim, num_hidden_layers=4).to(args.device)
     elif args.v == 'EtE2':
         model = ConditionTransformerNetwork(u_dim=args.ori_dim + args.obs_dim, y_dim=args.obs_dim, output_dim=args.ori_dim, hidden_dim=args.hidden_dim, 
@@ -118,7 +118,7 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
         local_nn_input = torch.cat(local_nn_input_cat_list, dim=-1)
         infl_nn_input = torch.cat(infl_nn_input_cat_list, dim=-1).view(-1, args.ori_dim + st_output_dim_actual)
         return nn_input, local_nn_input, infl_nn_input
-    elif args.v == 'EtE':
+    elif args.v == 'EtE' or args.v == 'EtE-LRes':
         return nn_input, None, None # Return None for unused values
     elif args.v == 'EtE2':
         return nn_input, obs_y.squeeze(1), None
@@ -183,13 +183,21 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
         
         K = torch.bmm(K1, torch.inverse(K2))
         current_analyzed_ens_v_a = Vnn1 + torch.bmm(ens_i_innov, K.transpose(1, 2))
-
+    
     elif args.v == 'EtE':
         nn_input, _, _ = _get_model_inputs(
             args, st_model1, st_model2, ens_v_f, hv, obs_y
         )
         nn_output = model(nn_input).view(B, N_ens, -1)
         current_analyzed_ens_v_a = nn_output
+        
+    elif args.v == 'EtE-LRes':
+        nn_input, _, _ = _get_model_inputs(
+            args, st_model1, st_model2, ens_v_f, hv, obs_y
+        )
+        nn_output = model(nn_input).view(B, N_ens, -1)
+        # modified to learning the residual 
+        current_analyzed_ens_v_a = ens_v_f + nn_output
         
     elif args.v == 'EtE2':
         nn_input, y, _ = _get_model_inputs(
