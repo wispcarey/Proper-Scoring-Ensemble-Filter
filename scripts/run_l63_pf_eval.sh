@@ -44,7 +44,7 @@ for N in 10; do
     --cp_load_path save/${save_dir}/cp_1000.pth
 done
 
-ete es1
+# ete es1
 save_dir="2025-06-28_21-55lorenz63_1.0_10_60_8192_es_joint_EtE"
 for N in 10; do
     python evaluate.py \

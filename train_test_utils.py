@@ -572,7 +572,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         batch_size = first_batch_for_shape.shape[1]
         
         cache_dir = os.path.join('data', args.dataset)
-        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_{args.seed}.pt"
+        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_avg.pt"
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
         if os.path.exists(cache_filepath):
@@ -1373,14 +1373,184 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
     return final_metrics
 
 def print_test_results_v2(results):
-    """A helper function to format and print the test results dictionary."""
-    print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
-    print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
-    print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
-    print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
-    print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
-    print(f"W2: {results['mean_w2_diff']:.3f} ± {results['std_w2_diff']:.3f}")
-    # print(f"CovDiff: {results['mean_cov_diff']:.3f} ± {results['std_cov_diff']:.3f}")
-    # print(f"RCovDiff: {results['mean_rcov_diff']:.3f} ± {results['std_rcov_diff']:.3f}")
-    print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
-    print(f"Min initial norm: {results['min_m_norm']:.2f}, Max initial norm: {results['max_m_norm']:.2f}")
+    """
+    Print formatted test results from a dictionary.
+
+    Args:
+        results (dict): A dictionary containing metric names as keys
+                        and their calculated values. It checks for the
+                        existence of keys before printing.
+    """
+    if 'mean_rmse' in results and 'std_rmse' in results:
+        print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
+        
+    if 'mean_rrmse' in results and 'std_rrmse' in results:
+        print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
+        
+    if 'mean_rmv' in results and 'std_rmv' in results:
+        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
+        
+    if 'mean_crps' in results and 'std_crps' in results:
+        print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
+        
+    if 'mean_rcrps' in results and 'std_rcrps' in results:
+        print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
+        
+    if 'mean_w2_diff' in results and 'std_w2_diff' in results:
+        print(f"W2: {results['mean_w2_diff']:.3f} ± {results['std_w2_diff']:.3f}")
+        
+    if 'no_nan_percent' in results:
+        print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
+        
+    if 'min_m_norm' in results and 'max_m_norm' in results:
+        print(f"Min initial norm: {results['min_m_norm']:.2f}, Max initial norm: {results['max_m_norm']:.2f}")
+    
+
+### test gt uncertainty 
+def test_linear_sampling_error(loader, args, num_resamples):
+    """
+    Computes the sampling error of an ensemble in a linear-Gaussian system.
+
+    This function runs a Kalman Filter to get the true posterior mean and
+    covariance. At each step, it repeatedly samples from this true posterior
+    to measure the statistical error (RMSE, CRPS, W2) introduced by a
+    finite ensemble size N.
+
+    Args:
+        loader (DataLoader): DataLoader for initial conditions.
+        args (Namespace): Experiment parameters (N, device, test_steps, etc.).
+        num_resamples (int): Number of times to resample at each step for averaging.
+
+    Returns:
+        dict: A dictionary of final, averaged metrics and their standard deviation.
+    """
+    N = args.N
+    D = args.ori_dim
+    D_obs = args.obs_dim
+
+    # --- Forward and Observation Function Initialization ---
+    forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1, -2))
+    H_fun = lambda x, H: torch.bmm(x, H.transpose(-1, -2))
+
+    # --- Initialize Result Tensors for All Batches---
+    all_results = {
+        'rmse': torch.empty(0, device=args.device),
+        'rmv': torch.empty(0, device=args.device),
+        'rrmse': torch.empty(0, device=args.device),
+        'crps': torch.empty(0, device=args.device),
+        'rcrps': torch.empty(0, device=args.device),
+        'w2_diff': torch.empty(0, device=args.device),
+    }
+
+    with torch.no_grad():
+        for batch_ind, batch_info in enumerate(loader):
+            # --- Unpack Batch Data ---
+            m, A, C, H, sigma_v, sigma_y = (batch_info['m'], batch_info['A'], batch_info['C'], 
+                                             batch_info['H'], batch_info['sigma_v'].squeeze(), 
+                                             batch_info['sigma_y'].squeeze())
+            m, A, C, H, sigma_v, sigma_y = (m.to(args.device), A.to(args.device), C.to(args.device), 
+                                             H.to(args.device), sigma_v.to(args.device), sigma_y.to(args.device))
+            
+            B = m.shape[0]
+            
+            # --- Initialize Ground Truth State and Covariance ---
+            gt_v_a = m.unsqueeze(1) # Shape: (B, 1, D)
+            P_a = C @ C.transpose(-1, -2) 
+            
+            # --- Lists to Store Trajectory-Averaged Data ---
+            gt_list = [gt_v_a.squeeze(1)]
+            rmse_list, rmv_list, crps_list, w2_diff_list = [], [], [], []
+
+            # --- Main Assimilation Loop ---
+            for i in range(args.test_steps - 1):
+                # --- Ground Truth Evolution (Kalman Filter) ---
+                Q = (sigma_v.view(B, 1, 1) ** 2) * torch.eye(D, device=args.device)
+                R = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(D_obs, device=args.device)
+                
+                gt_v_f = forward_fun(gt_v_a, A)
+                gt_v_a = gt_v_f + torch.bmm(torch.randn_like(gt_v_f), Q.sqrt())
+                obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a, H)), R.sqrt())
+
+                # --- Kalman Filter Update (Ground Truth) ---
+                P_f = A @ P_a @ A.transpose(-1, -2) + Q
+                S = H @ P_f @ H.transpose(-1, -2) + R
+                K = P_f @ H.transpose(-1, -2) @ torch.inverse(S)
+                P_a = (torch.eye(D, device=args.device) - K @ H) @ P_f
+                gt_v_a = (gt_v_f.transpose(-1,-2) + K @ (obs_y - H_fun(gt_v_f, H)).transpose(-1,-2)).transpose(-1,-2)
+
+                # --- Resampling and Metric Calculation Loop ---
+                step_rmses, step_rmvs, step_crpses, step_w2s = [], [], [], []
+                L_a = torch.linalg.cholesky(P_a)
+                
+                for _ in range(num_resamples):
+                    noise = torch.randn(B, N, D, device=args.device)
+                    ens_v_a = gt_v_a + torch.bmm(noise, L_a.transpose(-1,-2))
+                    
+                    ens_mean = ens_v_a.mean(dim=1)
+                    P_ens_a = get_ens_cov(ens_v_a) 
+
+                    # --- Calculate Metrics for this Sample Set ---
+                    rmse = torch.sqrt(torch.mean((ens_mean - gt_v_a.squeeze(1)) ** 2, dim=-1))
+                    step_rmses.append(rmse)
+
+                    rmv = torch.sqrt(torch.mean((ens_v_a - gt_v_a)**2, dim=(1,-1)))
+                    step_rmvs.append(rmv)
+                    
+                    crps = compute_es(ens_v_a.unsqueeze(0), gt_v_a.squeeze(1).unsqueeze(0)).squeeze(0)
+                    step_crpses.append(crps)
+
+                    w2 = wasserstein2_multivariate_gaussian(
+                        mean_true=gt_v_a.squeeze(1), cov_true=P_a, 
+                        mean_sample=ens_mean, cov_sample=P_ens_a
+                    )
+                    step_w2s.append(w2)
+
+                # --- Average metrics over the resamples for this time step ---
+                rmse_list.append(torch.stack(step_rmses).mean(dim=0))
+                rmv_list.append(torch.stack(step_rmvs).mean(dim=0))
+                crps_list.append(torch.stack(step_crpses).mean(dim=0))
+                w2_diff_list.append(torch.stack(step_w2s).mean(dim=0))
+                
+                gt_list.append(gt_v_a.squeeze(1))
+
+            # --- Process and Store Batch Results (Averaged over trajectory) ---
+            gt_tensor = torch.stack(gt_list, dim=0)
+            
+            rmse_val = torch.stack(rmse_list).mean(dim=0)
+            rmv_val = torch.stack(rmv_list).mean(dim=0)
+            crps_val = torch.stack(crps_list).mean(dim=0)
+            w2_diff_val = torch.stack(w2_diff_list).mean(dim=0)
+
+            rms_val = torch.sqrt(torch.mean(gt_tensor ** 2, dim=-1)).mean(dim=0)
+            rrmse_val = rmse_val / rms_val
+            rcrps_val = crps_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
+
+            # --- Aggregate Results ---
+            all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
+            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
+            all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
+            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
+            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['w2_diff'] = torch.cat((all_results['w2_diff'], w2_diff_val))
+
+    # --- Final Metrics Calculation ---
+    final_metrics = {}
+    nan_mask = torch.isnan(all_results['rrmse'])
+    valid_B_mask = ~nan_mask
+    
+    if not valid_B_mask.any():
+        metrics_keys = ['mean_rrmse', 'std_rrmse', 'mean_rmse', 'std_rmse', 
+                        'mean_rmv', 'std_rmv', 'mean_crps', 'std_crps', 
+                        'mean_rcrps', 'std_rcrps', 'mean_w2_diff', 'std_w2_diff']
+        final_metrics = {key: float('nan') for key in metrics_keys}
+        final_metrics['no_nan_percent'] = 0.0
+    else:
+        final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
+        final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
+        final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
+        final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
+        final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+        final_metrics['mean_w2_diff'], final_metrics['std_w2_diff'] = get_mean_std(all_results['w2_diff'][valid_B_mask])
+        final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
+
+    return final_metrics
