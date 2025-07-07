@@ -174,6 +174,8 @@ def get_parameters():
                         help='number of epochs in the beginning to warm up the learning rate')
     parser.add_argument('--SGD', action='store_true',
                         help='use SGD optimizer, otherwise use Adam')
+    parser.add_argument('--no_running_loss', action='store_true',
+                        help='Do not use an accumulative loss in training. Calculate the loss once finishing the entire trajectory')
     
     # test settings
     parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')
@@ -254,6 +256,11 @@ def get_parameters():
         
     if args.sigma_y == 'default':
         args.sigma_y = dataset_config.get('sigma_y')
+        
+    if args.no_running_loss:
+        args.running_loss = False
+    else:
+        args.running_loss = True
 
     args.ori_dim = dataset_config.get('dim')
     args.obs_dim = dataset_config.get('obs_dim')

@@ -228,12 +228,166 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
     # Return both the analyzed ensemble and the localization output
     return ens_v_a, loc_nn_output
 
+# def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
+#     model, infl_model, local_model, st_model1, st_model2 = model_list
+#     m = args.N
+#     losses = AverageMeter()
+#     batch_time = AverageMeter()
+    
+#     if args.dataset == "lorenz63":
+#         forward_fun = L63.forward
+#     elif args.dataset == "lorenz96":
+#         forward_fun = L96.forward
+#     elif args.dataset == "ks":
+#         if args.dt_iter <= 0:
+#             raise ValueError("args.dt_iter must be positive for KS model.")
+#         forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
+#     else:
+#         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+    
+#     if H_info is None:
+#         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
+#     else:
+#         H_fun, H = H_info
+
+#     model.train()
+#     if hasattr(infl_model, 'train'): infl_model.train()
+#     if hasattr(local_model, 'train'): local_model.train()
+#     if hasattr(st_model1, 'train'): st_model1.train()
+#     if hasattr(st_model2, 'train'): st_model2.train()
+
+#     all_trainable_params = []
+#     for m_ in [model, infl_model, local_model, st_model1, st_model2]:
+#         if hasattr(m_, 'parameters') and not isinstance(m_, NaiveNetwork):
+#             all_trainable_params.extend(list(filter(lambda p: p.requires_grad, m_.parameters())))
+
+#     num_batches_all_nan = 0
+
+#     for batch_ind, batch_v_trajectory in enumerate(loader):
+#         t_start = time.time()
+#         batch_v_trajectory = batch_v_trajectory.to(device=args.device)
+#         current_actual_batch_size = batch_v_trajectory.shape[1]
+#         optimizer.zero_grad()
+#         ens_v_a = batch_v_trajectory[0].unsqueeze(1).repeat(1, m, 1)
+#         ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
+#         accumulated_loss_for_batch_load = 0.0
+#         num_valid_loss_contributions = 0
+
+#         end_ind_t = min(epoch + 1, len(batch_v_trajectory) - 1) if args.loss_warm_up else len(batch_v_trajectory) - 1
+#         if end_ind_t <= 0:
+#             if (batch_ind + 1) % args.print_batch == 0:
+#                 print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
+#                       f'Skipped batch due to end_ind_t <=0 (Warm-up or short trajectory)')
+#             batch_time.update(time.time() - t_start)
+#             continue
+
+#         for i in range(end_ind_t):
+#             obs_y = H_fun(batch_v_trajectory[i + 1].unsqueeze(1))
+#             obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
+#             ens_v_a_forecast_input = ens_v_a.reshape(-1, args.ori_dim)
+            
+#             for j_iter in range(args.dt_iter):
+#                 if args.dataset == 'ks':
+#                     ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
+#                 else:
+#                     current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+#                     ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+            
+#             ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
+#             ens_v_f = ens_v_f + torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+#             hv = H_fun(ens_v_f)
+#             r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
+#             ens_i_innov = obs_y - hv - r_noise
+#             mean_hv = torch.mean(hv, dim=1, keepdim=True)
+#             mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
+
+#             # ======================= [Refactored Core Call] =======================
+#             # Replace the complex analysis logic with a single call to the new function.
+#             current_analyzed_ens_v_a, _ = _process_analysis_step(
+#                 args, model_list, ens_v_f, hv, obs_y,
+#                 ens_i_innov, mean_ens_v_f, mean_hv,
+#             )
+#             # ======================================================================
+
+#             if (i + 1) > args.ignore_first:
+#                 ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
+#                 batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)
+#                 nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
+#                 valid_B_mask_this_step = ~nan_mask_this_step
+
+#                 if valid_B_mask_this_step.any():
+#                     step_loss_sum_over_valid_batch_items = 0
+#                     for loss_type_val in args.loss_type:
+#                         step_loss_sum_over_valid_batch_items += compute_loss(
+#                             ens_tensor=ens_tensor_step, batch_v=batch_v_step,
+#                             loss_type=loss_type_val, ignore_first=0, end_ind=None,
+#                             valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
+#                             norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True 
+#                         )
+                    
+#                     accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
+#                     num_valid_in_step = torch.sum(valid_B_mask_this_step)
+#                     num_valid_loss_contributions += num_valid_in_step.item()
+                    
+#                     if num_valid_in_step > 0:
+#                         losses.update(step_loss_sum_over_valid_batch_items.item() / num_valid_in_step.item(), 
+#                                       num_valid_in_step.item())
+            
+#             ens_v_a = current_analyzed_ens_v_a
+#             if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
+#                 ens_v_a = ens_v_a.detach()
+        
+#         if num_valid_loss_contributions > 0:
+#             average_loss_for_loaded_batch = accumulated_loss_for_batch_load / num_valid_loss_contributions
+#             average_loss_for_loaded_batch.backward()
+            
+#             if all_trainable_params:
+#                 nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+#             optimizer.step()
+#         else:
+#             num_batches_all_nan += 1
+
+#         batch_time.update(time.time() - t_start)
+#         total_possible_contributions = current_actual_batch_size * max(0, end_ind_t - args.ignore_first)
+#         current_no_nan_percentage = (num_valid_loss_contributions / total_possible_contributions * 100) if total_possible_contributions > 0 else 100.0
+
+#         if (batch_ind + 1) % args.print_batch == 0:
+#             print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
+#                   f'Batch time {batch_time.val:.3f} (Avg: {batch_time.avg:.3f})\t'
+#                   f'Loss {losses.val:.3f} (Avg: {losses.avg:.3f})\t'
+#                   f'LR: {optimizer.param_groups[0]["lr"]:.2e}\t'
+#                   f'No NAN % (batch): {current_no_nan_percentage:.2f}%')
+
+#     if num_batches_all_nan == len(loader) and len(loader) > 0:
+#         print(f"Warning: All {len(loader)} batches in epoch {epoch} resulted in NaN or no valid loss.")
+#         if losses.count == 0:
+#             return float('nan')
+
+#     scheduler.step()
+#     return losses.avg
+
 def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
+    """
+    Function to train the model for one epoch.
+
+    Args:
+        epoch (int): The current epoch number.
+        loader (DataLoader): The data loader for training data.
+        model_list (list): A list of models to be trained.
+        optimizer (Optimizer): The optimizer for updating model weights.
+        scheduler (Scheduler): The learning rate scheduler.
+        args (Namespace): A namespace containing all arguments/hyperparameters.
+        H_info (tuple, optional): A tuple containing the observation operator and its matrix form. Defaults to None.
+
+    Returns:
+        float: The average loss for the epoch.
+    """
     model, infl_model, local_model, st_model1, st_model2 = model_list
     m = args.N
     losses = AverageMeter()
     batch_time = AverageMeter()
-    
+
+    # --- Forward Function Selection ---
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
@@ -245,11 +399,13 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
     
+    # --- Observation Operator Setup ---
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
     else:
         H_fun, H = H_info
 
+    # --- Set Models to Train Mode ---
     model.train()
     if hasattr(infl_model, 'train'): infl_model.train()
     if hasattr(local_model, 'train'): local_model.train()
@@ -263,16 +419,16 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
 
     num_batches_all_nan = 0
 
+    # --- Batch Loop ---
     for batch_ind, batch_v_trajectory in enumerate(loader):
         t_start = time.time()
         batch_v_trajectory = batch_v_trajectory.to(device=args.device)
         current_actual_batch_size = batch_v_trajectory.shape[1]
         optimizer.zero_grad()
+        
         ens_v_a = batch_v_trajectory[0].unsqueeze(1).repeat(1, m, 1)
         ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
-        accumulated_loss_for_batch_load = 0.0
-        num_valid_loss_contributions = 0
-
+        
         end_ind_t = min(epoch + 1, len(batch_v_trajectory) - 1) if args.loss_warm_up else len(batch_v_trajectory) - 1
         if end_ind_t <= 0:
             if (batch_ind + 1) % args.print_batch == 0:
@@ -280,8 +436,15 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                       f'Skipped batch due to end_ind_t <=0 (Warm-up or short trajectory)')
             batch_time.update(time.time() - t_start)
             continue
+        
+        # --- Initialize variables for loss calculation ---
+        accumulated_loss_for_batch_load = 0.0
+        num_valid_loss_contributions = 0
+        collected_ens_v_a = [] if not args.running_loss else None
 
+        # ======================= [REFACTORED UNIFIED TIME-STEP LOOP] =======================
         for i in range(end_ind_t):
+            # --- Common Forecast and Analysis Step ---
             obs_y = H_fun(batch_v_trajectory[i + 1].unsqueeze(1))
             obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
             ens_v_a_forecast_input = ens_v_a.reshape(-1, args.ori_dim)
@@ -301,52 +464,84 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
             mean_hv = torch.mean(hv, dim=1, keepdim=True)
             mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
 
-            # ======================= [Refactored Core Call] =======================
-            # Replace the complex analysis logic with a single call to the new function.
             current_analyzed_ens_v_a, _ = _process_analysis_step(
                 args, model_list, ens_v_f, hv, obs_y,
                 ens_i_innov, mean_ens_v_f, mean_hv,
             )
-            # ======================================================================
 
-            if (i + 1) > args.ignore_first:
-                ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
-                batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)
-                nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
-                valid_B_mask_this_step = ~nan_mask_this_step
+            # --- Strategy-Dependent Action inside the loop ---
+            if args.running_loss:
+                if (i + 1) > args.ignore_first:
+                    ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
+                    batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)
+                    nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
+                    valid_B_mask_this_step = ~nan_mask_this_step
 
-                if valid_B_mask_this_step.any():
-                    step_loss_sum_over_valid_batch_items = 0
-                    for loss_type_val in args.loss_type:
-                        step_loss_sum_over_valid_batch_items += compute_loss(
-                            ens_tensor=ens_tensor_step, batch_v=batch_v_step,
-                            loss_type=loss_type_val, ignore_first=0, end_ind=None,
-                            valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
-                            norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True 
-                        )
-                    
-                    accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
-                    num_valid_in_step = torch.sum(valid_B_mask_this_step)
-                    num_valid_loss_contributions += num_valid_in_step.item()
-                    
-                    if num_valid_in_step > 0:
-                        losses.update(step_loss_sum_over_valid_batch_items.item() / num_valid_in_step.item(), 
-                                      num_valid_in_step.item())
+                    if valid_B_mask_this_step.any():
+                        step_loss_sum_over_valid_batch_items = 0
+                        for loss_type_val in args.loss_type:
+                            step_loss_sum_over_valid_batch_items += compute_loss(
+                                ens_tensor=ens_tensor_step, batch_v=batch_v_step,
+                                loss_type=loss_type_val, ignore_first=0, end_ind=None,
+                                valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
+                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True 
+                            )
+                        
+                        accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
+                        num_valid_in_step = torch.sum(valid_B_mask_this_step)
+                        num_valid_loss_contributions += num_valid_in_step.item()
+                        
+                        if num_valid_in_step > 0:
+                            losses.update(step_loss_sum_over_valid_batch_items.item() / num_valid_in_step.item(), 
+                                          num_valid_in_step.item())
+            else: # Trajectory loss: collect tensors
+                collected_ens_v_a.append(current_analyzed_ens_v_a)
             
+            # --- Common State Update and Detach Logic ---
             ens_v_a = current_analyzed_ens_v_a
             if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
                 ens_v_a = ens_v_a.detach()
         
-        if num_valid_loss_contributions > 0:
-            average_loss_for_loaded_batch = accumulated_loss_for_batch_load / num_valid_loss_contributions
-            average_loss_for_loaded_batch.backward()
-            
-            if all_trainable_params:
-                nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-            optimizer.step()
-        else:
-            num_batches_all_nan += 1
+        # ======================= [POST-LOOP BACKPROPAGATION] =======================
+        if args.running_loss:
+            if num_valid_loss_contributions > 0:
+                average_loss_for_loaded_batch = accumulated_loss_for_batch_load / num_valid_loss_contributions
+                average_loss_for_loaded_batch.backward()
+                if all_trainable_params:
+                    nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+                optimizer.step()
+            else:
+                num_batches_all_nan += 1
+        else: # Trajectory loss
+            if len(collected_ens_v_a) > args.ignore_first:
+                ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:]
+                batch_v = batch_v_trajectory[1:end_ind_t + 1][args.ignore_first:]
+                
+                if ens_tensor.shape[0] > 0:
+                    valid_B_mask = ~torch.isnan(ens_tensor).any(dim=(2, 3))
+                    num_valid_loss_contributions = torch.sum(valid_B_mask).item()
 
+                    if num_valid_loss_contributions > 0:
+                        total_loss = sum(compute_loss(
+                                ens_tensor=ens_tensor, batch_v=batch_v, loss_type=loss_type_val,
+                                ignore_first=0, end_ind=None, valid_B_mask=valid_B_mask,
+                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True
+                            ) for loss_type_val in args.loss_type)
+                        
+                        average_loss = total_loss / num_valid_loss_contributions
+                        average_loss.backward()
+                        if all_trainable_params:
+                            nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+                        optimizer.step()
+                        losses.update(average_loss.item(), num_valid_loss_contributions)
+                    else:
+                        num_batches_all_nan += 1
+                else:
+                    num_batches_all_nan += 1
+            else:
+                num_batches_all_nan += 1
+
+        # --- Common Logging and Timing ---
         batch_time.update(time.time() - t_start)
         total_possible_contributions = current_actual_batch_size * max(0, end_ind_t - args.ignore_first)
         current_no_nan_percentage = (num_valid_loss_contributions / total_possible_contributions * 100) if total_possible_contributions > 0 else 100.0
@@ -977,20 +1172,33 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
 
 def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
-    model, infl_model, local_model, st_model1, st_model2 = model_list
-    
-    N = args.N
+    """
+    Function to train the model for one epoch (V2 with linear dynamics).
 
+    Args:
+        epoch (int): The current epoch number.
+        loader (DataLoader): The data loader for training data.
+        model_list (list): A list of models to be trained.
+        optimizer (Optimizer): The optimizer for updating model weights.
+        scheduler (Scheduler): The learning rate scheduler.
+        args (Namespace): A namespace containing all arguments/hyperparameters.
+
+    Returns:
+        float: The average loss for the epoch.
+    """
+    model, infl_model, local_model, st_model1, st_model2 = model_list
+    N = args.N
     losses = AverageMeter()
     batch_time = AverageMeter()
     
+    # --- Model and Observation Operator ---
     if args.dataset == "linear":
         forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1,-2))
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
-
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1,-2))
     
+    # --- Set Models to Train Mode ---
     model.train()
     if hasattr(infl_model, 'train'): infl_model.train()
     if hasattr(local_model, 'train'): local_model.train()
@@ -998,13 +1206,13 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
     if hasattr(st_model2, 'train'): st_model2.train()
 
     all_trainable_params = []
-    # Assuming NaiveNetwork is a non-trainable model
     for m_ in [model, infl_model, local_model, st_model1, st_model2]:
         if hasattr(m_, 'parameters') and not isinstance(m_, NaiveNetwork):
             all_trainable_params.extend(list(filter(lambda p: p.requires_grad, m_.parameters())))
 
     num_batches_all_nan = 0
 
+    # --- Batch Loop ---
     for batch_ind, batch_info in enumerate(loader):
         t_start = time.time()
         
@@ -1014,125 +1222,117 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
         m, A, C, H, sigma_v, sigma_y = (m.to(args.device), A.to(args.device), C.to(args.device), 
                                         H.to(args.device), sigma_v.to(args.device), sigma_y.to(args.device))
         
-        # es_normalize_val = torch.linalg.norm(m, dim=1, keepdim=True).expand(-1, m.shape[1]) / torch.sqrt(torch.tensor(m.shape[1], dtype=m.dtype))
-        
         current_actual_batch_size = m.shape[0]
         D, D_obs = args.ori_dim, args.obs_dim
-
         optimizer.zero_grad()
 
-        # --- Initialize ensemble and ground truth states ---
-        ens_v_a = m.unsqueeze(1).repeat(1, N, 1)
-        ens_v_a = ens_v_a + torch.bmm(torch.randn_like(ens_v_a, device=args.device), C.transpose(-1,-2))
+        # --- Initialize States and Noise Covariances ---
+        ens_v_a = m.unsqueeze(1).repeat(1, N, 1) + torch.bmm(torch.randn_like(m.unsqueeze(1).repeat(1, N, 1)), C.transpose(-1,-2))
         gt_v_a = m.unsqueeze(1)
-        
-        # --- NEW: Construct full noise covariance matrices consistent with the test function ---
-        # This ensures physical consistency between training and testing.
-        Q = (sigma_v.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D, device=args.device).unsqueeze(0).repeat(current_actual_batch_size, 1, 1)
-        R = (sigma_y.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D_obs, device=args.device).unsqueeze(0).repeat(current_actual_batch_size, 1, 1)
+        Q = (sigma_v.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D, device=args.device).unsqueeze(0)
+        R = (sigma_y.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D_obs, device=args.device).unsqueeze(0)
 
+        # --- Initialize variables for loss calculation ---
         accumulated_loss_for_batch_load = 0.0
         num_valid_loss_contributions = 0
+        collected_ens_v_a = [] if not args.running_loss else None
+        collected_gt_v_a = [] if not args.running_loss else None
 
-        # Set the number of training steps for the current epoch
-        if args.loss_warm_up:
-            end_ind_t = min(epoch + 1, args.train_steps - 1)
-        else:
-            end_ind_t = args.train_steps - 1
+        end_ind_t = min(epoch + 1, args.train_steps - 1) if args.loss_warm_up else args.train_steps - 1
         
         if end_ind_t <= 0:
             if (batch_ind + 1) % args.print_batch == 0:
                 print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
-                      f'Skipped batch due to end_ind_t <=0 (Warm-up or short trajectory)')
+                      f'Skipped batch due to end_ind_t <=0 (Warm-up)')
             batch_time.update(time.time() - t_start)
             continue
 
-        # --- Main assimilation loop ---
+        # ======================= [REFACTORED UNIFIED TIME-STEP LOOP] =======================
         for i in range(end_ind_t):
-            
-            # --- MODIFIED: Evolve ground truth state using the Q matrix ---
+            # --- Common Forecast and Analysis Step ---
             gt_v_a = forward_fun(gt_v_a, A) + torch.bmm(torch.randn_like(gt_v_a), Q.sqrt())
-            
-            # --- MODIFIED: Generate observations using the R matrix ---
-            obs_y = H_fun(gt_v_a, H)
-            obs_y += torch.bmm(torch.randn_like(obs_y), R.sqrt())
-
-            # --- MODIFIED: Perform ensemble forecast using the Q matrix ---
+            obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a, H)), R.sqrt())
             ens_v_f = forward_fun(ens_v_a, A) + torch.bmm(torch.randn_like(ens_v_a), Q.sqrt())
-
             hv = H_fun(ens_v_f, H)
-            
-            # --- MODIFIED: Generate observation perturbation using the R matrix ---
             r_noise = mean0(torch.bmm(torch.randn_like(hv), R.sqrt()))
             ens_i_innov = obs_y - hv - r_noise
-
             mean_hv = torch.mean(hv, dim=1, keepdim=True)
             mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
 
-            # --- Analysis step (calling helper function) ---
             current_analyzed_ens_v_a, _ = _process_analysis_step(
                 args, model_list, ens_v_f, hv, obs_y,
                 ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=sigma_y,
             )
             
-            # --- Loss calculation and accumulation ---
-            if (i + 1) > args.ignore_first:
-                ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
-                batch_v_step = gt_v_a.squeeze(1).unsqueeze(0)
+            # --- Strategy-Dependent Action inside the loop ---
+            if args.running_loss:
+                if (i + 1) > args.ignore_first:
+                    ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
+                    batch_v_step = gt_v_a.squeeze(1).unsqueeze(0)
+                    valid_B_mask_this_step = ~torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0)
 
-                nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
-                valid_B_mask_this_step = ~nan_mask_this_step
-
-                if valid_B_mask_this_step.any():
-                    step_loss_sum_over_valid_batch_items = 0
-                    for loss_type_val in args.loss_type:
-                        # if "es" in loss_type_val:
-                        #     normalize_val = es_normalize_val
-                        # else:
-                        #     normalize_val = None
-                        step_loss_sum_over_valid_batch_items += compute_loss(
-                            ens_tensor=ens_tensor_step,
-                            batch_v=batch_v_step,
-                            loss_type=loss_type_val,
-                            ignore_first=0,
-                            end_ind=None,
-                            valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
-                            norm_p=args.es_p,
-                            kes_sigma=args.kes_sigma,
-                            return_sum=True,
-                            # normalize_val=normalize_val
-                        )
-                    
-                    accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
-                    
-                    num_valid_in_step = torch.sum(valid_B_mask_this_step)
-                    num_valid_loss_contributions += num_valid_in_step.item()
-                    
-                    if num_valid_in_step > 0:
-                        losses.update(step_loss_sum_over_valid_batch_items.item() / num_valid_in_step.item(), 
-                                      num_valid_in_step.item())
+                    if valid_B_mask_this_step.any():
+                        step_loss = sum(compute_loss(
+                            ens_tensor=ens_tensor_step, batch_v=batch_v_step, loss_type=lt, ignore_first=0, end_ind=None,
+                            valid_B_mask=valid_B_mask_this_step.unsqueeze(0), norm_p=args.es_p,
+                            kes_sigma=args.kes_sigma, return_sum=True) for lt in args.loss_type)
+                        
+                        accumulated_loss_for_batch_load += step_loss
+                        num_valid_in_step = torch.sum(valid_B_mask_this_step)
+                        num_valid_loss_contributions += num_valid_in_step.item()
+                        if num_valid_in_step > 0:
+                            losses.update(step_loss.item() / num_valid_in_step.item(), num_valid_in_step.item())
+            else: # Trajectory loss: collect tensors
+                collected_ens_v_a.append(current_analyzed_ens_v_a)
+                collected_gt_v_a.append(gt_v_a)
             
+            # --- Common State Update and Detach Logic ---
             ens_v_a = current_analyzed_ens_v_a
-
-            # Detach the computational graph as needed to prevent vanishing/exploding gradients
             if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
                 ens_v_a = ens_v_a.detach()
         
-        # --- Backpropagation and optimization ---
-        if num_valid_loss_contributions > 0:
-            # Average the loss by the number of valid contributions
-            average_loss_for_loaded_batch = accumulated_loss_for_batch_load / num_valid_loss_contributions
-            average_loss_for_loaded_batch.backward()
-            
-            if all_trainable_params:
-                nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-            optimizer.step()
-        else:
-            num_batches_all_nan += 1
+        # ======================= [POST-LOOP BACKPROPAGATION] =======================
+        if args.running_loss:
+            if num_valid_loss_contributions > 0:
+                average_loss = accumulated_loss_for_batch_load / num_valid_loss_contributions
+                average_loss.backward()
+                if all_trainable_params:
+                    nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+                optimizer.step()
+            else:
+                num_batches_all_nan += 1
+        else: # Trajectory loss
+            if len(collected_ens_v_a) > args.ignore_first:
+                ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:]
+                batch_v = torch.stack(collected_gt_v_a, dim=0).squeeze(2)[args.ignore_first:]
+                
+                if ens_tensor.shape[0] > 0:
+                    valid_B_mask = ~torch.isnan(ens_tensor).any(dim=(2, 3))
+                    num_valid_loss_contributions = torch.sum(valid_B_mask).item()
 
+                    if num_valid_loss_contributions > 0:
+                        normalize_val = torch.std(batch_v, dim=0)
+                        total_loss = sum(compute_loss(
+                            ens_tensor=ens_tensor, batch_v=batch_v, loss_type=lt, ignore_first=0, end_ind=None,
+                            valid_B_mask=valid_B_mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,
+                            normalize_val=normalize_val,
+                        ) for lt in args.loss_type)
+                        
+                        average_loss = total_loss / num_valid_loss_contributions
+                        average_loss.backward()
+                        if all_trainable_params:
+                            nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+                        optimizer.step()
+                        losses.update(average_loss.item(), num_valid_loss_contributions)
+                    else:
+                        num_batches_all_nan += 1
+                else:
+                    num_batches_all_nan += 1
+            else:
+                num_batches_all_nan += 1
+
+        # --- Common Logging and Timing ---
         batch_time.update(time.time() - t_start)
-        
-        # --- Print logs ---
         total_possible_contributions = current_actual_batch_size * max(0, end_ind_t - args.ignore_first)
         current_no_nan_percentage = (num_valid_loss_contributions / total_possible_contributions * 100) if total_possible_contributions > 0 else 100.0
 

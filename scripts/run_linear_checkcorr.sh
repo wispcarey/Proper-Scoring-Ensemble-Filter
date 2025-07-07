@@ -2,18 +2,14 @@
 
 cd ..
 
-python train.py \
-    --dataset lorenz63 \
+python train_v2.py \
     --epochs 1000 \
-    --N 5 \
-    --sigma_y 1 \
+    --dataset linear \
+    --N 10 \
     --seed 42 \
-    --v EtE-LRes \
+    --v CorrTerms \
     --no_localization \
     --loss_type es \
     --es_p 1 \
-    --test_steps 500 \
     --no_running_loss \
-    --normal_output
-
-
+    --weight_decay 1e-1 
