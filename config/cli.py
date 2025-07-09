@@ -139,6 +139,10 @@ def get_parameters():
     parser.add_argument('--obs_in_loc', action='store_true',
                         help='include observation in the input of localization')
     # parser.set_defaults(obs_in_loc=True)
+    parser.add_argument('--noise_st_input', action='store_true',
+                        help='use the noise part hv + eta in the input of st')
+    parser.add_argument('--mlp_y_type', type=str, default='obs', choices=['obs', 'innov', 'noise_innov'],
+        help='the way dealing with the y-term in mlp')
 
 
     # output setting
@@ -339,8 +343,6 @@ def get_parameters():
     # Save folder
     if args.cp_load_path != "no":
         args.suffix += "_tuned"
-    else:
-        args.suffix = ""
     folder_name = os.path.join("save", datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
     loss_type_name = "_".join([loss_type for loss_type in args.loss_type])
     folder_name += f"{args.dataset}_{args.sigma_y}_{args.N}_{args.train_steps}_{args.train_traj_num}_{loss_type_name}_{args.st_type}_{args.v}{args.suffix}"

@@ -62,7 +62,10 @@ if __name__ == "__main__":
         for epoch in range(1, 1 + args.epochs):
             train_loss = train_model_v2(epoch, train_loader, model_list, optimizer, scheduler, args)
             train_records['train_loss'].append(train_loss)
-            
+            if torch.isnan(train_loss):
+                print("NAN loss. Terminate training.")
+                break
+
             if epoch % args.save_epoch == 0:
                 # Test at each save epoch
                 epoch_test_results = test_model_v2(test_loader, model_list, args, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}_{epoch}', save_pdf=False)

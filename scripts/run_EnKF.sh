@@ -24,3 +24,31 @@ python train.py \
     --pf_verification \
     --pf_N 1000000 \
     --sigma_reg None 
+
+python train.py \
+    --epochs 0 \
+    --dataset lorenz63 \
+    --sigma_y 1 \
+    --N 5 \
+    --seed 42 \
+    --v EnKF \
+    --test_steps 500 \
+    --no_localization \
+    --normal_output \
+    --pf_verification \
+    --pf_N 1000000 \
+    --sigma_reg None 
+
+python train.py \
+    --epochs 0 \
+    --dataset lorenz63 \
+    --sigma_y 1 \
+    --N 15 \
+    --seed 42 \
+    --v EnKF \
+    --test_steps 500 \
+    --no_localization \
+    --normal_output \
+    --pf_verification \
+    --pf_N 1000000 \
+    --sigma_reg None 

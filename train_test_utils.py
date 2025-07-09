@@ -76,8 +76,23 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
     """Prepare input tensors for the models based on args.st_type."""
     N_ens = ens_v_f.shape[1]
     
+    if args.noise_st_input:
+        st_input_2 = hv + args.sigma_y * torch.randn_like(obs_y, device=args.device)
+    else:
+        st_input_2 = hv
+    
+    if args.mlp_y_type == 'obs':
+        mlp_y_input = obs_y.expand(-1, N_ens, -1)
+    elif args.mlp_y_type == 'innov':
+        mlp_y_input = obs_y.expand(-1, N_ens, -1) - hv
+    elif args.mlp_y_type == 'noise_innov':
+        mlp_y_input = obs_y.expand(-1, N_ens, -1) - hv - args.sigma_y * torch.randn_like(obs_y, device=args.device)
+    else:
+        raise ValueError("args.mlp_y_type must be one within 'obs', 'innov', 'noise_innov'.")
+    
+    
     if args.v == 'EtE2':
-        nn_input_cat_list = [ens_v_f, hv]
+        nn_input_cat_list = [ens_v_f, st_input_2]
         nn_input = torch.cat(nn_input_cat_list, dim=-1)
     else:
         # Initialize lists to avoid NameError
@@ -86,7 +101,7 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
 
         if args.st_type == 'state_only':
             ens_nn_output = st_model1(ens_v_f)
-            nn_input_cat_list = [ens_v_f, hv, obs_y.expand(-1, N_ens, -1), ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
+            nn_input_cat_list = [ens_v_f, hv, mlp_y_input, ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
             if args.v == 'CorrTerms':
                 local_nn_input_cat_list = [obs_y.squeeze(1), ens_nn_output] if args.obs_in_loc else [ens_nn_output]
                 infl_nn_input_cat_list = [ens_v_f, ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
@@ -94,7 +109,7 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
             
         elif args.st_type == 'separate':
             ens_nn_output = st_model1(ens_v_f)
-            ens_o_nn_output = st_model2(hv)
+            ens_o_nn_output = st_model2(st_input_2)
             nn_input_cat_list = [ens_v_f, hv, obs_y.expand(-1, N_ens, -1), ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1), ens_o_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
             if args.v == 'CorrTerms':
                 local_nn_input_cat_list = [obs_y.squeeze(1), ens_nn_output, ens_o_nn_output] if args.obs_in_loc else [ens_nn_output, ens_o_nn_output]
@@ -102,8 +117,8 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
             st_output_dim_actual = args.st_output_dim
             
         elif args.st_type == 'joint':
-            ens_nn_output = st_model1(torch.cat([ens_v_f, hv], dim=-1))
-            nn_input_cat_list = [ens_v_f, hv, obs_y.expand(-1, N_ens, -1), ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
+            ens_nn_output = st_model1(torch.cat([ens_v_f, st_input_2], dim=-1))
+            nn_input_cat_list = [ens_v_f, hv, mlp_y_input, ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
             if args.v == 'CorrTerms':
                 local_nn_input_cat_list = [obs_y.squeeze(1), ens_nn_output] if args.obs_in_loc else [ens_nn_output]
                 infl_nn_input_cat_list = [ens_v_f, ens_nn_output.unsqueeze(1).expand(-1, N_ens, -1)]
@@ -1312,6 +1327,7 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
 
                     if num_valid_loss_contributions > 0:
                         normalize_val = torch.std(batch_v, dim=0)
+                        # normalize_val = None
                         total_loss = sum(compute_loss(
                             ens_tensor=ens_tensor, batch_v=batch_v, loss_type=lt, ignore_first=0, end_ind=None,
                             valid_B_mask=valid_B_mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,

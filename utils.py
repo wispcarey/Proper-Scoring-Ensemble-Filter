@@ -3,6 +3,7 @@ import os
 import sys
 import datetime
 import pickle
+import math
 
 from contextlib import contextmanager
 from scipy.linalg import eigvals
@@ -423,6 +424,35 @@ def get_dataloader(args, x0=None, test_only=False):
         
         J = torch.randn(args.ori_dim, args.ori_dim)
         A, _ = torch.linalg.qr(J)
+        eigenvalues = torch.linalg.eigvals(A)
+        print("\nEigenvalues of A:")
+        print(eigenvalues)
+        
+        # A = torch.zeros(args.ori_dim, args.ori_dim)
+
+        # # Fill the matrix with 2x2 rotation blocks
+        # for i in range(0, args.ori_dim, 2):
+        #     # Generate a random rotation angle, ensuring it's not a multiple of pi.
+        #     # theta (float): The rotation angle.
+        #     theta = torch.rand(1) * (math.pi - 0.2) + 0.1 # Avoid 0 and pi
+
+        #     # Create a 2x2 rotation matrix (which is orthogonal)
+        #     # R (torch.Tensor): A 2x2 orthogonal rotation matrix.
+        #     c, s = torch.cos(theta), torch.sin(theta)
+        #     R = torch.tensor([[c, -s],
+        #                     [s,  c]])
+
+        #     # Place the 2x2 block on the diagonal of A
+        #     A[i:i+2, i:i+2] = R
+
+        # # Calculate the eigenvalues of the constructed matrix A
+        # # eigenvalues (torch.Tensor): A tensor containing the eigenvalues.
+        # eigenvalues = torch.linalg.eigvals(A)
+        
+        print("Constructed Orthogonal Matrix A:")
+        print(A)
+        print("\nEigenvalues of A (guaranteed to be non-real):")
+        print(eigenvalues)
         
         H = torch.zeros(args.obs_dim, args.ori_dim)
         for i in range(args.obs_dim):
@@ -436,7 +466,7 @@ def get_dataloader(args, x0=None, test_only=False):
             sigma_v=args.sigma_v, 
             data_name=f"training_{args.seed}",
             sigma_y=args.sigma_y,
-            load_existing=True,
+            load_existing=False,
             seed=None
         )
         test_data = LinearSystemDataset(
@@ -447,7 +477,7 @@ def get_dataloader(args, x0=None, test_only=False):
             sigma_v=args.sigma_v, 
             sigma_y=args.sigma_y,
             data_name=f"test_{args.seed}",
-            load_existing=True,
+            load_existing=False,
             seed=None
         )
         train_loader = DataLoader(train_data, batch_size=args.batch_size,
