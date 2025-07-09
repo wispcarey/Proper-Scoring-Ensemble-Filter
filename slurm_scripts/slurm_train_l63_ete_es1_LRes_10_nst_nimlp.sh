@@ -35,6 +35,7 @@ python train.py \
    --loss_type es \
    --es_p 1 \
    --test_steps 500 \
+   --no_running_loss \
    --noise_st_input \
    --mlp_y_type noise_innov \
    --suffix _nst_nimlp
