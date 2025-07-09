@@ -180,6 +180,7 @@ def get_parameters():
                         help='use SGD optimizer, otherwise use Adam')
     parser.add_argument('--no_running_loss', action='store_true',
                         help='Do not use an accumulative loss in training. Calculate the loss once finishing the entire trajectory')
+    parser.set_defaults(no_running_loss=True)
     
     # test settings
     parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')

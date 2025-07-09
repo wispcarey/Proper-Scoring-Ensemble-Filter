@@ -65,7 +65,7 @@ if __name__ == "__main__":
         for epoch in range(1, 1 + args.epochs):
             train_loss = train_model(epoch, train_loader, model_list, optimizer, scheduler, args, H_info=H_info)
             train_records['train_loss'].append(train_loss)
-            if torch.isnan(train_loss):
+            if torch.isnan(torch.tensor(train_loss)):
                 print("NAN loss. Terminate training.")
                 break
             
