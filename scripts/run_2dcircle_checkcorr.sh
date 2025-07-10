@@ -2,9 +2,9 @@
 
 cd ..
 
-python train_v2.py \
+python train.py \
     --epochs 1000 \
-    --dataset linear \
+    --dataset circle \
     --N 10 \
     --seed 42 \
     --v CorrTerms \
@@ -13,9 +13,9 @@ python train_v2.py \
     --es_p 1 \
     --weight_decay 1e-2 
     
-python train_v2.py \
+python train.py \
     --epochs 1000 \
-    --dataset linear \
+    --dataset circle \
     --N 10 \
     --seed 42 \
     --v CorrTerms \
@@ -27,9 +27,9 @@ python train_v2.py \
     --mlp_y_type noise_innov \
     --suffix _nst_nimlp
 
-python train_v2.py \
+python train.py \
     --epochs 1000 \
-    --dataset linear \
+    --dataset circle \
     --N 10 \
     --seed 42 \
     --v CorrTerms \
@@ -40,9 +40,9 @@ python train_v2.py \
     --noise_st_input \
     --suffix _nst
 
-python train_v2.py \
+python train.py \
     --epochs 1000 \
-    --dataset linear \
+    --dataset circle \
     --N 10 \
     --seed 42 \
     --v CorrTerms \

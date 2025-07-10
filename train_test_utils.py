@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn as nn
 
-from utils import L63, L96, rk4, etd_rk4_wrapper
+from utils import L63, L96, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
 from utils import AverageMeter, mystery_operator, get_mean_std
 from utils import post_process, mean0
 from visualization import plot_particle_trajectories_with_histograms, plot_particle_trajectories
@@ -407,6 +407,10 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+    elif args.dataset == "circle":
+        forward_fun = CircleODE.forward
+    elif args.dataset == "Hdoublewell":
+        forward_fun = DoubleWellODE.forward
     elif args.dataset == "ks":
         if args.dt_iter <= 0:
             raise ValueError("args.dt_iter must be positive for KS model.")
@@ -601,10 +605,16 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+    elif args.dataset == "circle":
+        forward_fun = CircleODE.forward
+    elif args.dataset == "Hdoublewell":
+        forward_fun = DoubleWellODE.forward
     elif args.dataset == "ks":
+        if args.dt_iter <= 0:
+            raise ValueError("args.dt_iter must be positive for KS model.")
         forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
@@ -759,10 +769,16 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+    elif args.dataset == "circle":
+        forward_fun = CircleODE.forward
+    elif args.dataset == "Hdoublewell":
+        forward_fun = DoubleWellODE.forward
     elif args.dataset == "ks":
+        if args.dt_iter <= 0:
+            raise ValueError("args.dt_iter must be positive for KS model.")
         forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
@@ -1001,10 +1017,16 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+    elif args.dataset == "circle":
+        forward_fun = CircleODE.forward
+    elif args.dataset == "Hdoublewell":
+        forward_fun = DoubleWellODE.forward
     elif args.dataset == "ks":
-        forward_fun = etd_rk4_wrapper(device = args.device, dt = args.dt / args.dt_iter)
+        if args.dt_iter <= 0:
+            raise ValueError("args.dt_iter must be positive for KS model.")
+        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)

@@ -152,7 +152,37 @@ class L96(nn.Module):
         x_p1 = torch.roll(x, 1, -1)
         return (x_p1 - x_m2) * x_m1 - x + F * torch.ones_like(x)
     
+class CircleODE(nn.Module):
+    """
+    Defines the ODE: dx/dt = omega*y, dy/dt = -omega*x.
+    """
+    def __init__(self):
+        super(CircleODE, self).__init__()
 
+    @staticmethod
+    def forward(t, x, omega=1.0):
+        # Input: t, x(batch,2), omega
+        # Output: dx/dt(batch,2)
+        rvals = torch.zeros_like(x)
+        rvals[:, 0] = omega * x[:, 1]
+        rvals[:, 1] = -omega * x[:, 0]
+        return rvals
+
+class DoubleWellODE(nn.Module):
+    """
+    Defines the ODE for a double-well potential: dx/dt = y, dy/dt = b*x - a*x^3.
+    """
+    def __init__(self):
+        super(DoubleWellODE, self).__init__()
+
+    @staticmethod
+    def forward(t, x, a=1.0, b=1.0):
+        # Input: t, x(batch,2), a, b
+        # Output: dx/dt(batch,2)
+        rvals = torch.zeros_like(x)
+        rvals[:, 0] = x[:, 1]
+        rvals[:, 1] = b * x[:, 0] - a * (x[:, 0]**3)
+        return rvals
 
 def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
              check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
@@ -222,6 +252,10 @@ def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
         model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  # Ensure float32
     elif dataset == "lorenz96":
         model, dim, default_v0 = L96, 40, torch.randn(1, 40, dtype=torch.float32) + 5  # Ensure float32
+    elif dataset == "circle":
+        model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  # Ensure float32
+    elif dataset == "Hdoublewell":
+        model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  # Ensure float32
     elif dataset == "ks":
         # Kuramoto-Sivashinsky model specifics
         model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
@@ -422,32 +456,36 @@ def get_dataloader(args, x0=None, test_only=False):
         # scaling_factor = 1.1 / max_abs_eig
         # A = A * scaling_factor
         
-        J = torch.randn(args.ori_dim, args.ori_dim)
-        A, _ = torch.linalg.qr(J)
-        eigenvalues = torch.linalg.eigvals(A)
-        print("\nEigenvalues of A:")
-        print(eigenvalues)
-        
-        # A = torch.zeros(args.ori_dim, args.ori_dim)
-
-        # # Fill the matrix with 2x2 rotation blocks
-        # for i in range(0, args.ori_dim, 2):
-        #     # Generate a random rotation angle, ensuring it's not a multiple of pi.
-        #     # theta (float): The rotation angle.
-        #     theta = torch.rand(1) * (math.pi - 0.2) + 0.1 # Avoid 0 and pi
-
-        #     # Create a 2x2 rotation matrix (which is orthogonal)
-        #     # R (torch.Tensor): A 2x2 orthogonal rotation matrix.
-        #     c, s = torch.cos(theta), torch.sin(theta)
-        #     R = torch.tensor([[c, -s],
-        #                     [s,  c]])
-
-        #     # Place the 2x2 block on the diagonal of A
-        #     A[i:i+2, i:i+2] = R
-
-        # # Calculate the eigenvalues of the constructed matrix A
-        # # eigenvalues (torch.Tensor): A tensor containing the eigenvalues.
+        # if args.ori_dim == 2:
+        #     dt_A = torch.tensor(1)
+        #     A = torch.tensor([[torch.cos(dt_A), torch.sin(dt_A)], [-torch.sin(dt_A), torch.cos(dt_A)]])
+        # else:
+        #     J = torch.randn(args.ori_dim, args.ori_dim)
+        #     A, _ = torch.linalg.qr(J)
         # eigenvalues = torch.linalg.eigvals(A)
+        # print("\nEigenvalues of A:")
+        # print(eigenvalues)
+        
+        A = torch.zeros(args.ori_dim, args.ori_dim)
+
+        # Fill the matrix with 2x2 rotation blocks
+        for i in range(0, args.ori_dim, 2):
+            # Generate a random rotation angle, ensuring it's not a multiple of pi.
+            # theta (float): The rotation angle.
+            theta = torch.tensor(0.2 + 0.8 * (args.ori_dim - i) / args.ori_dim)
+
+            # Create a 2x2 rotation matrix (which is orthogonal)
+            # R (torch.Tensor): A 2x2 orthogonal rotation matrix.
+            c, s = torch.cos(theta), torch.sin(theta)
+            R = torch.tensor([[c, -s],
+                            [s,  c]])
+
+            # Place the 2x2 block on the diagonal of A
+            A[i:i+2, i:i+2] = R
+
+        # Calculate the eigenvalues of the constructed matrix A
+        # eigenvalues (torch.Tensor): A tensor containing the eigenvalues.
+        eigenvalues = torch.linalg.eigvals(A)
         
         print("Constructed Orthogonal Matrix A:")
         print(A)
