@@ -691,7 +691,7 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                 pf_ens_v_a = bootstrap_particle_filter_analysis(
                     pf_ens_v_f, obs_y_list[i + 1].squeeze(1), H_fun, args.sigma_y,
                     resampling_method="multinomial", sigma_reg=args.sigma_reg,
-                    max_chunk_size=500000,
+                    max_chunk_size=100000,
                 )
 
                 # Store results for caching and metrics

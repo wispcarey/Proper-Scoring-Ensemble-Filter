@@ -184,7 +184,7 @@ class DoubleWellODE(nn.Module):
         rvals[:, 1] = b * x[:, 0] - a * (x[:, 0]**3)
         return rvals
 
-def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
+def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
              check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
     """
     Generate training, validation, and test data for a given model.
@@ -251,7 +251,7 @@ def gen_data(dataset, t, steps_test, steps_valid, v0=None, sigma_v=0,
     if dataset == "lorenz63":
         model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  # Ensure float32
     elif dataset == "lorenz96":
-        model, dim, default_v0 = L96, 40, torch.randn(1, 40, dtype=torch.float32) + 5  # Ensure float32
+        model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim, dtype=torch.float32) + 5  # Ensure float32
     elif dataset == "circle":
         model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  # Ensure float32
     elif dataset == "Hdoublewell":
@@ -456,41 +456,32 @@ def get_dataloader(args, x0=None, test_only=False):
         # scaling_factor = 1.1 / max_abs_eig
         # A = A * scaling_factor
         
-        # if args.ori_dim == 2:
-        #     dt_A = torch.tensor(1)
-        #     A = torch.tensor([[torch.cos(dt_A), torch.sin(dt_A)], [-torch.sin(dt_A), torch.cos(dt_A)]])
-        # else:
-        #     J = torch.randn(args.ori_dim, args.ori_dim)
-        #     A, _ = torch.linalg.qr(J)
-        # eigenvalues = torch.linalg.eigvals(A)
-        # print("\nEigenvalues of A:")
-        # print(eigenvalues)
-        
-        A = torch.zeros(args.ori_dim, args.ori_dim)
+        if args.ori_dim == 2:
+            dt_A = torch.tensor(0.5)
+            A = torch.tensor([[torch.cos(dt_A), torch.sin(dt_A)], [-torch.sin(dt_A), torch.cos(dt_A)]])
+        else:
+            # A = torch.zeros(args.ori_dim, args.ori_dim)
+            # for i in range(0, args.ori_dim, 2):
+            #     # Generate a random rotation angle, ensuring it's not a multiple of pi.
+            #     # theta (float): The rotation angle.
+            #     theta = torch.tensor(0.2 + 0.8 * (args.ori_dim - i) / args.ori_dim)
 
-        # Fill the matrix with 2x2 rotation blocks
-        for i in range(0, args.ori_dim, 2):
-            # Generate a random rotation angle, ensuring it's not a multiple of pi.
-            # theta (float): The rotation angle.
-            theta = torch.tensor(0.2 + 0.8 * (args.ori_dim - i) / args.ori_dim)
+            #     # Create a 2x2 rotation matrix (which is orthogonal)
+            #     # R (torch.Tensor): A 2x2 orthogonal rotation matrix.
+            #     c, s = torch.cos(theta), torch.sin(theta)
+            #     R = torch.tensor([[c, -s],
+            #                     [s,  c]])
 
-            # Create a 2x2 rotation matrix (which is orthogonal)
-            # R (torch.Tensor): A 2x2 orthogonal rotation matrix.
-            c, s = torch.cos(theta), torch.sin(theta)
-            R = torch.tensor([[c, -s],
-                            [s,  c]])
-
-            # Place the 2x2 block on the diagonal of A
-            A[i:i+2, i:i+2] = R
-
-        # Calculate the eigenvalues of the constructed matrix A
-        # eigenvalues (torch.Tensor): A tensor containing the eigenvalues.
+            #     # Place the 2x2 block on the diagonal of A
+            #     A[i:i+2, i:i+2] = R
+            
+            J = torch.randn(args.ori_dim, args.ori_dim)
+            A, _ = torch.linalg.qr(J)
+            
         eigenvalues = torch.linalg.eigvals(A)
-        
-        print("Constructed Orthogonal Matrix A:")
-        print(A)
-        print("\nEigenvalues of A (guaranteed to be non-real):")
+        print("\nEigenvalues of A:")
         print(eigenvalues)
+        
         
         H = torch.zeros(args.obs_dim, args.ori_dim)
         for i in range(args.obs_dim):
@@ -535,6 +526,7 @@ def get_dataloader(args, x0=None, test_only=False):
         gen_trajs = gen_data(args.dataset, t, v0=x0, sigma_v=args.sigma_v,
                                                         steps_test=args.test_steps * args.test_traj_num,
                                                         steps_valid=args.valid_steps,
+                                                        args=args,
                                                         check_disk=args.new_data,
                                                         steps_burn=args.burn_steps,
                                                         dt_iter=args.dt_iter,
