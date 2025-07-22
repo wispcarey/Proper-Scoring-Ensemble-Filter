@@ -586,7 +586,6 @@ def _letkf_analysis(
     return ensemble_a, None
 
 ## iEnKS
-
 def _ienks_analysis(
     ensemble_f,             # (B, N_ensemble, d_state) at the start of the window
     observation_y,          # (B, d_obs) or (d_obs,) at the end of the window
@@ -605,8 +604,7 @@ def _ienks_analysis(
     """
     # Function:
     #   Iterative Ensemble Kalman Smoother (iEnKS) analysis step using a robust
-    #   incremental Gauss-Newton optimization. This method is generally more
-    #   stable than a fixed-point iteration scheme.
+    #   incremental Gauss-Newton optimization with a square-root update for anomalies.
     # ---
     # Input:
     #   ensemble_f: Ensemble at the beginning of the DA window.
@@ -629,23 +627,30 @@ def _ienks_analysis(
         obs_y_eff = observation_y
 
     # --- Initialization (in ensemble space) ---
-    # X0: Initial anomalies, x0: Initial mean
     X0, x0 = center_ensemble(ensemble_f, rescale=False)
-
-    # w: Control vector for the mean update in the anomaly basis.
-    # It represents the weights for the linear combination of anomalies.
     w = torch.zeros(batch_size, N_ensemble, device=device, dtype=dtype)
     za = N_ensemble - 1.0
+    T = torch.eye(N_ensemble, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
-    # --- Iteration Loop (Incremental Gauss-Newton) ---
+    # --- Iteration Loop (Fixed-Point Iteration) ---
     for iteration in range(nIter):
         w_old = w.clone()
 
-        # 1. Reconstruct and propagate the ensemble based on the current w
-        # The current estimate for the mean at the start of the window is x0 + X0.T @ w
+        # 1. Reconstruct and propagate the ensemble based on the current w AND T
+        # Calculate the target mean for the ensemble at the start of the window
         mean_update = (X0.transpose(-2, -1) @ w.unsqueeze(-1)).transpose(-2, -1)
         current_mean_estimate = x0 + mean_update
-        ensemble_to_propagate = current_mean_estimate + X0
+
+        # Transform the initial anomalies using the current transform T
+        transformed_anomalies = T @ X0
+        
+        # FINAL CORRECTION: Re-center the transformed anomalies to ensure their mean is zero.
+        # This is CRUCIAL to prevent corrupting the ensemble mean.
+        # The mean of transformed_anomalies is not guaranteed to be zero.
+        centered_anomalies = transformed_anomalies - torch.mean(transformed_anomalies, dim=1, keepdim=True)
+        
+        # Construct the ensemble for propagation with the correct mean and centered anomalies
+        ensemble_to_propagate = current_mean_estimate + centered_anomalies
 
         # Forecast the full ensemble over the DA window
         num_model_steps = Lag * steps_between_analyses
@@ -659,57 +664,49 @@ def _ienks_analysis(
         AYf, y_f_mean = center_ensemble(y_f_ens, rescale=False)
         innov = obs_y_eff.unsqueeze(1) - y_f_mean
 
-        # 3. Formulate and solve the linear system for the INCREMENT dw
-        # Normalize observation anomalies and innovation by observation error
+        # 3. Formulate and solve the linear system for the next w
         AYf_norm = AYf / sigma_y
         innov_norm = innov / sigma_y
-
-        # Hessian of the cost function in ensemble space: H = za*I + Y'^T * Y'
-        # In code: H = za*I + (AYf_norm) @ (AYf_norm)^T
         Hessian = AYf_norm @ AYf_norm.transpose(-2, -1) + \
                   za * torch.eye(N_ensemble, device=device, dtype=dtype).unsqueeze(0)
-
-        # The term g = Y'^T * d' is the right-hand side for a direct solve
         g = AYf_norm @ innov_norm.transpose(-2, -1)
 
-        # Gradient of the cost function: grad(J) = H*w - g
-        gradient = (Hessian @ w.unsqueeze(-1)) - g
-
-        # Solve for the increment dw: H * dw = -grad(J)
+        # This scheme is a fixed-point iteration: w_new = H_inv * g
         try:
-            dw_solved = torch.linalg.solve(Hessian, -gradient)
+            w_solved = torch.linalg.solve(Hessian, g)
         except torch.linalg.LinAlgError:
-            dw_solved = torch.linalg.pinv(Hessian) @ (-gradient)
+            w_solved = torch.linalg.pinv(Hessian) @ g
+        
+        w = w_solved.squeeze(-1)
 
-        # 4. Update the control vector w with the increment dw
-        # A damping factor (alpha < 1.0) could be introduced for more stability:
-        # w = w + alpha * dw_solved.squeeze(-1)
-        w = w + dw_solved.squeeze(-1)
+        # 4. Update the anomaly transform matrix T for the next iteration
+        try:
+            transform_increment = matrix_sqrt_psd(torch.linalg.inv(Hessian)) * math.sqrt(za)
+        except torch.linalg.LinAlgError:
+            transform_increment = matrix_sqrt_psd(torch.linalg.pinv(Hessian)) * math.sqrt(za)
+        T = transform_increment @ T
         
         # Check for convergence
         update_norm = torch.norm(w - w_old)
         w_norm = torch.norm(w_old)
         if w_norm > 0 and (update_norm / w_norm) < wtol:
             break
-        elif update_norm < wtol: # In case w_old was zero
+        elif update_norm < wtol:
             break
 
     # --- Final Analysis Ensemble ---
-    # Update transform matrix T based on the Hessian from the final iteration
-    # T = sqrt(za) * H^(-1/2) transforms prior anomalies to posterior anomalies
-    try:
-        # Use the final Hessian as it contains the most current information
-        T = matrix_sqrt_psd(torch.linalg.inv(Hessian)) * math.sqrt(za)
-    except torch.linalg.LinAlgError:
-        T = matrix_sqrt_psd(torch.linalg.pinv(Hessian)) * math.sqrt(za)
-
-    # Final analysis mean and anomalies at the start of the window
+    # Construct the final analysis using the optimized w and the fully iterated T
     mean_a = x0 + (X0.transpose(-2, -1) @ w.unsqueeze(-1)).transpose(-2, -1)
-    anom_a = T @ X0
+    
+    # Re-center the final anomalies as well for correctness
+    final_raw_anomalies = T @ X0
+    anom_a = final_raw_anomalies - torch.mean(final_raw_anomalies, dim=1, keepdim=True)
+    
     ensemble_a = mean_a + anom_a
 
     return ensemble_a, None
 
+# EnKF analysis
 def ensemble_kalman_filter_analysis(
     ensemble_f,             # (B, N_ensemble, d_state)
     observation_y,          # (B, d_obs) or (d_obs,) or None
@@ -856,7 +853,7 @@ if __name__ == '__main__':
     num_rk4_steps_between_analyses = 5
     dt_analysis = dt_rk4 * num_rk4_steps_between_analyses
 
-    N_ensemble = 10
+    N_ensemble = 50
     sigma_d_val = 0 # Model error std dev
     sigma_y_val = 1.0 # Observation error std dev for L63
     inflation_val = 1.02 # Inflation for L63
@@ -1005,7 +1002,7 @@ if __name__ == '__main__':
                 method="iEnKS",
                 ienks_lag=1,
                 ienks_niter=10,
-                ienks_wtol=1e-7,
+                ienks_wtol=1e-5,
                 model_args=model_arguments_for_ienks
             )
             end_time = time.perf_counter()
