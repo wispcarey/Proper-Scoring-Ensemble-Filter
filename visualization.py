@@ -1,16 +1,14 @@
 import torch
 import numpy as np
 from typing import Optional, List, Tuple
+import pingouin as pg
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
-
-
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import torch
-from typing import Optional, List, Tuple
+
+from argparse import Namespace 
 
 def plot_particle_trajectories_with_histograms(
     particles: torch.Tensor,
@@ -559,6 +557,117 @@ def plot_particle_trajectories(
 
     if not save_fig:
         if not plot_vertical_colorbar and not plot_horizontal_colorbar:
-             print("Plot generation complete (no colorbars requested). If in a script, ensure plt.show() is called.")
+            print("Plot generation complete (no colorbars requested). If in a script, ensure plt.show() is called.")
         else:
-             print("Plot generation complete including colorbar(s). If in a script, ensure plt.show() is called.")
+            print("Plot generation complete including colorbar(s). If in a script, ensure plt.show() is called.")
+            
+def plot_and_test_point_clouds(
+    args: Namespace,
+    tensor: torch.Tensor,
+    num_samples_plot: int,
+    num_samples_test: int,
+    prefix: str,
+    num_repeats: int = 10,
+    plot_indices: Optional[List[int]] = None,
+    history_traj: Optional[torch.Tensor] = None,
+):
+    """
+    Plots point clouds and optional trajectories, and tests for Gaussianity.
+
+    Controlled by `args`, it can generate both adaptive and fixed-range plots.
+
+    Args:
+        args (Namespace): Configuration object with attributes like `dataset` and `dt`.
+        tensor (torch.Tensor): Point cloud data. Shape: (B, N, 3).
+        history_traj (Optional[torch.Tensor]): Historical trajectory data. Shape: (T, B, 3).
+        num_samples_plot (int): The number of points to sample for PLOTTING.
+        num_samples_test (int): The number of points to sample for STATISTICAL TESTS.
+        prefix (str): The filename prefix for the saved images.
+        num_repeats (int): The number of times to repeat the sampling and testing.
+        plot_indices (Optional[List[int]]): A list of specific batch indices to plot.
+                                            If None, all items in the batch are plotted.
+    """
+    # --- Initial Setup and Validation ---
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    if history_traj is not None and history_traj.is_cuda:
+        history_traj = history_traj.cpu()
+
+    B, N, D = tensor.shape
+    assert D == 3, "Input tensor must be of shape (B, N, 3)"
+    
+    if history_traj is not None:
+        T_h, B_h, D_h = history_traj.shape
+        if B_h != B or D_h != D:
+            print(f"Warning: history_traj shape is incompatible. Trajectory will be ignored.")
+            history_traj = None
+
+    if plot_indices is None:
+        indices_to_process = range(B)
+    else:
+        indices_to_process = [idx for idx in plot_indices if 0 <= idx < B]
+
+    if num_samples_test > N:
+        num_samples_test = N
+
+    # --- Main loop over selected indices ---
+    for i in indices_to_process:
+        full_points_tensor = tensor[i, :, :]
+
+        # 1. --- STATISTICAL TESTING ---
+        hz_str = ""
+        if num_samples_test < D + 1:
+            hz_str = "HZ Test: Skipped (sample size too small)"
+        else:
+            p_values, normal_flags = [], []
+            for _ in range(num_repeats):
+                test_indices = torch.randperm(N)[:num_samples_test]
+                points_for_test = full_points_tensor[test_indices, :].numpy()
+                hz_results = pg.multivariate_normality(points_for_test, alpha=0.05)
+                p_values.append(hz_results.pval)
+                normal_flags.append(hz_results.normal)
+            
+            avg_pval = np.mean(p_values)
+            normal_percentage = np.mean(normal_flags) * 100
+            hz_str = f"HZ: {normal_percentage:.0f}% Normal ({num_repeats} runs, avg p-val={avg_pval:.3f})"
+
+        # 2. --- PLOTTING ---
+        n_to_plot = min(N, num_samples_plot)
+        plot_indices_for_vis = torch.randperm(N)[:n_to_plot]
+        points_to_plot = full_points_tensor[plot_indices_for_vis, :].numpy()
+        
+        # --- Plot 1: Adaptive Axes (Always created) ---
+        adaptive_title = f"Cloud {i} (Test on {num_samples_test} points)\n{hz_str}"
+        fig_adaptive = plt.figure(figsize=(8, 8))
+        ax_adaptive = fig_adaptive.add_subplot(111, projection='3d')
+        ax_adaptive.scatter(points_to_plot[:, 0], points_to_plot[:, 1], points_to_plot[:, 2], s=5, alpha=0.7, label='filtering distribution')
+        ax_adaptive.set_xlabel("X-axis"); ax_adaptive.set_ylabel("Y-axis"); ax_adaptive.set_zlabel("Z-axis")
+        ax_adaptive.set_title(adaptive_title, fontsize=12)
+        ax_adaptive.legend()
+        fig_adaptive.savefig(f"{prefix}_{i}_adaptive.png", bbox_inches='tight', dpi=150)
+        plt.close(fig_adaptive)
+
+        # --- Plot 2: Fixed Axes (Conditional on dataset) ---
+        if args.dataset == 'lorenz63':
+            lorenz_limits = {'xlim': (-25, 25), 'ylim': (-35, 35), 'zlim': (0, 60)}
+            fixed_title = rf"Lorenz 63: $\Delta t$ = {args.dt}, time step = {len(history_traj)}, T = {round(args.dt*len(history_traj)*100)/100:.2f}" 
+            
+            fig_fixed = plt.figure(figsize=(8, 8))
+            ax_fixed = fig_fixed.add_subplot(111, projection='3d')
+            ax_fixed.scatter(points_to_plot[:, 0], points_to_plot[:, 1], points_to_plot[:, 2], s=5, alpha=0.7, label='filtering distribution')
+            
+            if history_traj is not None:
+                traj_to_plot = history_traj[:, i, :].numpy()
+                ax_fixed.plot(traj_to_plot[:, 0], traj_to_plot[:, 1], traj_to_plot[:, 2], color='red', linewidth=1.5, label='History')
+
+            ax_fixed.set_xlabel("X-axis"); ax_fixed.set_ylabel("Y-axis"); ax_fixed.set_zlabel("Z-axis")
+            ax_fixed.set_title(fixed_title, fontsize=12)
+            ax_fixed.set_xlim(lorenz_limits['xlim']); ax_fixed.set_ylim(lorenz_limits['ylim']); ax_fixed.set_zlim(lorenz_limits['zlim'])
+            ax_fixed.legend()
+            fig_fixed.savefig(f"{prefix}_{i}_fixed.png", bbox_inches='tight', dpi=150)
+            plt.close(fig_fixed)
+
+    # --- Final Print Statement ---
+    num_processed = len(indices_to_process) if isinstance(indices_to_process, list) else B
+    plot_types_str = "2 plots (adaptive/fixed)" if args.dataset == 'lorenz63' else "1 plot (adaptive)"
+    print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")

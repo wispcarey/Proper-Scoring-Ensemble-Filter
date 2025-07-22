@@ -24,9 +24,6 @@ if __name__ == "__main__":
         # H_info
         H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
 
-        # modify test_batch_size
-        if args.N == 100:
-            args.test_batch_size = args.test_batch_size // 2
         test_loader = get_dataloader(args, test_only=True)
         
         # print test information

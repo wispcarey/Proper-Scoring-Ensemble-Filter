@@ -10,7 +10,7 @@ from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
 from utils import partial_obs_operator, get_dataloader, redirect_output
 
-from train_test_utils import test_ClassicFilter
+from train_test_utils import test_ClassicFilter, print_test_results
 
 def get_benchmarks(args):
     """
@@ -26,7 +26,14 @@ def get_benchmarks(args):
     file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
     df = pd.read_csv(file_path, usecols=['method', 'N', 'sigma_y', 'best_loc_rad','best_infl','rmse', 'rrmse_mean'])
 
-    method = "LETKF"
+    if args.v == "LETKF":
+        method = "LETKF"
+    elif args.v == "EnKF":
+        method = "EnKF_PertObs"
+    elif args.V == "ESRF":
+        method = "EnKF_Sqrt"
+    else:
+        raise NotImplementedError
     method_data = df[(df['method'] == method) & (df['N'] == args.N)]
     
     # Filter rows where sigma_y == 1 and 0.7
@@ -80,31 +87,38 @@ if __name__ == "__main__":
         # test
         print(f"Test {args.v} Results")
         loss_list_nn = []
-        mean_rmse_nn, std_rmse_nn, mean_rmv_nn, std_rmv_nn, mean_rrmse_nn, std_rrmse_nn, mean_crps_nn, std_crps_nn, no_nan_percent_nn = \
-            test_ClassicFilter(test_loader, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}', infl=infl, loc_radius=loc_radius, save_pdf=True)
-        print(f"RMSE: {mean_rmse_nn:.3f} ± {std_rmse_nn:.3f}")
-        print(f"RRMSE: {mean_rrmse_nn:.3f} ± {std_rrmse_nn:.3f}")
-        print(f"RMV: {mean_rmv_nn:.3f} ± {std_rmv_nn:.3f}")
-        print(f"CRPS: {mean_crps_nn:.3f} ± {std_crps_nn:.3f}")
-        print(f'No NAN Percentage: {no_nan_percent_nn * 100: .2f}%')
-        
+        test_results = \
+            test_ClassicFilter(test_loader, 
+                            args, 
+                            H_info=H_info, 
+                            plot_figures=True, 
+                            fig_name=f'{folder_name}/test_{args.N}', 
+                            infl=infl, 
+                            loc_radius=loc_radius, 
+                            save_pdf=True)
+        print_test_results(test_results)
+
             
         # save results
         tensor_dict = {
-            'nn':{
-                'mean_rmse':mean_rmse_nn,
-                'std_rmse':std_rmse_nn,
-                'mean_rrmse':mean_rrmse_nn,
-                'std_rrmse':std_rrmse_nn,
-                'mean_rmv':mean_rmv_nn,
-                'std_rmv':std_rmv_nn,
-                'mean_crps':mean_crps_nn,
-                'std_crps':std_crps_nn,
-                'valid_percent':no_nan_percent_nn,
-                'loc_diff_dist':args.diff_dist,
+            'nn': {
+                'mean_rmse': test_results.get('mean_rmse', float('nan')),
+                'std_rmse': test_results.get('std_rmse', float('nan')),
+                'mean_rrmse': test_results.get('mean_rrmse', float('nan')),
+                'std_rrmse': test_results.get('std_rrmse', float('nan')),
+                'mean_rmv': test_results.get('mean_rmv', float('nan')),
+                'std_rmv': test_results.get('std_rmv', float('nan')),  
+                'mean_crps': test_results.get('mean_crps', float('nan')),
+                'std_crps': test_results.get('std_crps', float('nan')),
+                'mean_rcrps': test_results.get('mean_rcrps', float('nan')),
+                'std_rcrps': test_results.get('std_rcrps', float('nan')),
+                'valid_percent': test_results.get('no_nan_percent', 0.0),
+                'cov_diff': test_results.get('mean_cov_diff', float('nan')),
+                'pf_rmse': test_results.get('mean_pf_rmse', float('nan')),
+                'loc_diff_dist': getattr(args, 'diff_dist', None),
             },
-            'cp_load_path': args.cp_load_path,
-            'sigma_y': args.sigma_y,
+            'cp_load_path': getattr(args, 'cp_load_path', None),
+            'sigma_y': getattr(args, 'sigma_y', None),
         }
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])

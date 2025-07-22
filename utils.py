@@ -987,3 +987,61 @@ class LinearSystemDataset(Dataset):
         print(f"  sigma_v: {sample['sigma_v'].item():.4f}")
         print(f"  sigma_y: {sample['sigma_y'].item():.4f}")
         print("--------------------------")
+
+import ot
+def wasserstein_distance_pt(x, y, n_projections=100):
+    """
+    Calculates the W-2 distance between two point clouds using PyTorch.
+    - If d=1, it uses the efficient sorting-based method.
+      Cost is approx. O(M*log(M) + N*log(N)) for each item in the batch.
+    - If d>1, it uses the Sliced-Wasserstein distance.
+      Cost is approx. O(L * K*log(K)) for each item, where L is the number of
+      projections and K is the total number of points (M+N).
+
+    INPUT:
+    - x: A torch.Tensor of shape (M, d) or (B, M, d).
+    - y: A torch.Tensor of shape (N, d) or (B, N, d).
+    - n_projections: The number of random projections for the Sliced method.
+
+    OUTPUT:
+    - dist: A tensor containing the W-2 distance(s).
+            Shape is (B,) for batched input, or a scalar for unbatched input.
+    """
+    # --- 1. Input Validation and Preparation ---
+    if x.device != y.device:
+        raise ValueError("Input tensors must be on the same device")
+    
+    original_device = x.device
+    is_unbatched = x.dim() == 2
+    if is_unbatched:
+        x = x.unsqueeze(0)
+        y = y.unsqueeze(0)
+
+    B, M, d = x.shape
+    _B, N, _d = y.shape
+
+    if B != _B or d != _d:
+      raise ValueError(f"Shape mismatch: x is {x.shape}, y is {y.shape}")
+
+    # --- 2. Dimension-specific routing ---
+    if d == 1:
+        x_1d = x.squeeze(-1)
+        y_1d = y.squeeze(-1)
+        
+        # Move to CPU for ot.wasserstein_1d which may not support CUDA
+        dist_list_1d = [ot.wasserstein_1d(x_b.to("cpu"), y_b.to("cpu"), p=2) for x_b, y_b in zip(x_1d, y_1d)]
+        dist = torch.stack(dist_list_1d).to(original_device)
+
+    else: # d > 1, use Sliced-Wasserstein
+        # FIX: Loop through the batch, as ot.sliced_wasserstein_distance
+        # does not support batching in the (B, N, d) format.
+        dist_list_sliced = [
+            ot.sliced_wasserstein_distance(x_b, y_b, n_projections=n_projections, p=2)
+            for x_b, y_b in zip(x, y)
+        ]
+        dist = torch.stack(dist_list_sliced)
+
+    # --- 3. Final Output Formatting ---
+    if is_unbatched:
+        return dist.squeeze(0)
+    return dist

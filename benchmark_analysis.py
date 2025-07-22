@@ -174,147 +174,121 @@ from torch import vmap
 def bootstrap_particle_filter_analysis(
     particles_forecast,      # (batch_size, N_particles, d_state)
     observation_y,           # (batch_size, d_obs) or (d_obs,)
-    observation_operator,    # callable: (d_state,) -> (d_obs,)
+    observation_operator,    # callable or torch.Tensor of shape (d_obs, d_state)
     sigma_y,                 # float (std dev of observation noise)
     resampling_method="multinomial",
+    resample_on_cpu=False,   # bool: If True, moves weight/index calculations to CPU
     sigma_reg=None,          # float (std dev for regularization noise)
-    use_half_precision=False, # bool: If True, use float16 to save memory
-    max_chunk_size=5000      # int: Max particles to process at once to save memory
+    use_half_precision=False,# bool: If True, use float16 to save memory
+    max_chunk_size=5000      # int: Max particles to process at once for non-matrix operators
 ):
     """
     Performs an advanced batch analysis (update & resampling) for a Bootstrap Particle Filter.
-
-    This implementation includes:
-    1. Vectorization: Uses torch.vmap to avoid slow Python loops over particles.
-    2. Chunking: Processes particles in chunks if N_particles > max_chunk_size to manage memory.
-    3. Half-Precision: Optionally uses torch.float16 to reduce memory and potentially speed up computation.
+    This version is optimized for a linear observation_operator provided as a matrix
+    and includes a fix for float16 underflow during resampling.
 
     Args:
         particles_forecast (torch.Tensor): Forecasted particles of shape (batch_size, N_particles, d_state).
-        observation_y (torch.Tensor): Observation tensor. Expected shape is (batch_size, d_obs) or (d_obs,).
-        observation_operator (callable): The observation mapping function, y_pred = h(x_forecast),
-                                         which maps a state of shape (d_state,) to an observation of shape (d_obs,).
-        sigma_y (float): Standard deviation of the observation noise (assumed to be isotropic Gaussian).
-        resampling_method (str): The resampling method to use, either "multinomial" or "systematic".
-        sigma_reg (float, optional): Std dev for regularization noise. If > 0, adds N(0, sigma_reg^2 * I) noise.
-        use_half_precision (bool): If True, converts key tensors to float16 for the computation.
-        max_chunk_size (int): The maximum number of particles to process in a single vectorized call.
+        observation_y (torch.Tensor): Observation tensor of shape (batch_size, d_obs) or (d_obs,).
+        observation_operator (callable or torch.Tensor): The observation mapping.
+                                 - If callable: a function y_pred = h(x_forecast).
+                                 - If torch.Tensor: A matrix H of shape (d_obs, d_state).
+        sigma_y (float): Standard deviation of the observation noise.
+        resampling_method (str): Resampling method, either "multinomial" or "systematic".
+        resample_on_cpu (bool): If True, computes weights and indices on CPU to conserve GPU memory.
+        sigma_reg (float, optional): Std dev for regularization noise.
+        use_half_precision (bool): If True, converts key tensors to float16.
+        max_chunk_size (int): Max particles for vectorized call (only for callable operators).
 
     Returns:
-        torch.Tensor: The analysis particles after resampling and optional regularization,
-                      of shape (batch_size, N_particles, d_state).
+        torch.Tensor: The analysis particles of shape (batch_size, N_particles, d_state).
     """
     batch_size, N_particles, d_state = particles_forecast.shape
     device = particles_forecast.device
-    original_dtype = particles_forecast.dtype # Keep track of original dtype to cast back at the end
+    original_dtype = particles_forecast.dtype
 
     if N_particles == 0:
         return particles_forecast
 
     # 1. Precision Handling
-    # ---------------------
-    # Optionally convert to half precision to save memory and potentially speed up computation.
-    if use_half_precision:
-        compute_dtype = torch.float16
-        particles_forecast = particles_forecast.to(compute_dtype)
-        if observation_y is not None:
-            observation_y = observation_y.to(compute_dtype)
-    else:
-        compute_dtype = original_dtype
+    compute_dtype = torch.float16 if use_half_precision else original_dtype
+    particles_forecast = particles_forecast.to(compute_dtype)
+    if observation_y is not None:
+        observation_y = observation_y.to(compute_dtype)
 
     # 2. Update (Compute Weights)
-    # ---------------------------
-    log_weights = torch.zeros(batch_size, N_particles, device=device, dtype=compute_dtype)
-
     if observation_y is not None:
-        # --- Prepare observation_y for broadcasting ---
-        if observation_y.ndim == 1:   # Shape (d_obs,)
-            d_obs = observation_y.shape[0]
-            obs_y_broadcastable = observation_y.view(1, 1, d_obs)
-        elif observation_y.ndim == 2: # Shape (batch_size, d_obs) or (1, d_obs)
-            d_obs = observation_y.shape[1]
+        if observation_y.ndim == 1:
+            obs_y_broadcastable = observation_y.view(1, 1, -1)
+        elif observation_y.ndim == 2:
             obs_y_broadcastable = observation_y.unsqueeze(1)
         else:
             raise ValueError("observation_y must be a 1D or 2D tensor.")
 
-        # --- Predict observations for all particles (Vectorized with optional chunking) ---
-        vectorized_op = vmap(vmap(observation_operator))
-
-        if N_particles > max_chunk_size:
-            # --- Chunked processing to save memory ---
+        if isinstance(observation_operator, torch.Tensor):
+            H = observation_operator.to(device=device, dtype=compute_dtype)
+            if H.shape[1] != d_state:
+                raise ValueError(f"Matrix shape mismatch: H requires {d_state} columns, but has {H.shape[1]}")
+            y_forecast = particles_forecast @ H.T
+            diff_sq = ((obs_y_broadcastable - y_forecast) / sigma_y) ** 2
+            log_weights = -0.5 * torch.sum(diff_sq, dim=2)
+        elif callable(observation_operator):
+            log_weights = torch.zeros(batch_size, N_particles, device=device, dtype=compute_dtype)
+            vectorized_op = vmap(vmap(observation_operator))
             for i in range(0, N_particles, max_chunk_size):
                 chunk_end = min(i + max_chunk_size, N_particles)
                 particles_chunk = particles_forecast[:, i:chunk_end, :]
-
-                # Apply vectorized operator on the smaller chunk
                 y_forecast_chunk = vectorized_op(particles_chunk)
-
-                # Calculate log-likelihoods for the chunk
                 diff_sq_chunk = ((obs_y_broadcastable - y_forecast_chunk) / sigma_y) ** 2
-                log_weights_chunk = -0.5 * torch.sum(diff_sq_chunk, dim=2)
-                
-                # Store the result in the full log_weights tensor
-                log_weights[:, i:chunk_end] = log_weights_chunk
+                log_weights[:, i:chunk_end] = -0.5 * torch.sum(diff_sq_chunk, dim=2)
         else:
-            # --- Full vectorized processing (if N_particles is small enough) ---
-            y_forecast = vectorized_op(particles_forecast)
-            diff_sq = ((obs_y_broadcastable - y_forecast) / sigma_y) ** 2
-            log_weights = -0.5 * torch.sum(diff_sq, dim=2)
-
-        # --- Normalize weights using log-sum-exp trick for numerical stability ---
+            raise TypeError("observation_operator must be a callable or a torch.Tensor")
+            
         max_log_w = torch.max(log_weights, dim=1, keepdim=True)[0]
         weights_unnormalized = torch.exp(log_weights - max_log_w)
         sum_weights = torch.sum(weights_unnormalized, dim=1, keepdim=True)
-
+        
         uniform_dist = torch.full((N_particles,), 1.0 / N_particles, device=device, dtype=compute_dtype)
         weights = uniform_dist.unsqueeze(0).expand(batch_size, -1).clone()
-        
-        good_batches_mask = (sum_weights > 1e-6).squeeze(-1) # Use 1e-6 for float16 safety
 
+        good_batches_mask = (sum_weights > 1e-6).squeeze(-1)
         if good_batches_mask.any():
             normalized_w_good = weights_unnormalized[good_batches_mask] / sum_weights[good_batches_mask]
             weights[good_batches_mask] = normalized_w_good
     else:
-        # If no observation, all particles have uniform weight
         weights = torch.full((batch_size, N_particles), 1.0 / N_particles, device=device, dtype=compute_dtype)
 
-    # 3. Resampling (This section is already efficient)
-    # -----------------------------------------------
-    indices = torch.multinomial(weights, N_particles, replacement=True)
+    # 3. Resampling (FIX APPLIED HERE)
+    # --- For numerical stability, cast weights to float32 for resampling calculations ---
+    resample_device = torch.device("cpu") if resample_on_cpu else device
+    resample_dtype = torch.float32 # Use float32 to prevent underflow
     
-    # The systematic resampling part is slightly more complex to make fully compatible
-    # with batching when weights can be all zeros for some batches.
-    # Multinomial is generally robust and efficient. For simplicity, this implementation
-    # will focus on the more common multinomial resampling. If systematic is needed,
-    # careful handling of the 'weights' tensor is required.
-    if resampling_method == "systematic":
-        # Note: Systematic resampling can be sensitive to batches with all-zero weights.
-        # This implementation is a standard approach.
-        cdf = torch.cumsum(weights, dim=1)
-        cdf[:, -1] = 1.0 # Ensure the CDF ends at 1.0 for robustness
+    weights_resample = weights.to(device=resample_device, dtype=resample_dtype)
+    
+    # Add a small epsilon to the weights to guarantee the sum is non-zero
+    weights_resample += torch.finfo(resample_dtype).eps
 
-        u_start = torch.rand(batch_size, 1, device=device, dtype=compute_dtype) / N_particles
-        u_uniform_strata = torch.arange(N_particles, device=device, dtype=compute_dtype) / N_particles
+    if resampling_method == "multinomial":
+        indices = torch.multinomial(weights_resample, N_particles, replacement=True)
+    elif resampling_method == "systematic":
+        cdf = torch.cumsum(weights_resample, dim=1)
+        cdf[:, -1] = 1.0
+        u_start = torch.rand(batch_size, 1, device=resample_device, dtype=resample_dtype) / N_particles
+        u_uniform_strata = torch.arange(N_particles, device=resample_device, dtype=resample_dtype) / N_particles
         u_samples = u_start + u_uniform_strata.unsqueeze(0)
-
-        indices = torch.searchsorted(cdf, u_samples, right=True)
-        indices.clamp_(0, N_particles - 1)
-    elif resampling_method != "multinomial":
+        indices = torch.searchsorted(cdf, u_samples, right=True).clamp_(0, N_particles - 1)
+    else:
         raise ValueError(f"Unknown resampling method: {resampling_method}")
 
-    # Gather the resampled particles using advanced indexing
-    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(indices)
+    indices = indices.to(device=device)
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     particles_analysis = particles_forecast[batch_indices, indices]
 
-    # 4. Regularization (Optional, already efficient)
-    # ---------------------------------------------
+    # 4. Regularization
     if sigma_reg is not None and sigma_reg > 0:
-        noise = torch.randn_like(particles_analysis) # noise will have dtype=compute_dtype
-        particles_analysis = particles_analysis + noise * sigma_reg
+        particles_analysis += torch.randn_like(particles_analysis) * sigma_reg
 
     # 5. Final Type Casting
-    # ---------------------
-    # Cast the final result back to the original data type if needed
     if use_half_precision:
         particles_analysis = particles_analysis.to(original_dtype)
         
@@ -611,6 +585,130 @@ def _letkf_analysis(
     ensemble_a = ensemble_a_mean_parts + ensemble_a_anom_parts
     return ensemble_a, None
 
+## iEnKS
+
+def _ienks_analysis(
+    ensemble_f,             # (B, N_ensemble, d_state) at the start of the window
+    observation_y,          # (B, d_obs) or (d_obs,) at the end of the window
+    observation_operator_ens, # function to apply to ensemble
+    sigma_y,                # scalar or (B,)
+    # --- Model specific args for propagation ---
+    model_propagator,       # function like rk4_step
+    model_rhs,              # function for the propagator
+    model_dt,               # float, model integration time step
+    # --- iEnKS specific hyperparameters ---
+    Lag=1,                  # int, DA window length in analysis cycles
+    nIter=10,               # int, max number of iterations
+    wtol=1e-5,              # float, tolerance for stopping
+    steps_between_analyses=5 # int, model steps per analysis cycle
+):
+    """
+    # Function:
+    #   Iterative Ensemble Kalman Smoother (iEnKS) analysis step using a robust
+    #   incremental Gauss-Newton optimization. This method is generally more
+    #   stable than a fixed-point iteration scheme.
+    # ---
+    # Input:
+    #   ensemble_f: Ensemble at the beginning of the DA window.
+    #   observation_y: Observation at the end of the DA window.
+    #   observation_operator_ens: Observation operator function.
+    #   sigma_y: Standard deviation of observation noise.
+    #   model_propagator, model_rhs, model_dt: Model details for forecast.
+    #   Lag, nIter, wtol, steps_between_analyses: iEnKS hyperparameters.
+    # ---
+    # Output:
+    #   tuple[torch.Tensor, None]: Smoothed analysis ensemble and None (for API consistency).
+    """
+    batch_size, N_ensemble, d_state = ensemble_f.shape
+    device = ensemble_f.device
+    dtype = ensemble_f.dtype
+
+    if observation_y.ndim == 1:
+        obs_y_eff = observation_y.unsqueeze(0)
+    else:
+        obs_y_eff = observation_y
+
+    # --- Initialization (in ensemble space) ---
+    # X0: Initial anomalies, x0: Initial mean
+    X0, x0 = center_ensemble(ensemble_f, rescale=False)
+
+    # w: Control vector for the mean update in the anomaly basis.
+    # It represents the weights for the linear combination of anomalies.
+    w = torch.zeros(batch_size, N_ensemble, device=device, dtype=dtype)
+    za = N_ensemble - 1.0
+
+    # --- Iteration Loop (Incremental Gauss-Newton) ---
+    for iteration in range(nIter):
+        w_old = w.clone()
+
+        # 1. Reconstruct and propagate the ensemble based on the current w
+        # The current estimate for the mean at the start of the window is x0 + X0.T @ w
+        mean_update = (X0.transpose(-2, -1) @ w.unsqueeze(-1)).transpose(-2, -1)
+        current_mean_estimate = x0 + mean_update
+        ensemble_to_propagate = current_mean_estimate + X0
+
+        # Forecast the full ensemble over the DA window
+        num_model_steps = Lag * steps_between_analyses
+        propagated_members_flat = ensemble_to_propagate.reshape(batch_size * N_ensemble, d_state)
+        for _ in range(num_model_steps):
+            propagated_members_flat = model_propagator(model_rhs, propagated_members_flat, model_dt)
+        E_propagated = propagated_members_flat.reshape(batch_size, N_ensemble, d_state)
+
+        # 2. Observe the propagated ensemble and compute innovation
+        y_f_ens = observation_operator_ens(E_propagated)
+        AYf, y_f_mean = center_ensemble(y_f_ens, rescale=False)
+        innov = obs_y_eff.unsqueeze(1) - y_f_mean
+
+        # 3. Formulate and solve the linear system for the INCREMENT dw
+        # Normalize observation anomalies and innovation by observation error
+        AYf_norm = AYf / sigma_y
+        innov_norm = innov / sigma_y
+
+        # Hessian of the cost function in ensemble space: H = za*I + Y'^T * Y'
+        # In code: H = za*I + (AYf_norm) @ (AYf_norm)^T
+        Hessian = AYf_norm @ AYf_norm.transpose(-2, -1) + \
+                  za * torch.eye(N_ensemble, device=device, dtype=dtype).unsqueeze(0)
+
+        # The term g = Y'^T * d' is the right-hand side for a direct solve
+        g = AYf_norm @ innov_norm.transpose(-2, -1)
+
+        # Gradient of the cost function: grad(J) = H*w - g
+        gradient = (Hessian @ w.unsqueeze(-1)) - g
+
+        # Solve for the increment dw: H * dw = -grad(J)
+        try:
+            dw_solved = torch.linalg.solve(Hessian, -gradient)
+        except torch.linalg.LinAlgError:
+            dw_solved = torch.linalg.pinv(Hessian) @ (-gradient)
+
+        # 4. Update the control vector w with the increment dw
+        # A damping factor (alpha < 1.0) could be introduced for more stability:
+        # w = w + alpha * dw_solved.squeeze(-1)
+        w = w + dw_solved.squeeze(-1)
+        
+        # Check for convergence
+        update_norm = torch.norm(w - w_old)
+        w_norm = torch.norm(w_old)
+        if w_norm > 0 and (update_norm / w_norm) < wtol:
+            break
+        elif update_norm < wtol: # In case w_old was zero
+            break
+
+    # --- Final Analysis Ensemble ---
+    # Update transform matrix T based on the Hessian from the final iteration
+    # T = sqrt(za) * H^(-1/2) transforms prior anomalies to posterior anomalies
+    try:
+        # Use the final Hessian as it contains the most current information
+        T = matrix_sqrt_psd(torch.linalg.inv(Hessian)) * math.sqrt(za)
+    except torch.linalg.LinAlgError:
+        T = matrix_sqrt_psd(torch.linalg.pinv(Hessian)) * math.sqrt(za)
+
+    # Final analysis mean and anomalies at the start of the window
+    mean_a = x0 + (X0.transpose(-2, -1) @ w.unsqueeze(-1)).transpose(-2, -1)
+    anom_a = T @ X0
+    ensemble_a = mean_a + anom_a
+
+    return ensemble_a, None
 
 def ensemble_kalman_filter_analysis(
     ensemble_f,             # (B, N_ensemble, d_state)
@@ -626,7 +724,12 @@ def ensemble_kalman_filter_analysis(
     localization_radius_letkf=None, # scalar
     coords_state_letkf=None,        # (d_state, D_coord)
     coords_obs_letkf=None,          # (d_obs, D_coord)
-    domain_letkf=None       # (D_coord,)
+    domain_letkf=None,      # (D_coord,)
+    # For iEnKS
+    ienks_lag=1,
+    ienks_niter=10,
+    ienks_wtol=1e-5,
+    model_args=None # Dict for model propagator info needed by iEnKS
 ):
     """ Main dispatcher for ensemble Kalman filter analysis (Batched) """
     kalman_gain_or_transform = None
@@ -653,6 +756,19 @@ def ensemble_kalman_filter_analysis(
             localization_radius_letkf, coords_state_letkf,
             coords_obs_letkf, domain_letkf
         )
+    elif method == "iEnKS":
+        if model_args is None:
+            raise ValueError("iEnKS method requires 'model_args' dictionary.")
+        ensemble_a_raw, kalman_gain_or_transform = _ienks_analysis(
+            ensemble_f, observation_y, observation_operator_ens, sigma_y,
+            model_propagator=model_args['propagator'],
+            model_rhs=model_args['rhs'],
+            model_dt=model_args['dt'],
+            steps_between_analyses=model_args['steps_between_analyses'],
+            Lag=ienks_lag,
+            nIter=ienks_niter,
+            wtol=ienks_wtol
+        )
     else:
         raise ValueError(f"Unknown EnKF method: {method}")
 
@@ -664,7 +780,7 @@ def ensemble_kalman_filter_analysis(
 # ##############################################################################
 # # Lorenz 96 and RK4 for Testing
 # ##############################################################################
-def lorenz96_rhs(x, F):
+def lorenz96_rhs(x, F=8):
     """
     Calculates the RHS of the Lorenz 96 equations.
     x can be a 1D tensor (D_state,) or a 2D tensor (batch_size, D_state).
@@ -688,16 +804,40 @@ def lorenz96_rhs(x, F):
     dxdt = (x_p1 - x_m2) * x_m1 - x + F
     return dxdt
 
-def rk4_step(rhs_func, x, dt, F_param):
+def lorenz63_rhs(x, sigma=10.0, rho=28.0, beta=8.0/3.0):
+    """
+    # Function: Calculates the RHS of the Lorenz 63 equations.
+    # ---
+    # Input:
+    #   x (torch.Tensor): State tensor of shape (batch_size, 3) or (3,).
+    #   sigma, rho, beta (float): Lorenz 63 parameters.
+    # ---
+    # Output:
+    #   torch.Tensor: The derivatives (dx/dt, dy/dt, dz/dt) with the same shape as x.
+    """
+    # Unpack state variables
+    x_val = x[..., 0]
+    y_val = x[..., 1]
+    z_val = x[..., 2]
+
+    # Lorenz 63 equations
+    dxdt = sigma * (y_val - x_val)
+    dydt = x_val * (rho - z_val) - y_val
+    dzdt = x_val * y_val - beta * z_val
+
+    # Stack the results back into a tensor of the same shape as the input
+    return torch.stack([dxdt, dydt, dzdt], dim=-1)
+
+def rk4_step(rhs_func, x, dt):
     """
     Performs one RK4 step.
     x can be (D_state,) or (batch_size, D_state).
     rhs_func is compatible with batched x.
     """
-    k1 = rhs_func(x, F_param)
-    k2 = rhs_func(x + 0.5 * dt * k1, F_param)
-    k3 = rhs_func(x + 0.5 * dt * k2, F_param)
-    k4 = rhs_func(x + dt * k3, F_param)
+    k1 = rhs_func(x)
+    k2 = rhs_func(x + 0.5 * dt * k1)
+    k3 = rhs_func(x + 0.5 * dt * k2)
+    k4 = rhs_func(x + dt * k3)
     x_next = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
     return x_next
 
@@ -705,122 +845,98 @@ def rk4_step(rhs_func, x, dt, F_param):
 # # Main Test Script
 # ##############################################################################
 if __name__ == '__main__':
-    print("Running Lorenz 96 DA example with 3D Tensors (Batch Support)...")
-    device = 'cuda:0'
+    print("Running Lorenz 63 DA example with 3D Tensors (Batch Support)...")
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     dtype = torch.float32
     print(f"Using device: {device}, dtype: {dtype}")
 
-    # --- Configuration ---
-    D_L96 = 40 # Reduced for faster testing, original was 500
-    F_L96_const = 8.0
-    dt_rk4 = 0.03 # Slightly larger dt for L40
+    # --- Configuration for Lorenz 63 ---
+    D_L63 = 3   # State dimension for Lorenz 63
+    dt_rk4 = 0.03 # Time step for RK4 integrator, smaller for L63 is more stable
     num_rk4_steps_between_analyses = 5
     dt_analysis = dt_rk4 * num_rk4_steps_between_analyses
 
-    N_ensemble = 20 # Reduced N_ensemble for speed
+    N_ensemble = 10
     sigma_d_val = 0 # Model error std dev
-    sigma_y_val = 1 # Observation error std dev
-    inflation_val = 1.05
+    sigma_y_val = 1.0 # Observation error std dev for L63
+    inflation_val = 1.02 # Inflation for L63
 
-    batch_size = 5 # Introduce batch size
+    batch_size = 5 # Number of independent experiments to run in parallel
 
-    d_obs_l96 = D_L96 # Observe all state variables
-    
-    def obs_op_l96(x_curr): 
-        return torch.arctan(x_curr)
-        # return x_curr
+    d_obs_l63 = 1 # We only observe the first state variable (x)
+
+    # Observation operator: select the first component (the 'x' variable)
+    obs_op_l63 = lambda x: x[..., 0:1]
+
+    # Define the model RHS for the forecast steps, with fixed parameters
+    l63_rhs_func = lambda x: lorenz63_rhs(x, sigma=10.0, rho=28.0, beta=8.0/3.0)
+
 
     # --- True State Initialization and Spin-up ---
-    # true_state_t: (batch_size, D_L96)
-    true_state_t = torch.rand(batch_size, D_L96, device=device, dtype=dtype) * 15.0 - 5.0 # L96 range
-    true_state_t[:, D_L96 // 2] += F_L96_const # Add some perturbation to break symmetry for batches
+    # Initialize true state near the attractor and add some noise for batch diversity
+    true_state_t = torch.tensor([[ -8.0, -9.0, 27.0 ]], device=device, dtype=dtype) + \
+                   torch.randn(batch_size, D_L63, device=device, dtype=dtype) * 2.0
 
     print("Spinning up true states (batched)...")
-    for _ in range(100): # Spin-up iterations
+    for _ in range(400): # Spin-up iterations
         for _ in range(num_rk4_steps_between_analyses):
-            true_state_t = rk4_step(lorenz96_rhs, true_state_t, dt_rk4, F_L96_const)
+            true_state_t = rk4_step(l63_rhs_func, true_state_t, dt_rk4)
     print("True state spin-up complete.")
 
     # --- Initial Ensembles (Batched) ---
-    # initial_ensemble: (batch_size, N_ensemble, D_L96)
-    # true_state_t.unsqueeze(1): (B, 1, D) for broadcasting
+    # initial_ensemble: (batch_size, N_ensemble, D_L63)
     initial_ensemble = true_state_t.unsqueeze(1) + \
-                       torch.randn(batch_size, N_ensemble, D_L96, device=device, dtype=dtype) * 2.0
+                       torch.randn(batch_size, N_ensemble, D_L63, device=device, dtype=dtype) * 3.0
 
     current_particles_bpf = initial_ensemble.clone()
     current_ensemble_enkf_po = initial_ensemble.clone()
     current_ensemble_ersf = initial_ensemble.clone()
-    current_ensemble_letkf = initial_ensemble.clone()
+    current_ensemble_ienks = initial_ensemble.clone()
 
-    # --- Localization Setup (Not batched, shared across batches) ---
-    coords_state_l96 = torch.arange(D_L96, device=device, dtype=dtype).unsqueeze(1) # (D_L96, 1)
-    coords_obs_l96 = torch.arange(d_obs_l96, device=device, dtype=dtype).unsqueeze(1) # (d_obs_l96, 1)
-    domain_l96 = torch.tensor([D_L96], device=device, dtype=dtype) # (1,)
-    loc_radius_gc = 3.0 # Effective radius for Gaspari-Cohn like localization
-
-    # Assuming pairwise_distances and dist2coeff are available and work as expected.
-    # If pairwise_distances is strictly 3D (B,N,D_coord), these calls need adjustment:
-    # e.g., coords_state_l96.unsqueeze(0) to make it (1, D_L96, 1)
-    # For simplicity, assume the existing call structure is valid with the (assumed fixed) utils.
-    try:
-        Lxy_l96 = dist2coeff(
-            pairwise_distances(coords_state_l96, coords_obs_l96, domain=domain_l96),
-            loc_radius_gc
-        )
-        Lyy_l96 = dist2coeff(
-            pairwise_distances(coords_obs_l96, coords_obs_l96, domain=domain_l96),
-            loc_radius_gc
-        )
-    except NameError: # Fallback if helper functions are not defined
-        print("Warning: Lxy_l96/Lyy_l96 not computed due to missing pairwise_distances or dist2coeff.")
-        Lxy_l96, Lyy_l96 = None, None
-
+    # --- Localization Setup ---
+    # Localization is not used for the low-dimensional L63 system.
+    # We explicitly set these to None for clarity in the filter call.
+    Lxy, Lyy = None, None
 
     # --- Main Simulation Loop ---
-    num_analysis_cycles = 1000 # Reduced cycles for faster test
+    num_analysis_cycles = 200 # More cycles for better statistics
     print(f"\nRunning {num_analysis_cycles} analysis cycles (batch_size={batch_size}, dt_analysis={dt_analysis:.2f})...")
-    results_rmse = {"BPF": [], "EnKF-PO": [], "ERSF": [], "LETKF": []}
-    analysis_times = {"BPF": [], "EnKF-PO": [], "ERSF": [], "LETKF": []}
+    results_rmse = {"BPF": [], "EnKF-PO": [], "ERSF": [], "iEnKS": []}
+    analysis_times = {"BPF": [], "EnKF-PO": [], "ERSF": [], "iEnKS": []}
 
     for cycle in range(num_analysis_cycles):
         # 1. Forecast True State (Batched)
         for _ in range(num_rk4_steps_between_analyses):
-            true_state_t = rk4_step(lorenz96_rhs, true_state_t, dt_rk4, F_L96_const)
+            true_state_t = rk4_step(l63_rhs_func, true_state_t, dt_rk4)
 
         # 2. Generate Observation (Batched)
-        # observation_y_t: (batch_size, d_obs_l96)
-        observation_y_t = obs_op_l96(true_state_t) + \
-                          sigma_y_val * torch.randn(batch_size, d_obs_l96, device=device, dtype=dtype)
+        observation_y_t = obs_op_l63(true_state_t) + \
+                          sigma_y_val * torch.randn(batch_size, d_obs_l63, device=device, dtype=dtype)
 
         # 3. Forecast Ensembles (Batched)
         ensembles_to_forecast = {
             "BPF": current_particles_bpf,
             "EnKF-PO": current_ensemble_enkf_po,
             "ERSF": current_ensemble_ersf,
-            "LETKF": current_ensemble_letkf
+            "iEnKS": current_ensemble_ienks
         }
         forecast_inputs = {}
 
         for name, ens_batch in ensembles_to_forecast.items():
-            # ens_batch shape: (batch_size, N_ensemble, D_L96)
-            # Reshape for vectorized forecast: (batch_size * N_ensemble, D_L96)
             num_total_members = batch_size * N_ensemble
-            current_members_flat = ens_batch.reshape(num_total_members, D_L96)
+            current_members_flat = ens_batch.reshape(num_total_members, D_L63)
 
             propagated_members_flat = current_members_flat
             for _ in range(num_rk4_steps_between_analyses):
-                propagated_members_flat = rk4_step(lorenz96_rhs, propagated_members_flat, dt_rk4, F_L96_const)
+                propagated_members_flat = rk4_step(l63_rhs_func, propagated_members_flat, dt_rk4)
             
-            # Reshape back: (batch_size, N_ensemble, D_L96)
-            forecasted_ens = propagated_members_flat.reshape(batch_size, N_ensemble, D_L96)
+            forecasted_ens = propagated_members_flat.reshape(batch_size, N_ensemble, D_L63)
             
-            # Add model error
             if sigma_d_val > 0:
                 forecasted_ens += sigma_d_val * torch.randn_like(forecasted_ens)
             forecast_inputs[name] = forecasted_ens
         
         # 4. Analysis Step for each method (Batched)
-        # For RMSE, we'll report for the first batch element to keep output simple
         batch_idx_for_rmse = 0
 
         # BPF
@@ -828,9 +944,9 @@ if __name__ == '__main__':
             start_time = time.perf_counter()
             current_particles_bpf = bootstrap_particle_filter_analysis(
                 forecast_inputs["BPF"], observation_y_t,
-                obs_op_l96, # Operates on (D_state), BPF analysis handles iteration
+                obs_op_l63,
                 sigma_y_val,
-                resampling_method="multinomial" 
+                resampling_method="systematic"
             )
             end_time = time.perf_counter()
             analysis_times["BPF"].append(end_time - start_time)
@@ -839,10 +955,10 @@ if __name__ == '__main__':
         except NameError: results_rmse["BPF"].append(float('nan')); analysis_times["BPF"].append(float('nan'))
 
 
-        # EnKF Methods (using the main dispatcher)
+        # EnKF Methods
         common_enkf_args = {
             "observation_y": observation_y_t,
-            "observation_operator_ens": obs_op_l96,
+            "observation_operator_ens": obs_op_l63,
             "sigma_y": sigma_y_val,
             "inflation_factor": inflation_val
         }
@@ -853,8 +969,8 @@ if __name__ == '__main__':
             current_ensemble_enkf_po, _ = ensemble_kalman_filter_analysis(
                 forecast_inputs["EnKF-PO"], **common_enkf_args,
                 method="EnKF-PertObs",
-                localization_matrix_Lxy=Lxy_l96, 
-                localization_matrix_Lyy=Lyy_l96 
+                localization_matrix_Lxy=Lxy, 
+                localization_matrix_Lyy=Lyy
             )
             end_time = time.perf_counter()
             analysis_times["EnKF-PO"].append(end_time - start_time)
@@ -875,42 +991,49 @@ if __name__ == '__main__':
             results_rmse["ERSF"].append(rmse_ersf)
         except NameError: results_rmse["ERSF"].append(float('nan')); analysis_times["ERSF"].append(float('nan'))
             
-        # LETKF
+        # iEnKS
         try:
+            model_arguments_for_ienks = {
+                "propagator": rk4_step,
+                "rhs": l63_rhs_func,
+                "dt": dt_rk4,
+                "steps_between_analyses": num_rk4_steps_between_analyses,
+            }
             start_time = time.perf_counter()
-            current_ensemble_letkf, _ = ensemble_kalman_filter_analysis(
-                # The code `forecast_inputs["LETKF"]` is accessing the value associated with the key
-                # "LETKF" in the dictionary `forecast_inputs`.
-                
-                forecast_inputs["LETKF"], **common_enkf_args,
-                method="LETKF",
-                localization_radius_letkf=loc_radius_gc,
-                coords_state_letkf=coords_state_l96,
-                coords_obs_letkf=coords_obs_l96,
-                domain_letkf=domain_l96
+            current_ensemble_ienks, _ = ensemble_kalman_filter_analysis(
+                forecast_inputs["iEnKS"], **common_enkf_args,
+                method="iEnKS",
+                ienks_lag=1,
+                ienks_niter=10,
+                ienks_wtol=1e-7,
+                model_args=model_arguments_for_ienks
             )
             end_time = time.perf_counter()
-            analysis_times["LETKF"].append(end_time - start_time)
-            rmse_letkf = torch.sqrt(torch.mean((current_ensemble_letkf[batch_idx_for_rmse].mean(dim=0) - true_state_t[batch_idx_for_rmse])**2)).item()
-            results_rmse["LETKF"].append(rmse_letkf)
-        except NameError: results_rmse["LETKF"].append(float('nan')); analysis_times["LETKF"].append(float('nan'))
+            analysis_times["iEnKS"].append(end_time - start_time)
+            rmse_ienks = torch.sqrt(torch.mean((current_ensemble_ienks[batch_idx_for_rmse].mean(dim=0) - true_state_t[batch_idx_for_rmse])**2)).item()
+            results_rmse["iEnKS"].append(rmse_ienks)
+        except NameError: results_rmse["iEnKS"].append(float('nan')); analysis_times["iEnKS"].append(float('nan'))
 
-        verbose_step = 100
+        verbose_step = 50
         if (cycle + 1) % verbose_step == 0 or cycle == num_analysis_cycles - 1:
-            print(f"Cycle {cycle + 1:3d} (RMSEs for batch[0]): "
-                  f"BPF: {torch.tensor(results_rmse['BPF'][-verbose_step:]).mean():.3f} (t:{torch.tensor(analysis_times['BPF'][-verbose_step:]).mean():.4f}s), "
-                  f"EnKF-PO: {torch.tensor(results_rmse['EnKF-PO'][-verbose_step:]).mean():.3f} (t:{torch.tensor(analysis_times['EnKF-PO'][-verbose_step:]).mean():.4f}s), "
-                  f"ERSF: {torch.tensor(results_rmse['ERSF'][-verbose_step:]).mean():.3f} (t:{torch.tensor(analysis_times['ERSF'][-verbose_step:]).mean():.4f}s), "
-                  f"LETKF: {torch.tensor(results_rmse['LETKF'][-verbose_step:]).mean():.3f} (t:{torch.tensor(analysis_times['LETKF'][-verbose_step:]).mean():.4f}s)")
-
-    print("\nExample L96 DA run with batching completed.")
+            start_idx = max(0, len(results_rmse['BPF']) - verbose_step)
+            print(f"Cycle {cycle + 1:3d} (Avg RMSE for batch[0] over last {verbose_step} steps): "
+                f"BPF: {torch.tensor(results_rmse['BPF'][start_idx:]).mean():.3f} (t:{torch.tensor(analysis_times['BPF'][start_idx:]).mean():.4f}s), "
+                f"EnKF-PO: {torch.tensor(results_rmse['EnKF-PO'][start_idx:]).mean():.3f} (t:{torch.tensor(analysis_times['EnKF-PO'][start_idx:]).mean():.4f}s), "
+                f"ERSF: {torch.tensor(results_rmse['ERSF'][start_idx:]).mean():.3f} (t:{torch.tensor(analysis_times['ERSF'][start_idx:]).mean():.4f}s), "
+                f"iEnKS: {torch.tensor(results_rmse['iEnKS'][start_idx:]).mean():.3f} (t:{torch.tensor(analysis_times['iEnKS'][start_idx:]).mean():.4f}s)")
+    
+    print("\nExample L63 DA run with batching completed.")
 
     print("\n--- Average Analysis Step Times (across all batches processed together) ---")
     for method_name, times_list in analysis_times.items():
         valid_times = [t for t in times_list if not torch.isnan(torch.tensor(t))]
-        rmse_mean = torch.tensor(results_rmse[method_name]).mean()
+        # Calculate mean RMSE over the second half of the simulation for a more stable estimate
+        stable_rmse_period = results_rmse[method_name][num_analysis_cycles // 2:]
+        rmse_mean = torch.tensor(stable_rmse_period).mean() if stable_rmse_period else float('nan')
+        
         if valid_times:
             avg_time = sum(valid_times) / len(valid_times)
-            print(f"{method_name}: {avg_time:.6f} seconds per analysis step; Mean RMSE: {rmse_mean:.4f}")
+            print(f"{method_name}: {avg_time:.6f} seconds per analysis step; Mean RMSE (stable): {rmse_mean:.4f}")
         else:
             print(f"{method_name}: No analysis steps timed or all failed.")

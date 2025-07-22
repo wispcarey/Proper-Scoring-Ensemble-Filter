@@ -35,6 +35,6 @@ if __name__ == "__main__":
         test_results = test_linear_sampling_error(test_loader, args, num_resamples)
         print_test_results_v2(test_results)
         
-        torch.save(test_results, os.path.join("save", "benchmark", f"linear_inherent_unc_N{args.N}_resample{num_resamples}_len{args.test_steps}_2rot.pt"))
+        torch.save(test_results, os.path.join("save", "benchmark", f"linear_inherent_unc_N{args.N}_resample{num_resamples}_len{args.test_steps}_10rand.pt"))
 
 

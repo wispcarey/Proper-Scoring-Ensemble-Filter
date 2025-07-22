@@ -8,7 +8,7 @@ import torch.nn as nn
 from utils import L63, L96, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
 from utils import AverageMeter, mystery_operator, get_mean_std
 from utils import post_process, mean0
-from visualization import plot_particle_trajectories_with_histograms, plot_particle_trajectories
+from visualization import plot_particle_trajectories_with_histograms, plot_particle_trajectories, plot_and_test_point_clouds
 from localization import dist2coeff, create_loc_mat
 from loss import compute_loss, compute_es, wasserstein2_multivariate_gaussian
 from networks import NaiveNetwork, SetTransformer, Simple_MLP, ConditionTransformerNetwork
@@ -18,7 +18,7 @@ from benchmark_analysis import ensemble_kalman_filter_analysis, bootstrap_partic
 def set_models(args):
     # set models
     if args.v == 'CorrTerms':
-        model = Simple_MLP(d_input=args.input_dim, d_output=args.obs_dim + args.ori_dim, num_hidden_layers=2).to(args.device)
+        model = Simple_MLP(d_input=args.input_dim, d_output=args.obs_dim + args.ori_dim, num_hidden_layers=3).to(args.device)
     elif args.v == 'EtE' or args.v == 'EtE-LRes':
         model = Simple_MLP(d_input=args.input_dim, d_output=args.ori_dim, num_hidden_layers=4).to(args.device)
     elif args.v == 'EtE2':
@@ -55,7 +55,7 @@ def set_models(args):
                 infl_model = Simple_MLP(d_input=args.ori_dim + args.st_output_dim, d_output=args.ori_dim, num_hidden_layers=2).to(args.device)
         elif args.st_type == 'joint':
             st_model1 = SetTransformer(input_dim=args.ori_dim + args.obs_dim, num_heads=8, num_inds=args.st_num_seeds, output_dim=args.st_output_dim * 2, 
-                                        hidden_dim=args.hidden_dim, num_layers=2, freeze_WQ=not args.unfreeze_WQ).to(args.device)
+                                        hidden_dim=args.hidden_dim, num_layers=3, freeze_WQ=not args.unfreeze_WQ).to(args.device)
             st_model2 = NaiveNetwork(1)
             if args.v.startswith('EtE'):
                 infl_model = NaiveNetwork(1)
@@ -689,10 +689,28 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
 
                 # Analysis Step
                 pf_ens_v_a = bootstrap_particle_filter_analysis(
-                    pf_ens_v_f, obs_y_list[i + 1].squeeze(1), H_fun, args.sigma_y,
-                    resampling_method="multinomial", sigma_reg=args.sigma_reg,
-                    max_chunk_size=100000,
+                    pf_ens_v_f, 
+                    obs_y_list[i + 1].squeeze(1), 
+                    H.transpose(1,0), 
+                    # H_fun,
+                    args.sigma_y,
+                    resampling_method="multinomial", 
+                    sigma_reg=args.sigma_reg,
+                    max_chunk_size=1000000,
+                    resample_on_cpu=False,
                 )
+                
+                # if (i + 1) % 250 == 0:
+                # if i < 600:
+                #     prefix = f'save/pf_vis/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_timestep{i+1}_{args.seed}'
+                #     plot_and_test_point_clouds(args,
+                #                             pf_ens_v_a, 
+                #                             num_samples_plot=100000, 
+                #                             num_samples_test=10000, 
+                #                             prefix=prefix, 
+                #                             num_repeats=1, 
+                #                             plot_indices=[0, 1],
+                #                             history_traj=batch_v[1:i+2],)
 
                 # Store results for caching and metrics
                 pf_mean_a = torch.mean(pf_ens_v_a, dim=1)
@@ -1011,6 +1029,23 @@ def print_test_results(results):
 
 
 def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', loc_radius=None, save_pdf=False):
+    """
+    Tests a classic data assimilation filter (e.g., EnKF, ESRF, LETKF) and
+    optionally compares results against a particle filter baseline.
+
+    Args:
+        loader (DataLoader): DataLoader providing batches of true states.
+        args (Namespace): Arguments containing model and experiment parameters.
+        infl (float, optional): Inflation factor. Defaults to 1.
+        H_info (tuple, optional): Precomputed observation operator. Defaults to None.
+        plot_figures (bool, optional): Whether to plot figures. Defaults to True.
+        fig_name (str, optional): Base name for saved figures. Defaults to 'example_fig'.
+        loc_radius (float, optional): Localization radius. Defaults to None.
+        save_pdf (bool, optional): Whether to save figures as PDF. Defaults to False.
+
+    Returns:
+        dict: A dictionary containing mean and standard deviation of evaluation metrics.
+    """
     m = args.N
     
     if args.dataset == "lorenz63":
@@ -1035,30 +1070,56 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         
     if args.no_localization:
         print("Do not use localization")
-        loc_radius = None # Ensure loc_radius is None if no_localization is True
-    
-    rmse_tensor_all = None
-    rmv_tensor_all = None
-    rrmse_tensor_all = None
-    crps_tensor_all = None
+        loc_radius = None
+
+    cached_pf_data = None
+    if args.pf_verification:
+        first_batch_for_shape = next(iter(loader))
+        traj_len = first_batch_for_shape.shape[0]
+        batch_size = first_batch_for_shape.shape[1]
+        
+        cache_dir = os.path.join('data', args.dataset)
+        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_avg.pt"
+        cache_filepath = os.path.join(cache_dir, cache_filename)
+
+        if os.path.exists(cache_filepath):
+            print(f"Loading cached PF results from: {cache_filepath}")
+            cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
+        else:
+            raise FileNotFoundError(
+                f"Required particle filter cache file not found at: {cache_filepath}. "
+                f"Please run generate_and_cache_pf_results() first."
+            )
+
+    all_results = {
+        'rmse': torch.empty(0, device=args.device),
+        'rmv': torch.empty(0, device=args.device),
+        'rrmse': torch.empty(0, device=args.device),
+        'crps': torch.empty(0, device=args.device),
+        'rcrps': torch.empty(0, device=args.device),
+        'cov_diff': torch.empty(0, device=args.device),
+        'rcov_diff': torch.empty(0, device=args.device),
+        'pf_rmse': torch.empty(0, device=args.device),
+    }
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
             batch_v = batch_v.to(device=args.device)
 
             ens_v_a = batch_v[0].unsqueeze(1).repeat(1, m, 1)
-            ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
+            ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
 
             ens_list = [ens_v_a]
-            
-            obs_y_step = H_fun(batch_v[0].unsqueeze(1))
-            obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
-            obs_y_list = [obs_y_step]
+            cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
+
+            obs_y_list = []
+            for i in range(len(batch_v)):
+                obs_y_step = H_fun(batch_v[i].unsqueeze(1))
+                obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
+                obs_y_list.append(obs_y_step)
 
             for i in range(len(batch_v) - 1):
-                obs_y = H_fun(batch_v[i + 1].unsqueeze(1))
-                obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
-                obs_y_list.append(obs_y)
+                obs_y = obs_y_list[i + 1]
 
                 ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
                 for j_iter in range(args.dt_iter):
@@ -1069,143 +1130,140 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                         ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
                 ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
                 
-                ens_v_f = ens_v_f + torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+                ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
                 
                 B_shape, N_ens, D_state = ens_v_f.shape
-                d_obs_shape = obs_y.shape[2] # H_fun(ens_v_f).shape[2]
-                                
+                d_obs_shape = obs_y.shape[2]
+                
                 common_enkf_args = {
                     "observation_y": obs_y.squeeze(1),
-                    "observation_operator_H_fun": H_fun, # Pass H_fun directly
+                    "observation_operator_ens": H_fun,
                     "sigma_y": args.sigma_y,
                     "inflation_factor": infl
                 }
                 
-                current_analyzed_ens_v_a = None
                 if args.v == 'EnKF':
-                    current_loc_mat_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    current_loc_mat_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    
-                    current_analyzed_ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args,
-                        method='EnKF_PertObs', # Corrected method name based on typical EnKF implementations
-                        localization_matrix_Lxy=current_loc_mat_vy, 
-                        localization_matrix_Lyy=current_loc_mat_yy 
-                    )
+                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    ens_v_a, _ = ensemble_kalman_filter_analysis(
+                        ens_v_f, **common_enkf_args, method='EnKF-PertObs',
+                        localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
                 elif args.v == 'ESRF':
-                    current_loc_mat_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    current_loc_mat_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    current_analyzed_ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args,
-                        method='ESRF',
-                        localization_matrix_Lxy=current_loc_mat_vy, # ESRF can also use localization
-                        localization_matrix_Lyy=current_loc_mat_yy
-                    )
+                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    ens_v_a, _ = ensemble_kalman_filter_analysis(
+                        ens_v_f, **common_enkf_args, method='ESRF',
+                        localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
                 elif args.v == 'LETKF':
                     coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                    # Assuming obs_inds gives the indices of observed state variables
-                    if hasattr(args, 'obs_inds') and args.obs_inds is not None:
-                        coords_obs = torch.tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                    else: # Fallback if obs_inds not defined, assume regularly spaced observations
-                        coords_obs = torch.arange(0, D_state, int(D_state/d_obs_shape) if d_obs_shape > 0 else 1, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        if coords_obs.shape[0] != d_obs_shape: # Adjust if division is not perfect
-                            coords_obs = torch.linspace(0, D_state -1, steps=d_obs_shape,  device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
-
-
+                    coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1) if hasattr(args, 'obs_inds') and args.obs_inds is not None else torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
                     domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
-
-                    current_analyzed_ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args,
-                        method='LETKF',
-                        localization_radius_letkf=loc_radius,
-                        coords_state_letkf=coords_state,
-                        coords_obs_letkf=coords_obs,
-                        domain_letkf=domain
-                    )
+                    ens_v_a, _ = ensemble_kalman_filter_analysis(
+                        ens_v_f, **common_enkf_args, method='LETKF',
+                        localization_radius_letkf=loc_radius, coords_state_letkf=coords_state,
+                        coords_obs_letkf=coords_obs, domain_letkf=domain)
                 else:
                     raise NotImplementedError(f"The filter {args.v} is not implemented")
 
-                ens_v_a = torch.clamp(current_analyzed_ens_v_a, min=-args.clamp, max=args.clamp)
+                ens_v_a = torch.clamp(ens_v_a, min=-args.clamp, max=args.clamp)
                 ens_list.append(ens_v_a)
 
-            ens_tensor = torch.stack(ens_list)
-            obs_tensor = torch.stack(obs_y_list).squeeze(2)
-            observations = torch.full_like(batch_v, float('nan'), device=args.device)
+                if args.pf_verification:
+                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
+                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
+                    our_method_mean_a = torch.mean(ens_v_a, dim=1)
+                    pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))
+                    pf_rmse_list.append(pf_rmse)
+                    cov_ens_a = get_ens_cov(ens_v_a)
+                    cov_diff = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    rcov_diff = cov_diff / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    cov_diff_list.append(cov_diff)
+                    rcov_diff_list.append(rcov_diff)
 
-            if hasattr(args, 'obs_inds') and args.obs_inds is not None:
-                observations[:,:,args.obs_inds] = obs_tensor
-            else:
-                print("Warning: args.obs_inds not defined for test_ClassicFilter. Observations tensor might be all NaNs.")
+            ens_tensor = torch.stack(ens_list)
             
-            crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0) / torch.mean(torch.norm(batch_v, p=1, dim=2), dim=0)
+            crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
+            rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.mean(torch.sqrt(N_ens / (N_ens-1) * torch.mean((ens_tensor - batch_v.unsqueeze(2)) ** 2, dim=(2,3))),dim=0)
             
-            if batch_ind == 0:
-                rmse_tensor_all = rmse_val
-                rmv_tensor_all = rmv_val
-                rrmse_tensor_all = rrmse_val
-                crps_tensor_all = crps_val
-            else:
-                rmse_tensor_all = torch.cat((rmse_tensor_all, rmse_val))
-                rmv_tensor_all = torch.cat((rmv_tensor_all, rmv_val))
-                rrmse_tensor_all = torch.cat((rrmse_tensor_all, rrmse_val))
-                crps_tensor_all = torch.cat((crps_tensor_all, crps_val))
+            all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
+            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
+            all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
+            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
+            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            if args.pf_verification:
+                all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
+                all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
+                all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
             
-        if plot_figures: 
-            time_idx_plot = -2 
-            num_dims_plot = 4
-            dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
-
-            plot_particle_trajectories_with_histograms(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                                    true_traj=batch_v[:,time_idx_plot,:], 
-                                                    observation=None, #observations[:,time_idx_plot,:],
-                                                    dim_indices=dim_indices_plot,
-                                                    start_time=0,
-                                                    end_time=ens_tensor.shape[0], 
-                                                    mode='quantile',
-                                                    save_fig=True,
-                                                    save_pdf=save_pdf,
-                                                    save_name=fig_name + "_hist_classic",
-                                                    hist_step=1,
-                                                    fontsize=None)
-            plot_particle_trajectories(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                        true_traj=batch_v[:,time_idx_plot,:], 
-                                        observation=observations[:,time_idx_plot,:],
-                                        cmap_name='bwr',
-                                        start_time=0,
-                                        end_time=ens_tensor.shape[0], 
-                                        main_fig_size=(5, 2), 
-                                        save_fig=True,
-                                        save_pdf=save_pdf,
-                                        save_name=fig_name + "_traj_classic",
-                                        colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-                                        plot_vertical_colorbar=False,
-                                        plot_horizontal_colorbar=True)
-
-    if rrmse_tensor_all is None:
-        return (float('nan'), float('nan'), float('nan'), float('nan'),
-                float('nan'), float('nan'), float('nan'), float('nan'), 0.0)
-
-    nan_mask = torch.isnan(rrmse_tensor_all) 
-    valid_B_mask = ~nan_mask
+            obs_tensor = torch.stack(obs_y_list).squeeze(2)
+            observations = torch.full_like(batch_v, float('nan'), device=args.device)
+            if hasattr(args, 'obs_inds') and args.obs_inds is not None:
+                observations[:, :, args.obs_inds] = obs_tensor
+            else:
+                print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
     
-    if not valid_B_mask.any():
-        mean_rrmse, std_rrmse = float('nan'), float('nan')
-        mean_rmse, std_rmse = float('nan'), float('nan')
-        mean_rmv, std_rmv = float('nan'), float('nan')
-        mean_crps, std_crps = float('nan'), float('nan')
-        no_nan_percent = 0.0
+    if plot_figures: 
+        time_idx_plot = -2
+        num_dims_plot = 4
+        dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
+
+        if args.pf_verification:
+            batch_v = cached_pf_data[-1]['means']
+            ens_tensor = ens_tensor[1:]
+            observations = observations[1:]
+
+        plot_particle_trajectories_with_histograms(
+            particles=ens_tensor[:,time_idx_plot,:,:], 
+            true_traj=batch_v[:,time_idx_plot,:], 
+            observation=None, 
+            dim_indices=dim_indices_plot,
+            start_time=0, end_time=ens_tensor.shape[0], mode='quantile',
+            save_fig=True, save_pdf=save_pdf, save_name=fig_name + "_hist_classic",
+            hist_step=1, fontsize=None)
+        plot_particle_trajectories(
+            particles=ens_tensor[:,time_idx_plot,:,:], 
+            true_traj=batch_v[:,time_idx_plot,:], 
+            observation=observations[:,time_idx_plot,:],
+            cmap_name='bwr', start_time=0, end_time=ens_tensor.shape[0], 
+            main_fig_size=(5, 2), save_fig=True, save_pdf=save_pdf,
+            save_name=fig_name + "_traj_classic",
+            colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+            plot_vertical_colorbar=False, plot_horizontal_colorbar=True)
+
+    final_metrics = {}
+    if all_results['rrmse'].numel() == 0:
+        metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
+                        'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
+                        'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+        final_metrics = {key: float('nan') for key in metrics_keys}
+        final_metrics['no_nan_percent'] = 0.0
     else:
-        mean_rrmse, std_rrmse = get_mean_std(rrmse_tensor_all[valid_B_mask])
-        mean_rmse, std_rmse = get_mean_std(rmse_tensor_all[valid_B_mask])
-        mean_rmv, std_rmv = get_mean_std(rmv_tensor_all[valid_B_mask])
-        mean_crps, std_crps = get_mean_std(crps_tensor_all[valid_B_mask])
-        no_nan_percent = torch.sum(valid_B_mask).float() / rrmse_tensor_all.numel() * 100.0
+        nan_mask = torch.isnan(all_results['rrmse'])
+        valid_B_mask = ~nan_mask
         
-    return mean_rmse, std_rmse, mean_rmv, std_rmv, mean_rrmse, std_rrmse, mean_crps, std_crps, no_nan_percent
+        if not valid_B_mask.any():
+            metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
+                            'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
+                            'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+            final_metrics = {key: float('nan') for key in metrics_keys}
+            final_metrics['no_nan_percent'] = 0.0
+        else:
+            final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
+            final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
+            final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
+            final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
+            final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+            final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
+            if args.pf_verification:
+                final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
+                final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
+                final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
+
+    return final_metrics
 
 
 def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):

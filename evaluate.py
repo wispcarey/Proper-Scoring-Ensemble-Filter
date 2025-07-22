@@ -27,8 +27,8 @@ if __name__ == "__main__":
         H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
 
         # modify test_batch_size
-        if args.N == 100:
-            args.test_batch_size = args.test_batch_size // 2
+        # if args.N == 100:
+        #     args.test_batch_size = args.test_batch_size // 2
         test_loader = get_dataloader(args, test_only=True)
         
         # print test information
@@ -60,26 +60,24 @@ if __name__ == "__main__":
         
         # save results
         tensor_dict = {
-            'nn':{
-                'mean_rmse':test_results['mean_rmse'],
-                'std_rmse':test_results['std_rmse'],
-                'mean_rrmse':test_results['mean_rrmse'],
-                'std_rrmse':test_results['std_rrmse'],
-                'mean_rmv':test_results['mean_rmv'],
-                'std_rmv':test_results['mean_rmv'],
-                'mean_crps':test_results['mean_crps'],
-                'std_crps':test_results['std_crps'],
-                'mean_rcrps':test_results['mean_rcrps'],
-                'std_rcrps':test_results['std_rcrps'],
-                'valid_percent':test_results['no_nan_percent'],
-                'cov_diff':test_results['mean_cov_diff'],
-                'pf_rmse':test_results['mean_pf_rmse'],
-                'loc_mean':loc_mean,
-                'loc_std':loc_std,
-                'loc_diff_dist':args.diff_dist,
+            'nn': {
+                'mean_rmse': test_results.get('mean_rmse', float('nan')),
+                'std_rmse': test_results.get('std_rmse', float('nan')),
+                'mean_rrmse': test_results.get('mean_rrmse', float('nan')),
+                'std_rrmse': test_results.get('std_rrmse', float('nan')),
+                'mean_rmv': test_results.get('mean_rmv', float('nan')),
+                'std_rmv': test_results.get('std_rmv', float('nan')),  
+                'mean_crps': test_results.get('mean_crps', float('nan')),
+                'std_crps': test_results.get('std_crps', float('nan')),
+                'mean_rcrps': test_results.get('mean_rcrps', float('nan')),
+                'std_rcrps': test_results.get('std_rcrps', float('nan')),
+                'valid_percent': test_results.get('no_nan_percent', 0.0),
+                'cov_diff': test_results.get('mean_cov_diff', float('nan')),
+                'pf_rmse': test_results.get('mean_pf_rmse', float('nan')),
+                'loc_diff_dist': getattr(args, 'diff_dist', None),
             },
-            'cp_load_path': args.cp_load_path,
-            'sigma_y': args.sigma_y,
+            'cp_load_path': getattr(args, 'cp_load_path', None),
+            'sigma_y': getattr(args, 'sigma_y', None),
         }
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])

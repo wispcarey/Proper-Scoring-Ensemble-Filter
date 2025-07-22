@@ -29,8 +29,8 @@ echo "Host: $(hostname)"
 echo "Python: $(which python)"
 echo "----------------------------------------------------"
 
-SEEDS=(0 1 2 3 4 5 6 7 8 9 42)
-PARTICLE_NUMBERS=(1000000 2000000)
+SEEDS=(42)
+PARTICLE_NUMBERS=(1000000)
 
 for seed_val in "${SEEDS[@]}"; do
     for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
