@@ -1160,8 +1160,37 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
                     ens_v_a, _ = ensemble_kalman_filter_analysis(
                         ens_v_f, **common_enkf_args, method='LETKF',
-                        localization_radius_letkf=loc_radius, coords_state_letkf=coords_state,
-                        coords_obs_letkf=coords_obs, domain_letkf=domain)
+                        localization_radius=loc_radius, coords_state=coords_state,
+                        coords_obs=coords_obs, localization_domain=domain)
+                elif args.v.startswith('iEnKS'):
+                    coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                    coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1) if hasattr(args, 'obs_inds') and args.obs_inds is not None else torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
+                    domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
+                    
+                    model_args_ienks = {
+                        "propagator": rk4_stepper,
+                        "rhs": l63_rhs_func,
+                        "dt": dt,
+                        "steps_between_analyses": obs_every,
+                    }
+                    E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
+                        ens_v_f,
+                        **common_enkf_args,
+                        method=args.v,
+                        ienks_lag=1,
+                        ienks_niter=10,
+                        ienks_wtol=1e-5,
+                        model_args=model_args_ienks
+                    )
+
+                    # 2. Propagate smoothed state to current time `ko` for RMSE calculation
+                    E_analysis_at_ko = E_smoothed_at_start.clone()
+                    num_steps_to_propagate = obs_every
+                    if num_steps_to_propagate > 0:
+                        E_flat = E_analysis_at_ko.view(-1, 3)
+                        for _ in range(num_steps_to_propagate):
+                            E_flat = rk4_stepper(l63_rhs_func, E_flat, dt)
+                        E_analysis_at_ko = E_flat.view(batch_size, params['N'], 3)
                 else:
                     raise NotImplementedError(f"The filter {args.v} is not implemented")
 

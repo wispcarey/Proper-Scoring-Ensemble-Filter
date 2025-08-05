@@ -502,30 +502,130 @@ def _letkf_analysis(
     return ensemble_a, None
 
 ## iEnKS
+# def _ienks_analysis(
+#     ensemble_f,
+#     observation_y,
+#     observation_operator_ens,
+#     sigma_y,
+#     # --- Model specific args ---
+#     model_propagator,
+#     model_rhs,
+#     model_dt,
+#     # --- iEnKS hyperparameters ---
+#     upd_a='Sqrt', # <-- MODIFIED: Added update method selector
+#     Lag=1,
+#     nIter=10,
+#     wtol=1e-5,
+#     steps_between_analyses=5
+# ):
+#     """
+#     Function:
+#         Implements a batched Iterative Ensemble Kalman Smoother (iEnKS) analysis step.
+#     """
+#     B, N, D_state = ensemble_f.shape
+#     device = ensemble_f.device
+#     dtype = ensemble_f.dtype
+
+#     if observation_y.ndim == 1:
+#         y = observation_y.unsqueeze(0)
+#     else:
+#         y = observation_y
+
+#     N1 = N - 1
+#     X0, x0 = center_ensemble(ensemble_f)
+
+#     w = torch.zeros(B, N, 1, device=device, dtype=dtype)
+#     T = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+#     Tinv = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+#     D_pert = None # For PertObs method
+
+#     if isinstance(sigma_y, torch.Tensor) and sigma_y.ndim > 0:
+#         R_inv_sqrt = (1.0 / sigma_y).view(-1, 1, 1)
+#     else:
+#         R_inv_sqrt = 1.0 / sigma_y
+
+#     def propagate_ensemble_in_window(ens_in):
+#         ens_flat = ens_in.view(B * N, D_state)
+#         num_model_steps = Lag * steps_between_analyses
+#         propagated_ens = ens_flat
+#         for _ in range(num_model_steps):
+#             propagated_ens = model_propagator(lambda x: model_rhs(x), propagated_ens, model_dt)
+#         return propagated_ens.view(B, N, D_state)
+
+#     for iteration in range(nIter):
+#         E_iter = x0 + T @ X0 + (X0.transpose(-1, -2) @ w).transpose(-1, -2)
+#         E_fwd = propagate_ensemble_in_window(E_iter)
+#         Eo = observation_operator_ens(E_fwd)
+
+#         Y, xo_obs = center_ensemble(Eo)
+#         dy_eff = (y.unsqueeze(1) - xo_obs) * R_inv_sqrt
+#         Y_eff = Y * R_inv_sqrt
+#         za = float(N1)
+
+#         Y_iter = Tinv @ Y_eff
+
+#         # Unified Cow1 calculation for all methods
+#         C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device, dtype=dtype)
+#         eig_vals, U = torch.linalg.eigh(C_tilde)
+#         eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
+#         Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
+
+#         # Gauss-Newton optimization for weights `w`
+#         grad_term = Y_iter @ dy_eff.transpose(-2, -1)
+#         grad = grad_term - za * w
+#         dw = Cow1 @ grad
+
+#         # MODIFIED: Update transform matrices T and Tinv based on the chosen method
+#         if "Sqrt" in upd_a:
+#             eig_vals_sqrt = torch.sqrt(eig_vals_clamped)
+#             T = U @ torch.diag_embed(1.0 / eig_vals_sqrt) @ U.transpose(-2,-1) * math.sqrt(N1)
+#             Tinv = U @ torch.diag_embed(eig_vals_sqrt) @ U.transpose(-2,-1) / math.sqrt(N1)
+#         elif "PertObs" in upd_a:
+#             if iteration == 0:
+#                 _D_pert = torch.randn_like(Y_eff)
+#                 D_pert = _D_pert - _D_pert.mean(dim=1, keepdim=True)
+#             gradT = -(Y_eff + D_pert) @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+#             T = T + gradT @ Cow1
+#             Tinv = torch.linalg.inv(T + 1)
+#         elif "Order1" in upd_a:
+#             gradT = -0.5 * Y_eff @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+#             T = T + gradT @ Cow1
+#             Tinv = torch.linalg.inv(T)
+#         else:
+#             raise NotImplementedError(f"Update type '{upd_a}' not implemented.")
+
+#         w_new = w + dw
+#         if ((w_new - w).norm(p=2, dim=1)**2 / N).mean() < wtol:
+#             w = w_new
+#             break
+#         w = w_new
+
+#     final_delta_mean = (X0.transpose(-2, -1) @ w).transpose(-1, -2)
+#     final_X_smoothed = T @ X0
+#     E_smoothed_at_start = x0 + final_delta_mean + final_X_smoothed
+
+#     return E_smoothed_at_start, None
+
 def _ienks_analysis(
     ensemble_f,
     observation_y,
     observation_operator_ens,
     sigma_y,
-    # --- Model specific args ---
-    model_propagator,
-    model_rhs,
-    model_dt,
+    # --- Localization and Model Args ---
+    localization_radius,
+    coords_state=None,
+    coords_obs=None,
+    domain=None,
+    model_propagator=None,
+    model_rhs=None,
+    model_dt=None,
     # --- iEnKS hyperparameters ---
+    upd_a='Sqrt',
     Lag=1,
     nIter=10,
     wtol=1e-5,
-    steps_between_analyses=5,
-    inflation_factor=1.0
+    steps_between_analyses=5
 ):
-    """
-    Function:
-        Implements a batched Iterative Ensemble Kalman Smoother (iEnKS) analysis step.
-    """
-    if inflation_factor != 1.0:
-        X_f, x_f = center_ensemble(ensemble_f)
-        ensemble_f = x_f + X_f * inflation_factor
-
     B, N, D_state = ensemble_f.shape
     device = ensemble_f.device
     dtype = ensemble_f.dtype
@@ -535,88 +635,247 @@ def _ienks_analysis(
     else:
         y = observation_y
     
-    N1 = N - 1
-    X0, x0 = center_ensemble(ensemble_f)
-    
-    w = torch.zeros(B, N, 1, device=device, dtype=dtype)
-    T = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
-    Tinv = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
-    
     if isinstance(sigma_y, torch.Tensor) and sigma_y.ndim > 0:
-        R_inv_sqrt = (1.0 / sigma_y).view(-1, 1, 1)
+        R_inv_sqrt = (1.0 / sigma_y).view(1, 1, -1)
     else:
         R_inv_sqrt = 1.0 / sigma_y
+
+    N1 = N - 1
+    X0_global, x0_global = center_ensemble(ensemble_f)
 
     def propagate_ensemble_in_window(ens_in):
         ens_flat = ens_in.view(B * N, D_state)
         num_model_steps = Lag * steps_between_analyses
         propagated_ens = ens_flat
         for _ in range(num_model_steps):
-            propagated_ens = model_propagator(lambda x: model_rhs(x), propagated_ens, model_dt)
+            propagated_ens = model_propagator(lambda x: model_rhs(x), propagated_ens, None, model_dt)
         return propagated_ens.view(B, N, D_state)
-
-    for iteration in range(nIter):
-        E_iter = x0 + T @ X0 + (X0.transpose(-1, -2) @ w).transpose(-1, -2)
-        E_fwd = propagate_ensemble_in_window(E_iter)
-        Eo = observation_operator_ens(E_fwd)
-        
-        Y, xo_obs = center_ensemble(Eo)
-        dy_eff = (y.unsqueeze(1) - xo_obs) * R_inv_sqrt
-        Y_eff = Y * R_inv_sqrt
-        za = float(N1)
-        
-        Y_iter = Tinv @ Y_eff
-        C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device, dtype=dtype)
-        eig_vals, U = torch.linalg.eigh(C_tilde)
-        eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
-        
-        Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
-        
-        # CORRECTED: Reverted to the original, correct logic for the gradient term.
-        grad_term = Y_iter @ dy_eff.transpose(-2, -1)
-        grad = grad_term - za * w
-        
-        dw = Cow1 @ grad
-        w_new = w + dw
-        
-        if ((w_new - w).norm(p=2, dim=1)**2 / N).mean() < wtol:
-            w = w_new
-            break
-        w = w_new
-            
-        eig_vals_sqrt = torch.sqrt(eig_vals_clamped)
-        T = U @ torch.diag_embed(1.0 / eig_vals_sqrt) @ U.transpose(-2,-1) * math.sqrt(N1)
-        Tinv = U @ torch.diag_embed(eig_vals_sqrt) @ U.transpose(-2,-1) / math.sqrt(N1)
-
-    final_delta_mean = (X0.transpose(-2, -1) @ w).transpose(-2, -1)
-    final_X_smoothed = T @ X0
-    E_smoothed_at_start = x0 + final_delta_mean + final_X_smoothed
     
+    # ============================================================================
+    # --- Conditional Path: Global or Local Analysis ---
+    # ============================================================================
+
+    if localization_radius is None:
+        w = torch.zeros(B, N, 1, device=device, dtype=dtype)
+        T = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+        D_pert = None
+
+        for iteration in range(nIter):
+            E_iter = x0_global + T @ X0_global + (X0_global.transpose(-1, -2) @ w).transpose(-1, -2)
+            E_fwd = propagate_ensemble_in_window(E_iter)
+            Eo = observation_operator_ens(E_fwd)
+
+            Y, xo_obs = center_ensemble(Eo)
+            dy_eff = (y.unsqueeze(1) - xo_obs) * R_inv_sqrt
+            Y_eff = Y * R_inv_sqrt
+            
+            za = float(N1)
+            Tinv = torch.linalg.inv(T)
+            Y_iter = Tinv @ Y_eff
+            
+            C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device)
+            eig_vals, U = torch.linalg.eigh(C_tilde)
+            eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
+            Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
+            
+            grad = (Y_iter @ dy_eff.transpose(-2, -1)) - za * w
+            dw = Cow1 @ grad
+
+            if "Sqrt" in upd_a:
+                T = U @ torch.diag_embed(1.0 / torch.sqrt(eig_vals_clamped)) @ U.transpose(-2,-1) * math.sqrt(N1)
+            elif "PertObs" in upd_a:
+                if iteration == 0:
+                    _D_pert = torch.randn_like(Y_eff)
+                    D_pert = _D_pert - _D_pert.mean(dim=1, keepdim=True)
+                gradT = -(Y_eff + D_pert) @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+                T = T + gradT @ Cow1
+            elif "Order1" in upd_a:
+                gradT = -0.5 * Y_eff @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+                T = T + gradT @ Cow1
+            
+            w_new = w + dw
+            if ((w_new - w).norm(p=2, dim=1)**2 / N).mean() < wtol: w = w_new; break
+            w = w_new
+        
+        final_delta_mean = (X0_global.transpose(-2, -1) @ w).transpose(-1, -2)
+        final_X_smoothed = T @ X0_global
+
+    else:
+        if coords_state is None or coords_obs is None:
+            raise ValueError("coords_state and coords_obs must be provided for localization.")
+            
+        final_delta_mean = torch.zeros_like(x0_global)
+        final_X_smoothed = torch.zeros_like(X0_global)
+
+        for k_state_idx in range(D_state):
+            coord_k_state = coords_state[k_state_idx].unsqueeze(0)
+            dist_k_to_obs = pairwise_distances(coord_k_state, coords_obs, domain=domain).squeeze(0)
+            rho_k = dist2coeff(dist_k_to_obs, localization_radius)
+            local_obs_indices = torch.where(rho_k > 1e-6)[0]
+
+            X0_k = X0_global[:, :, k_state_idx].unsqueeze(-1)
+
+            if len(local_obs_indices) == 0:
+                final_delta_mean[:, :, k_state_idx] = 0.0
+                final_X_smoothed[:, :, k_state_idx] = X0_k.squeeze(-1)
+                continue
+            
+            y_local = y[:, local_obs_indices]
+            rho_local_k = rho_k[local_obs_indices]
+            sqrt_rho_bcast = torch.sqrt(rho_local_k).view(1, 1, -1)
+            
+            w_k = torch.zeros(B, N, 1, device=device, dtype=dtype)
+            T_k = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+            D_pert_local = None
+
+            for iteration in range(nIter):
+                E_iter = x0_global + T_k @ X0_global + (X0_global.transpose(-2, -1) @ w_k).transpose(-1, -2)
+                E_fwd = propagate_ensemble_in_window(E_iter)
+                Eo = observation_operator_ens(E_fwd)
+
+                Eo_local = Eo[:, :, local_obs_indices]
+                Y_local, xo_obs_local = center_ensemble(Eo_local)
+                dy_local_eff = (y_local.unsqueeze(1) - xo_obs_local) * R_inv_sqrt * sqrt_rho_bcast
+                Y_local_eff = Y_local * R_inv_sqrt * sqrt_rho_bcast
+                
+                za = float(N1)
+                Tinv_k = torch.linalg.inv(T_k)
+                Y_iter_local = Tinv_k @ Y_local_eff
+
+                C_tilde = (Y_iter_local @ Y_iter_local.transpose(-2, -1)) + za*torch.eye(N, device=device)
+                eig_vals, U = torch.linalg.eigh(C_tilde)
+                eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
+                Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
+
+                grad = (Y_iter_local @ dy_local_eff.transpose(-2, -1)) - za * w_k
+                dw_k = Cow1 @ grad
+                
+                if "Sqrt" in upd_a:
+                    T_k = U @ torch.diag_embed(1.0 / torch.sqrt(eig_vals_clamped)) @ U.transpose(-2,-1) * math.sqrt(N1)
+                elif "PertObs" in upd_a:
+                    if iteration == 0:
+                        _D_pert_local = torch.randn_like(Y_local_eff)
+                        D_pert_local = _D_pert_local - _D_pert_local.mean(dim=1, keepdim=True)
+                    gradT_k = -(Y_local_eff + D_pert_local) @ Y_iter_local.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T_k)
+                    T_k = T_k + gradT_k @ Cow1
+                elif "Order1" in upd_a:
+                    gradT_k = -0.5 * Y_local_eff @ Y_iter_local.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T_k)
+                    T_k = T_k + gradT_k @ Cow1
+                
+                w_k_new = w_k + dw_k
+                if ((w_k_new - w_k).norm(p=2, dim=1)**2 / N).mean() < wtol: w_k = w_k_new; break
+                w_k = w_k_new
+            
+            delta_mean_k = (X0_k.transpose(-2, -1) @ w_k).transpose(-1, -2)
+            X_smoothed_k = T_k @ X0_k
+            final_delta_mean[:, :, k_state_idx] = delta_mean_k.squeeze(-1)
+            final_X_smoothed[:, :, k_state_idx] = X_smoothed_k.squeeze(-1)
+
+    E_smoothed_at_start = x0_global + final_delta_mean + final_X_smoothed
     return E_smoothed_at_start, None
 
+
 # EnKF analysis
+# def ensemble_kalman_filter_analysis(
+#     ensemble_f,             # (B, N_ensemble, d_state)
+#     observation_y,          # (B, d_obs) or (d_obs,) or None
+#     observation_operator_ens, # (B, N_ensemble, d_state) -> (B, N_ensemble, d_obs)
+#     sigma_y,                # scalar or (B,)
+#     method="EnKF-PertObs",
+#     inflation_factor=1.0,   # scalar
+#     # For EnKF-PertObs
+#     localization_matrix_Lxy=None, # (d_state, d_obs)
+#     localization_matrix_Lyy=None, # (d_obs, d_obs)
+#     # For LETKF
+#     localization_radius_letkf=None, # scalar
+#     coords_state_letkf=None,        # (d_state, D_coord)
+#     coords_obs_letkf=None,          # (d_obs, D_coord)
+#     domain_letkf=None,      # (D_coord,)
+#     # For iEnKS
+#     ienks_lag=1,
+#     ienks_niter=10,
+#     ienks_wtol=1e-5,
+#     model_args=None # Dict for model propagator info needed by iEnKS
+# ):
+#     """ Main dispatcher for ensemble Kalman filter analysis (Batched) """
+#     kalman_gain_or_transform = None
+#     ensemble_a_raw = None
+
+#     if observation_y is None: # No observation, forecast is analysis
+#         ensemble_a_raw = ensemble_f
+#     elif method == "EnKF-PertObs":
+#         ensemble_a_raw, kalman_gain_or_transform = _enkf_pert_obs_analysis(
+#             ensemble_f, observation_y, observation_operator_ens, sigma_y,
+#             localization_matrix_Lxy, localization_matrix_Lyy
+#         )
+#     elif method == "ERSF": # ETKF variant
+#         ensemble_a_raw, kalman_gain_or_transform = _ersf_analysis(
+#             ensemble_f, observation_y, observation_operator_ens, sigma_y
+#         )
+#     elif method == "LETKF":
+#         if localization_radius_letkf is None or \
+#            coords_state_letkf is None or \
+#            coords_obs_letkf is None:
+#             raise ValueError("LETKF requires localization_radius, coords_state, and coords_obs.")
+#         ensemble_a_raw, kalman_gain_or_transform = _letkf_analysis(
+#             ensemble_f, observation_y, observation_operator_ens, sigma_y,
+#             localization_radius_letkf, coords_state_letkf,
+#             coords_obs_letkf, domain_letkf
+#         )
+#     elif method.startswith("iEnKS-"):
+#         if model_args is None:
+#             raise ValueError("iEnKS methods require 'model_args' dictionary.")
+        
+#         # Extract update type from method name, e.g., "iEnKS-Sqrt" -> "Sqrt"
+#         try:
+#             update_type = method.split('-', 1)[1]
+#         except IndexError:
+#             raise ValueError(f"Invalid iEnKS method format: {method}. Expected 'iEnKS-UpdateType'.")
+
+#         ensemble_a_raw, kalman_gain_or_transform = _ienks_analysis(
+#             ensemble_f, observation_y, observation_operator_ens, sigma_y,
+#             model_propagator=model_args['propagator'],
+#             model_rhs=model_args['rhs'],
+#             model_dt=model_args['dt'],
+#             steps_between_analyses=model_args['steps_between_analyses'],
+#             upd_a=update_type, # Pass the extracted update type
+#             Lag=ienks_lag,
+#             nIter=ienks_niter,
+#             wtol=ienks_wtol,
+#         )
+#     else:
+#         raise ValueError(f"Unknown EnKF method: {method}")
+
+#     # Apply inflation to the raw analysis ensemble
+#     ensemble_analysis = apply_inflation(ensemble_a_raw, inflation_factor)
+
+#     return ensemble_analysis, kalman_gain_or_transform
+
 def ensemble_kalman_filter_analysis(
-    ensemble_f,             # (B, N_ensemble, d_state)
-    observation_y,          # (B, d_obs) or (d_obs,) or None
-    observation_operator_ens, # (B, N_ensemble, d_state) -> (B, N_ensemble, d_obs)
-    sigma_y,                # scalar or (B,)
+    ensemble_f,                 # (B, N_ensemble, d_state)
+    observation_y,              # (B, d_obs) or (d_obs,) or None
+    observation_operator_ens,   # (B, N_ensemble, d_state) -> (B, N_ensemble, d_obs)
+    sigma_y,                    # scalar or (B,)
     method="EnKF-PertObs",
-    inflation_factor=1.0,   # scalar
-    # For EnKF-PertObs
+    inflation_factor=1.0,       # scalar
+    # --- Parameters for Covariance Localization (e.g., for EnKF-PertObs) ---
     localization_matrix_Lxy=None, # (d_state, d_obs)
     localization_matrix_Lyy=None, # (d_obs, d_obs)
-    # For LETKF
-    localization_radius_letkf=None, # scalar
-    coords_state_letkf=None,        # (d_state, D_coord)
-    coords_obs_letkf=None,          # (d_obs, D_coord)
-    domain_letkf=None,      # (D_coord,)
-    # For iEnKS
+    # --- SHARED Parameters for Observation Space Localization (LETKF, iEnKS) ---
+    localization_radius=None,   # scalar or None
+    coords_state=None,          # (d_state, D_coord)
+    coords_obs=None,            # (d_obs, D_coord)
+    localization_domain=None,   # (D_coord,)
+    # --- Parameters for iEnKS ---
     ienks_lag=1,
     ienks_niter=10,
     ienks_wtol=1e-5,
-    model_args=None # Dict for model propagator info needed by iEnKS
+    model_args=None             # Dict for model propagator info needed by iEnKS
 ):
-    """ Main dispatcher for ensemble Kalman filter analysis (Batched) """
+    """
+    Main dispatcher for ensemble Kalman filter analysis (Batched).
+    Now supports localized iEnKS.
+    """
     kalman_gain_or_transform = None
     ensemble_a_raw = None
 
@@ -632,37 +891,50 @@ def ensemble_kalman_filter_analysis(
             ensemble_f, observation_y, observation_operator_ens, sigma_y
         )
     elif method == "LETKF":
-        if localization_radius_letkf is None or \
-           coords_state_letkf is None or \
-           coords_obs_letkf is None:
+        if localization_radius is None or \
+            coords_state is None or \
+            coords_obs is None:
             raise ValueError("LETKF requires localization_radius, coords_state, and coords_obs.")
         ensemble_a_raw, kalman_gain_or_transform = _letkf_analysis(
             ensemble_f, observation_y, observation_operator_ens, sigma_y,
-            localization_radius_letkf, coords_state_letkf,
-            coords_obs_letkf, domain_letkf
+            localization_radius, coords_state,
+            coords_obs, localization_domain
         )
-    elif method == "iEnKS":
+    elif method.startswith("iEnKS-"):
         if model_args is None:
-            raise ValueError("iEnKS method requires 'model_args' dictionary.")
+            raise ValueError("iEnKS methods require 'model_args' dictionary.")
+        
+        # Extract update type from method name, e.g., "iEnKS-Sqrt" -> "Sqrt"
+        try:
+            update_type = method.split('-', 1)[1]
+        except IndexError:
+            raise ValueError(f"Invalid iEnKS method format: {method}. Expected 'iEnKS-UpdateType'.")
+
+        # --- MODIFIED: Call iEnKS with localization parameters ---
         ensemble_a_raw, kalman_gain_or_transform = _ienks_analysis(
+            # Standard DA args
             ensemble_f, observation_y, observation_operator_ens, sigma_y,
+            # Localization args
+            localization_radius=localization_radius,
+            coords_state=coords_state,
+            coords_obs=coords_obs,
+            domain=localization_domain,
+            # Model args
             model_propagator=model_args['propagator'],
             model_rhs=model_args['rhs'],
             model_dt=model_args['dt'],
             steps_between_analyses=model_args['steps_between_analyses'],
+            # iEnKS hyperparams
+            upd_a=update_type,
             Lag=ienks_lag,
             nIter=ienks_niter,
             wtol=ienks_wtol,
-            inflation_factor=inflation_factor,
         )
     else:
         raise ValueError(f"Unknown EnKF method: {method}")
 
     # Apply inflation to the raw analysis ensemble
-    if method != "iEnKS":
-        ensemble_analysis = apply_inflation(ensemble_a_raw, inflation_factor)
-    else:
-        ensemble_analysis = ensemble_a_raw
+    ensemble_analysis = apply_inflation(ensemble_a_raw, inflation_factor)
 
     return ensemble_analysis, kalman_gain_or_transform
 
@@ -693,31 +965,31 @@ def lorenz96_rhs(x, F=8):
     dxdt = (x_p1 - x_m2) * x_m1 - x + F
     return dxdt
 
-def lorenz63_rhs(x, sigma=10.0, rho=28.0, beta=8.0/3.0):
-    """
-    # Function: Calculates the RHS of the Lorenz 63 equations.
-    # ---
-    # Input:
-    #   x (torch.Tensor): State tensor of shape (batch_size, 3) or (3,).
-    #   sigma, rho, beta (float): Lorenz 63 parameters.
-    # ---
-    # Output:
-    #   torch.Tensor: The derivatives (dx/dt, dy/dt, dz/dt) with the same shape as x.
-    """
-    # Unpack state variables
-    x_val = x[..., 0]
-    y_val = x[..., 1]
-    z_val = x[..., 2]
+# def lorenz63_rhs(x, sigma=10.0, rho=28.0, beta=8.0/3.0):
+#     """
+#     # Function: Calculates the RHS of the Lorenz 63 equations.
+#     # ---
+#     # Input:
+#     #   x (torch.Tensor): State tensor of shape (batch_size, 3) or (3,).
+#     #   sigma, rho, beta (float): Lorenz 63 parameters.
+#     # ---
+#     # Output:
+#     #   torch.Tensor: The derivatives (dx/dt, dy/dt, dz/dt) with the same shape as x.
+#     """
+#     # Unpack state variables
+#     x_val = x[..., 0]
+#     y_val = x[..., 1]
+#     z_val = x[..., 2]
 
-    # Lorenz 63 equations
-    dxdt = sigma * (y_val - x_val)
-    dydt = x_val * (rho - z_val) - y_val
-    dzdt = x_val * y_val - beta * z_val
+#     # Lorenz 63 equations
+#     dxdt = sigma * (y_val - x_val)
+#     dydt = x_val * (rho - z_val) - y_val
+#     dzdt = x_val * y_val - beta * z_val
 
-    # Stack the results back into a tensor of the same shape as the input
-    return torch.stack([dxdt, dydt, dzdt], dim=-1)
+#     # Stack the results back into a tensor of the same shape as the input
+#     return torch.stack([dxdt, dydt, dzdt], dim=-1)
 
-def rk4_step(rhs_func, x, dt):
+def rk4_step(rhs_func, x, t, dt):
     """
     Performs one RK4 step.
     x can be (D_state,) or (batch_size, D_state).
@@ -760,7 +1032,7 @@ class Lorenz63:
         
         return dxdt.squeeze(0) if is_1d else dxdt
 
-    def step(self, rhs_func, x, dt):
+    def step(self, rhs_func, x, t, dt):
         """
         Function:
             Advances the model state by one time step using RK4.
@@ -788,8 +1060,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--methods', 
         nargs='+', 
-        default=['iEnKS'], # Default methods to run
-        choices=['BPF', 'EnKF-PO', 'ERSF', 'iEnKS'],
+        default=['iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'], # Default methods to run
+        choices=['BPF', 'EnKF-PO', 'ERSF', 'iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'],
         help='A list of DA methods to run.'
     )
     args = parser.parse_args()
@@ -815,10 +1087,10 @@ if __name__ == '__main__':
     
     params = {
         'N': 10,
-        'Lag': 3,
+        'Lag': 1,
         'nIter': 10,
         'wtol': 1e-5,
-        'infl': 1.0,
+        'infl': 1.1,
         'obs_noise_std': 1.0,
         'model_noise_std': 0.0
     }
@@ -827,7 +1099,7 @@ if __name__ == '__main__':
     obs_inds = [0] # Observe only the 'x' variable
     obs_operator = lambda x: x[..., obs_inds]
     l63_rhs_func = lambda x: lorenz_model._rhs(x)
-    rk4_stepper = lambda rhs, x, dt: lorenz_model.step(rhs, x, dt)
+    rk4_stepper = lambda rhs, x, dt: lorenz_model.step(rhs, x, None, dt)
 
     print("Generating true state with model spin-up...")
     x_spinup = torch.randn(batch_size, 3, device=device, dtype=torch.float32)
@@ -869,14 +1141,14 @@ if __name__ == '__main__':
         filter_forecasts = {}
         for name in methods_to_run:
             # Skip iEnKS here, as its forecast logic is handled differently
-            if name == 'iEnKS':
+            if name.startswith('iEnKS'):
                 continue
             
             ens = ensemble_states[name]
             ens_flat = ens.view(-1, 3) # Shape: [batch_size * N, 3]
             for _ in range(obs_every):
                 ens_flat = rk4_stepper(l63_rhs_func, ens_flat, dt)
-            forecast = ens_flat.view(1, params['N'], 3) 
+            forecast = ens_flat.view(batch_size, params['N'], 3) 
             forecast += torch.randn_like(forecast) * params['model_noise_std']
             filter_forecasts[name] = forecast
 
@@ -914,7 +1186,10 @@ if __name__ == '__main__':
             ensemble_states["ERSF"] = analysis_ersf
 
         # --- B: iEnKS Implementation (Smoother Logic) ---
-        if 'iEnKS' in methods_to_run:
+        ienks_methods = [m for m in methods_to_run if m.startswith('iEnKS-')]
+
+        if ienks_methods:
+            # This setup is common for all iEnKS methods
             k_start = max(0, ko - params['Lag'])
             
             model_args_ienks = {
@@ -924,39 +1199,48 @@ if __name__ == '__main__':
                 "steps_between_analyses": obs_every,
             }
 
-            # 1. Analysis step for iEnKS
-            start_time = time.perf_counter()
-            E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
-                ensemble_f=ensemble_states['iEnKS'], # Use the forecast from the previous cycle's start
-                observation_y=y_current,
-                observation_operator_ens=obs_operator,
-                sigma_y=params['obs_noise_std'],
-                method="iEnKS",
-                inflation_factor=params['infl'],
-                ienks_lag=(ko - k_start),
-                ienks_niter=params['nIter'],
-                ienks_wtol=params['wtol'],
-                model_args=model_args_ienks
-            )
-            analysis_times["iEnKS"].append(time.perf_counter() - start_time)
+            # Loop through each specific iEnKS method (e.g., iEnKS-Sqrt, iEnKS-PertObs)
+            for method_name in ienks_methods:
+                # 1. Analysis step for the specific iEnKS method
+                start_time = time.perf_counter()
+                E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
+                    ensemble_f=ensemble_states[method_name], # Use the forecast for this method
+                    observation_y=y_current,
+                    observation_operator_ens=obs_operator,
+                    sigma_y=params['obs_noise_std'],
+                    method=method_name, # Pass the specific method name
+                    inflation_factor=params['infl'],
+                    ienks_lag=(ko - k_start),
+                    ienks_niter=params['nIter'],
+                    ienks_wtol=params['wtol'],
+                    model_args=model_args_ienks
+                )
+                analysis_times[method_name].append(time.perf_counter() - start_time)
 
-            # 2. Propagate smoothed state to current time `ko` for RMSE calculation
-            E_analysis_at_ko = E_smoothed_at_start.clone()
-            num_steps_to_propagate = (ko - k_start) * obs_every
-            if num_steps_to_propagate > 0:
-                E_flat = E_analysis_at_ko.view(-1, 3)
-                for _ in range(num_steps_to_propagate):
-                    E_flat = rk4_stepper(l63_rhs_func, E_flat, dt)
-                E_analysis_at_ko = E_flat.view(batch_size, params['N'], 3)
-            results_rmse["iEnKS"].append(torch.sqrt(torch.mean((E_analysis_at_ko.mean(dim=1) - xx_true_obs[:, ko, :])**2, dim=-1)).cpu())
+                # 2. Propagate smoothed state to current time `ko` for RMSE calculation
+                E_analysis_at_ko = E_smoothed_at_start.clone()
+                num_steps_to_propagate = (ko - k_start) * obs_every
+                if num_steps_to_propagate > 0:
+                    E_flat = E_analysis_at_ko.view(-1, 3)
+                    for _ in range(num_steps_to_propagate):
+                        E_flat = rk4_stepper(l63_rhs_func, E_flat, dt)
+                    E_analysis_at_ko = E_flat.view(batch_size, params['N'], 3)
+                
+                # Store results for the current method
+                rmse = torch.sqrt(torch.mean((E_analysis_at_ko.mean(dim=1) - xx_true_obs[:, ko, :])**2, dim=-1))
+                results_rmse[method_name].append(rmse.cpu())
 
-            # 3. Create the forecast for the *next* cycle's window start
-            E_flat_next = E_smoothed_at_start.view(-1, 3)
-            for _ in range(obs_every):
-                E_flat_next = rk4_stepper(l63_rhs_func, E_flat_next, dt)
-            forecast_next = E_flat_next.view(batch_size, params['N'], 3)
-            forecast_next += torch.randn_like(forecast_next) * params['model_noise_std']
-            ensemble_states['iEnKS'] = forecast_next
+                # 3. Create the forecast for the *next* cycle's window start
+                E_flat_next = E_smoothed_at_start.view(-1, 3)
+                for _ in range(obs_every):
+                    E_flat_next = rk4_stepper(l63_rhs_func, E_flat_next, dt)
+                forecast_next = E_flat_next.view(batch_size, params['N'], 3)
+                
+                # Add model noise for the next forecast
+                forecast_next += torch.randn_like(forecast_next) * params['model_noise_std']
+                
+                # Update the state for the current method
+                ensemble_states[method_name] = forecast_next
 
 
     # -- 5. Final Results
@@ -965,7 +1249,7 @@ if __name__ == '__main__':
         rmse_tensor = torch.stack(results_rmse[method_name])
         time_tensor = torch.tensor(analysis_times[method_name])
         print("RMSE tensor shape:", rmse_tensor.shape)
-        stable_start_idx = 50
+        stable_start_idx = 0
         rmse_mean = rmse_tensor[stable_start_idx:, :].mean().item() 
         avg_time = time_tensor[stable_start_idx:].mean().item() 
         

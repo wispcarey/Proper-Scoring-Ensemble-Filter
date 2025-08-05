@@ -20,9 +20,9 @@ DATASET_INFO = {
         'colorbar_range': None,
     },
     'lorenz96': {
-        'dim': 8,
-        'obs_dim': 2,
-        'obs_inds': torch.arange(0, 8, 4),
+        'dim': 9,
+        'obs_dim': 6,
+        'obs_inds': torch.tensor([0,1,3,4,6,7]),
         'dt': 0.15,
         'dt_iter': 5,
         'test_steps': 500,
