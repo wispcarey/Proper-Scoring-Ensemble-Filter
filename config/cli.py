@@ -59,7 +59,8 @@ def parse_list_type(s):
 def get_parameters():
     parser = argparse.ArgumentParser()
     # dataset setting
-    parser.add_argument('--dataset', type=str, default='lorenz96', choices=['lorenz63', 'lorenz96', 'ks', 'linear', 'circle', 'Hdoublewell'],
+    parser.add_argument('--dataset', type=str, default='lorenz96', 
+                        choices=['lorenz63', 'rossler','lorenz96', 'ks', 'linear', 'circle', 'Hdoublewell'],
                         help='Dataset name')
     parser.add_argument('--num_loader_workers', type=int, default=16,
                         help='number of workers for the data loader')
@@ -200,7 +201,7 @@ def get_parameters():
     parser.add_argument('--suffix', type=str, default="", help='save folder suffix')
 
     # version setting
-    parser.add_argument('--v', type=str, choices=['CorrTerms','EtE','EtE-LRes','EtE2','EnKF','ESRF','LETKF'],
+    parser.add_argument('--v', type=str,
                         default='CorrTerms', help='versions')
 
     args = parser.parse_args()

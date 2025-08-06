@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn as nn
 
-from utils import L63, L96, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
+from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
 from utils import AverageMeter, mystery_operator, get_mean_std
 from utils import post_process, mean0
 from visualization import plot_particle_trajectories_with_histograms, plot_particle_trajectories, plot_and_test_point_clouds
@@ -243,144 +243,6 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
     # Return both the analyzed ensemble and the localization output
     return ens_v_a, loc_nn_output
 
-# def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
-#     model, infl_model, local_model, st_model1, st_model2 = model_list
-#     m = args.N
-#     losses = AverageMeter()
-#     batch_time = AverageMeter()
-    
-#     if args.dataset == "lorenz63":
-#         forward_fun = L63.forward
-#     elif args.dataset == "lorenz96":
-#         forward_fun = L96.forward
-#     elif args.dataset == "ks":
-#         if args.dt_iter <= 0:
-#             raise ValueError("args.dt_iter must be positive for KS model.")
-#         forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
-#     else:
-#         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
-    
-#     if H_info is None:
-#         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
-#     else:
-#         H_fun, H = H_info
-
-#     model.train()
-#     if hasattr(infl_model, 'train'): infl_model.train()
-#     if hasattr(local_model, 'train'): local_model.train()
-#     if hasattr(st_model1, 'train'): st_model1.train()
-#     if hasattr(st_model2, 'train'): st_model2.train()
-
-#     all_trainable_params = []
-#     for m_ in [model, infl_model, local_model, st_model1, st_model2]:
-#         if hasattr(m_, 'parameters') and not isinstance(m_, NaiveNetwork):
-#             all_trainable_params.extend(list(filter(lambda p: p.requires_grad, m_.parameters())))
-
-#     num_batches_all_nan = 0
-
-#     for batch_ind, batch_v_trajectory in enumerate(loader):
-#         t_start = time.time()
-#         batch_v_trajectory = batch_v_trajectory.to(device=args.device)
-#         current_actual_batch_size = batch_v_trajectory.shape[1]
-#         optimizer.zero_grad()
-#         ens_v_a = batch_v_trajectory[0].unsqueeze(1).repeat(1, m, 1)
-#         ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
-#         accumulated_loss_for_batch_load = 0.0
-#         num_valid_loss_contributions = 0
-
-#         end_ind_t = min(epoch + 1, len(batch_v_trajectory) - 1) if args.loss_warm_up else len(batch_v_trajectory) - 1
-#         if end_ind_t <= 0:
-#             if (batch_ind + 1) % args.print_batch == 0:
-#                 print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
-#                       f'Skipped batch due to end_ind_t <=0 (Warm-up or short trajectory)')
-#             batch_time.update(time.time() - t_start)
-#             continue
-
-#         for i in range(end_ind_t):
-#             obs_y = H_fun(batch_v_trajectory[i + 1].unsqueeze(1))
-#             obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
-#             ens_v_a_forecast_input = ens_v_a.reshape(-1, args.ori_dim)
-            
-#             for j_iter in range(args.dt_iter):
-#                 if args.dataset == 'ks':
-#                     ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
-#                 else:
-#                     current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-#                     ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-            
-#             ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-#             ens_v_f = ens_v_f + torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
-#             hv = H_fun(ens_v_f)
-#             r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
-#             ens_i_innov = obs_y - hv - r_noise
-#             mean_hv = torch.mean(hv, dim=1, keepdim=True)
-#             mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
-
-#             # ======================= [Refactored Core Call] =======================
-#             # Replace the complex analysis logic with a single call to the new function.
-#             current_analyzed_ens_v_a, _ = _process_analysis_step(
-#                 args, model_list, ens_v_f, hv, obs_y,
-#                 ens_i_innov, mean_ens_v_f, mean_hv,
-#             )
-#             # ======================================================================
-
-#             if (i + 1) > args.ignore_first:
-#                 ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
-#                 batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)
-#                 nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
-#                 valid_B_mask_this_step = ~nan_mask_this_step
-
-#                 if valid_B_mask_this_step.any():
-#                     step_loss_sum_over_valid_batch_items = 0
-#                     for loss_type_val in args.loss_type:
-#                         step_loss_sum_over_valid_batch_items += compute_loss(
-#                             ens_tensor=ens_tensor_step, batch_v=batch_v_step,
-#                             loss_type=loss_type_val, ignore_first=0, end_ind=None,
-#                             valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
-#                             norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True 
-#                         )
-                    
-#                     accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
-#                     num_valid_in_step = torch.sum(valid_B_mask_this_step)
-#                     num_valid_loss_contributions += num_valid_in_step.item()
-                    
-#                     if num_valid_in_step > 0:
-#                         losses.update(step_loss_sum_over_valid_batch_items.item() / num_valid_in_step.item(), 
-#                                       num_valid_in_step.item())
-            
-#             ens_v_a = current_analyzed_ens_v_a
-#             if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
-#                 ens_v_a = ens_v_a.detach()
-        
-#         if num_valid_loss_contributions > 0:
-#             average_loss_for_loaded_batch = accumulated_loss_for_batch_load / num_valid_loss_contributions
-#             average_loss_for_loaded_batch.backward()
-            
-#             if all_trainable_params:
-#                 nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-#             optimizer.step()
-#         else:
-#             num_batches_all_nan += 1
-
-#         batch_time.update(time.time() - t_start)
-#         total_possible_contributions = current_actual_batch_size * max(0, end_ind_t - args.ignore_first)
-#         current_no_nan_percentage = (num_valid_loss_contributions / total_possible_contributions * 100) if total_possible_contributions > 0 else 100.0
-
-#         if (batch_ind + 1) % args.print_batch == 0:
-#             print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
-#                   f'Batch time {batch_time.val:.3f} (Avg: {batch_time.avg:.3f})\t'
-#                   f'Loss {losses.val:.3f} (Avg: {losses.avg:.3f})\t'
-#                   f'LR: {optimizer.param_groups[0]["lr"]:.2e}\t'
-#                   f'No NAN % (batch): {current_no_nan_percentage:.2f}%')
-
-#     if num_batches_all_nan == len(loader) and len(loader) > 0:
-#         print(f"Warning: All {len(loader)} batches in epoch {epoch} resulted in NaN or no valid loss.")
-#         if losses.count == 0:
-#             return float('nan')
-
-#     scheduler.step()
-#     return losses.avg
-
 def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
     """
     Function to train the model for one epoch.
@@ -405,6 +267,8 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     # --- Forward Function Selection ---
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
+    elif args.dataset == 'rossler':
+        forward_fun = Rossler.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
     elif args.dataset == "circle":
@@ -597,12 +461,14 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
 
     Returns:
         dict: A dictionary containing performance metrics. CRPS-related keys are
-              only present if calculate_crps is True.
+            only present if calculate_crps is True.
     """
 
     # --- Model and Observation Initialization ---
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
+    elif args.dataset == 'rossler':
+        forward_fun = Rossler.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
     elif args.dataset == "circle":
@@ -785,6 +651,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
+    elif args.dataset == 'rossler':
+        forward_fun = Rossler.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
     elif args.dataset == "circle":
@@ -1121,16 +989,19 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             for i in range(len(batch_v) - 1):
                 obs_y = obs_y_list[i + 1]
 
-                ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
-                for j_iter in range(args.dt_iter):
-                    if args.dataset == 'ks':
-                        ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
-                    else:
-                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                        ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                
-                ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+                if args.v.startswith('iEnKS'):
+                    ens_v_f = ens_v_a
+                else:
+                    ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
+                    for j_iter in range(args.dt_iter):
+                        if args.dataset == 'ks':
+                            ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
+                        else:
+                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+                            ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+                    ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
+                    
+                    ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
                 
                 B_shape, N_ens, D_state = ens_v_f.shape
                 d_obs_shape = obs_y.shape[2]
@@ -1139,6 +1010,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     "observation_y": obs_y.squeeze(1),
                     "observation_operator_ens": H_fun,
                     "sigma_y": args.sigma_y,
+                    "sigma_v": args.sigma_v,
                     "inflation_factor": infl
                 }
                 
@@ -1168,29 +1040,37 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
                     
                     model_args_ienks = {
-                        "propagator": rk4_stepper,
-                        "rhs": l63_rhs_func,
-                        "dt": dt,
-                        "steps_between_analyses": obs_every,
+                        "propagator": rk4,
+                        "rhs": forward_fun,
+                        "dt": args.dt / args.dt_iter,
+                        "steps_between_analyses": args.dt_iter,
                     }
                     E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
                         ens_v_f,
                         **common_enkf_args,
                         method=args.v,
+                        localization_radius=loc_radius, 
+                        coords_state=coords_state,
+                        coords_obs=coords_obs, 
+                        localization_domain=domain,
                         ienks_lag=1,
                         ienks_niter=10,
                         ienks_wtol=1e-5,
                         model_args=model_args_ienks
                     )
+                    if torch.isnan(E_smoothed_at_start).all():
+                        print(i)
+                        raise ValueError
 
-                    # 2. Propagate smoothed state to current time `ko` for RMSE calculation
-                    E_analysis_at_ko = E_smoothed_at_start.clone()
-                    num_steps_to_propagate = obs_every
-                    if num_steps_to_propagate > 0:
-                        E_flat = E_analysis_at_ko.view(-1, 3)
-                        for _ in range(num_steps_to_propagate):
-                            E_flat = rk4_stepper(l63_rhs_func, E_flat, dt)
-                        E_analysis_at_ko = E_flat.view(batch_size, params['N'], 3)
+                    ens_v_a_forecast_input = E_smoothed_at_start.clone().view(-1, args.ori_dim)
+                    for j_iter in range(args.dt_iter):
+                        if args.dataset == 'ks':
+                            raise NotImplementedError
+                        else:
+                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+                            ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+                    ens_v_a = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
+                    ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_v
                 else:
                     raise NotImplementedError(f"The filter {args.v} is not implemented")
 

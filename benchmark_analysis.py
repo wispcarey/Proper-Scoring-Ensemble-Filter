@@ -79,7 +79,41 @@ def matrix_sqrt_psd(A, tol=1e-9):
     # .transpose(-2, -1) is robust for batched or non-batched.
     return eigenvectors @ torch.diag_embed(eigenvalues_sqrt) @ eigenvectors.transpose(-2, -1)
 
+def robust_eigh(A, cond_threshold=1e6):
+    """
+    A truly robust wrapper for torch.linalg.eigh.
+    It first checks for non-finite values in the input `A` before computing
+    the condition number to prevent linalg errors.
 
+    Input:
+    - A (torch.Tensor): Batch of square matrices, shape (B, N, N).
+    - cond_threshold (float): Max valid condition number.
+
+    Output:
+    - (torch.Tensor, torch.Tensor): Eigenvalues (B, N) and Eigenvectors (B, N, N).
+    """
+    B, N, _ = A.shape
+    device = A.device
+    dtype = torch.float32 if not A.is_floating_point() else A.dtype
+
+    finite_mask = torch.all(torch.isfinite(A), dim=(-2, -1))
+    cond_nums = torch.full((B,), float('inf'), device=device, dtype=dtype)
+
+    if finite_mask.any():
+        A_finite = A[finite_mask]
+        cond_nums[finite_mask] = torch.linalg.cond(A_finite)
+
+    valid_mask = cond_nums <= cond_threshold
+
+    eigvals = torch.full((B, N), float('nan'), device=device, dtype=dtype)
+    eigvecs = torch.full((B, N, N), float('nan'), device=device, dtype=dtype)
+
+    if valid_mask.any():
+        L_valid, V_valid = torch.linalg.eigh(A[valid_mask])
+        eigvals[valid_mask] = L_valid
+        eigvecs[valid_mask] = V_valid
+    
+    return eigvals, eigvecs
 
 # ##############################################################################
 # # Bootstrap Particle Filter (Analysis Step Only)
@@ -298,7 +332,7 @@ def _enkf_pert_obs_analysis(
     return ensemble_a, kalman_gain
 
 
-def _ersf_analysis( # Ensemble Randomized Square Root Filter (ETKF variant) - Batched
+def _esrf_analysis( # Ensemble Randomized Square Root Filter (ETKF variant) - Batched
     ensemble_f,             # (B, N_ensemble, d_state)
     observation_y,          # (B, d_obs) or (d_obs,)
     observation_operator_ens, # (B, N_ensemble, d_state) -> (B, N_ensemble, d_obs)
@@ -338,8 +372,7 @@ def _ersf_analysis( # Ensemble Randomized Square Root Filter (ETKF variant) - Ba
     # Batched: (B, N_ens, N_y) @ (B, N_y, N_ens) -> (B, N_ens, N_ens)
     C_tilde_sym = (AYf @ AYf.transpose(-2, -1)) * sigma_y_sq_inv + \
                   N1_val * torch.eye(N_ensemble, device=device, dtype=dtype).unsqueeze(0)
-
-    eig_vals, eig_vecs = torch.linalg.eigh(C_tilde_sym) # eig_vals (B,N), eig_vecs (B,N,N)
+    eig_vals, eig_vecs = robust_eigh(C_tilde_sym) # eig_vals (B,N), eig_vecs (B,N,N)
     eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
 
     # T_transform_matrix: (B, N_ensemble, N_ensemble)
@@ -379,7 +412,7 @@ def _letkf_core_etkf_update(
     Pa_tilde_inv_sqrt = eff_AY_f_anom @ eff_AY_f_anom.transpose(-2, -1) + \
                         N1_val * torch.eye(N_ensemble, device=device, dtype=dtype).unsqueeze(0)
 
-    eig_vals, eig_vecs = torch.linalg.eigh(Pa_tilde_inv_sqrt)
+    eig_vals, eig_vecs = robust_eigh(Pa_tilde_inv_sqrt)
     eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
 
     # T_transform: (B, N_ensemble, N_ensemble)
@@ -611,6 +644,7 @@ def _ienks_analysis(
     observation_y,
     observation_operator_ens,
     sigma_y,
+    sigma_v,
     # --- Localization and Model Args ---
     localization_radius,
     coords_state=None,
@@ -648,7 +682,8 @@ def _ienks_analysis(
         num_model_steps = Lag * steps_between_analyses
         propagated_ens = ens_flat
         for _ in range(num_model_steps):
-            propagated_ens = model_propagator(lambda x: model_rhs(x), propagated_ens, None, model_dt)
+            propagated_ens = model_propagator(model_rhs, propagated_ens, 0, model_dt)
+        propagated_ens += torch.randn_like(propagated_ens, device=propagated_ens.device) * sigma_v
         return propagated_ens.view(B, N, D_state)
     
     # ============================================================================
@@ -673,8 +708,9 @@ def _ienks_analysis(
             Tinv = torch.linalg.inv(T)
             Y_iter = Tinv @ Y_eff
             
-            C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device)
-            eig_vals, U = torch.linalg.eigh(C_tilde)
+            C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device).unsqueeze(0)
+
+            eig_vals, U = robust_eigh(C_tilde)
             eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
             Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
             
@@ -743,7 +779,7 @@ def _ienks_analysis(
                 Y_iter_local = Tinv_k @ Y_local_eff
 
                 C_tilde = (Y_iter_local @ Y_iter_local.transpose(-2, -1)) + za*torch.eye(N, device=device)
-                eig_vals, U = torch.linalg.eigh(C_tilde)
+                eig_vals, U = robust_eigh(C_tilde)
                 eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
                 Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
 
@@ -808,8 +844,8 @@ def _ienks_analysis(
 #             ensemble_f, observation_y, observation_operator_ens, sigma_y,
 #             localization_matrix_Lxy, localization_matrix_Lyy
 #         )
-#     elif method == "ERSF": # ETKF variant
-#         ensemble_a_raw, kalman_gain_or_transform = _ersf_analysis(
+#     elif method == "ESRF": # ETKF variant
+#         ensemble_a_raw, kalman_gain_or_transform = _esrf_analysis(
 #             ensemble_f, observation_y, observation_operator_ens, sigma_y
 #         )
 #     elif method == "LETKF":
@@ -856,6 +892,7 @@ def ensemble_kalman_filter_analysis(
     observation_y,              # (B, d_obs) or (d_obs,) or None
     observation_operator_ens,   # (B, N_ensemble, d_state) -> (B, N_ensemble, d_obs)
     sigma_y,                    # scalar or (B,)
+    sigma_v,                    # scalar or (B,)
     method="EnKF-PertObs",
     inflation_factor=1.0,       # scalar
     # --- Parameters for Covariance Localization (e.g., for EnKF-PertObs) ---
@@ -886,8 +923,8 @@ def ensemble_kalman_filter_analysis(
             ensemble_f, observation_y, observation_operator_ens, sigma_y,
             localization_matrix_Lxy, localization_matrix_Lyy
         )
-    elif method == "ERSF": # ETKF variant
-        ensemble_a_raw, kalman_gain_or_transform = _ersf_analysis(
+    elif method == "ESRF": # ETKF variant
+        ensemble_a_raw, kalman_gain_or_transform = _esrf_analysis(
             ensemble_f, observation_y, observation_operator_ens, sigma_y
         )
     elif method == "LETKF":
@@ -910,10 +947,9 @@ def ensemble_kalman_filter_analysis(
         except IndexError:
             raise ValueError(f"Invalid iEnKS method format: {method}. Expected 'iEnKS-UpdateType'.")
 
-        # --- MODIFIED: Call iEnKS with localization parameters ---
         ensemble_a_raw, kalman_gain_or_transform = _ienks_analysis(
             # Standard DA args
-            ensemble_f, observation_y, observation_operator_ens, sigma_y,
+            ensemble_f, observation_y, observation_operator_ens, sigma_y, sigma_v,
             # Localization args
             localization_radius=localization_radius,
             coords_state=coords_state,
@@ -1060,8 +1096,9 @@ if __name__ == '__main__':
     parser.add_argument(
         '--methods', 
         nargs='+', 
-        default=['iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'], # Default methods to run
-        choices=['BPF', 'EnKF-PO', 'ERSF', 'iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'],
+        # default=['iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'], # Default methods to run
+        default=['iEnKS-PertObs'], # Default methods to run
+        choices=['BPF', 'EnKF-PO', 'ESRF', 'iEnKS-PertObs', 'iEnKS-Sqrt', 'iEnKS-Order1'],
         help='A list of DA methods to run.'
     )
     args = parser.parse_args()
@@ -1081,7 +1118,7 @@ if __name__ == '__main__':
     lorenz_model = Lorenz63()
     dt = 0.03
     obs_every = 5
-    total_obs = 400
+    total_obs = 500
     n_steps = total_obs * obs_every
     batch_size = 32
     
@@ -1090,29 +1127,29 @@ if __name__ == '__main__':
         'Lag': 1,
         'nIter': 10,
         'wtol': 1e-5,
-        'infl': 1.1,
+        'infl': 1.08,
         'obs_noise_std': 1.0,
-        'model_noise_std': 0.0
+        'model_noise_std': 1e-2
     }
     
     # --- Observation Setup ---
     obs_inds = [0] # Observe only the 'x' variable
     obs_operator = lambda x: x[..., obs_inds]
     l63_rhs_func = lambda x: lorenz_model._rhs(x)
-    rk4_stepper = lambda rhs, x, dt: lorenz_model.step(rhs, x, None, dt)
+    rk4_stepper = lambda rhs, x, t, dt: lorenz_model.step(rhs, x, t, dt)
 
     print("Generating true state with model spin-up...")
     x_spinup = torch.randn(batch_size, 3, device=device, dtype=torch.float32)
     num_spinup_steps = 2000
     for _ in range(num_spinup_steps):
-        x_spinup = rk4_stepper(l63_rhs_func, x_spinup, dt)
+        x_spinup = rk4_stepper(l63_rhs_func, x_spinup, None, dt)
     print("Spin-up complete.")
 
     print("Generating full true trajectory batch...")
     x_true = torch.zeros((batch_size, n_steps + 1, 3), device=device, dtype=torch.float32)
     x_true[:, 0] = x_spinup
     for i in range(n_steps):
-        x_true[:, i+1] = rk4_stepper(l63_rhs_func, x_true[:, i], dt)
+        x_true[:, i+1] = rk4_stepper(l63_rhs_func, x_true[:, i], None, dt)
 
     obs_time_indices = torch.arange(0, n_steps + 1, obs_every)
     xx_true_obs = x_true[:, obs_time_indices]
@@ -1147,7 +1184,7 @@ if __name__ == '__main__':
             ens = ensemble_states[name]
             ens_flat = ens.view(-1, 3) # Shape: [batch_size * N, 3]
             for _ in range(obs_every):
-                ens_flat = rk4_stepper(l63_rhs_func, ens_flat, dt)
+                ens_flat = rk4_stepper(l63_rhs_func, ens_flat, None, dt)
             forecast = ens_flat.view(batch_size, params['N'], 3) 
             forecast += torch.randn_like(forecast) * params['model_noise_std']
             filter_forecasts[name] = forecast
@@ -1168,6 +1205,7 @@ if __name__ == '__main__':
             "observation_y": y_current,
             "observation_operator_ens": obs_operator,
             "sigma_y": params['obs_noise_std'],
+            "sigma_v": params['model_noise_std'],
             "inflation_factor": params['infl']
         }
         
@@ -1178,12 +1216,12 @@ if __name__ == '__main__':
             results_rmse["EnKF-PO"].append(torch.sqrt(torch.mean((analysis_enkf_po.mean(dim=1) - xx_true_obs[:, ko, :])**2, dim=-1)).cpu())
             ensemble_states["EnKF-PO"] = analysis_enkf_po
 
-        if 'ERSF' in methods_to_run:
+        if 'ESRF' in methods_to_run:
             start_time = time.perf_counter()
-            analysis_ersf, _ = ensemble_kalman_filter_analysis(filter_forecasts["ERSF"], method="ERSF", **common_enkf_args)
-            analysis_times["ERSF"].append(time.perf_counter() - start_time)
-            results_rmse["ERSF"].append(torch.sqrt(torch.mean((analysis_ersf.mean(dim=1) - xx_true_obs[:, ko, :])**2, dim=-1)).cpu())
-            ensemble_states["ERSF"] = analysis_ersf
+            analysis_esrf, _ = ensemble_kalman_filter_analysis(filter_forecasts["ESRF"], method="ESRF", **common_enkf_args)
+            analysis_times["ESRF"].append(time.perf_counter() - start_time)
+            results_rmse["ESRF"].append(torch.sqrt(torch.mean((analysis_esrf.mean(dim=1) - xx_true_obs[:, ko, :])**2, dim=-1)).cpu())
+            ensemble_states["ESRF"] = analysis_esrf
 
         # --- B: iEnKS Implementation (Smoother Logic) ---
         ienks_methods = [m for m in methods_to_run if m.startswith('iEnKS-')]
@@ -1208,6 +1246,8 @@ if __name__ == '__main__':
                     observation_y=y_current,
                     observation_operator_ens=obs_operator,
                     sigma_y=params['obs_noise_std'],
+                    sigma_v=params['model_noise_std'],
+                    # sigma_v=0,
                     method=method_name, # Pass the specific method name
                     inflation_factor=params['infl'],
                     ienks_lag=(ko - k_start),
@@ -1223,7 +1263,7 @@ if __name__ == '__main__':
                 if num_steps_to_propagate > 0:
                     E_flat = E_analysis_at_ko.view(-1, 3)
                     for _ in range(num_steps_to_propagate):
-                        E_flat = rk4_stepper(l63_rhs_func, E_flat, dt)
+                        E_flat = rk4_stepper(l63_rhs_func, E_flat, None, dt)
                     E_analysis_at_ko = E_flat.view(batch_size, params['N'], 3)
                 
                 # Store results for the current method
@@ -1233,7 +1273,7 @@ if __name__ == '__main__':
                 # 3. Create the forecast for the *next* cycle's window start
                 E_flat_next = E_smoothed_at_start.view(-1, 3)
                 for _ in range(obs_every):
-                    E_flat_next = rk4_stepper(l63_rhs_func, E_flat_next, dt)
+                    E_flat_next = rk4_stepper(l63_rhs_func, E_flat_next, None, dt)
                 forecast_next = E_flat_next.view(batch_size, params['N'], 3)
                 
                 # Add model noise for the next forecast

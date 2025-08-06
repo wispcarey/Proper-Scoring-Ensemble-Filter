@@ -25,7 +25,7 @@ for seed_val in "${SEEDS[@]}"; do
         echo "============================================================"
         
         python gen_pf_results.py \
-            --dataset lorenz63 \
+            --dataset rossler \
             --sigma_y 1 \
             --seed $seed_val \
             --normal_output \

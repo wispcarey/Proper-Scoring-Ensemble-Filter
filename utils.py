@@ -184,6 +184,50 @@ class DoubleWellODE(nn.Module):
         rvals[:, 1] = b * x[:, 0] - a * (x[:, 0]**3)
         return rvals
 
+class Rossler(nn.Module):
+    """
+    Batched Rössler ODE right-hand side, matching the Lorenz-63 wrapper style.
+    """
+
+    def __init__(self):
+        super(Rossler, self).__init__()
+        # Dummy attribute kept for API parity with the given L63 class
+        self.fe = 0
+
+    @staticmethod
+    def forward(t, x, a=0.2, b=0.2, c=5.7):
+        """
+        Compute the time derivatives for a batch of Rössler states.
+
+        Parameters
+        ----------
+        t : torch.Tensor or float
+            Current time (included for compatibility; not used by the equations).
+        x : torch.Tensor
+            Tensor of shape (batch_size, 3) containing the state vectors
+            [[x_0, y_0, z_0],
+             [x_1, y_1, z_1],
+             ...].
+        a, b, c : float, optional
+            Standard Rössler parameters. Defaults yield the classical chaotic
+            attractor (a ≈ 0.2, b ≈ 0.2, c ≈ 5.7).
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of the same shape as `x` containing the derivatives
+            [dx/dt, dy/dt, dz/dt] for each state in the batch.
+        """
+        # Allocate output tensor with the same shape and device as input
+        dxdt = torch.zeros_like(x)
+
+        # Rössler ODEs
+        dxdt[:, 0] = -x[:, 1] - x[:, 2]           # dx/dt
+        dxdt[:, 1] =  x[:, 0] + a * x[:, 1]       # dy/dt
+        dxdt[:, 2] =  b + x[:, 2] * (x[:, 0] - c) # dz/dt
+
+        return dxdt
+    
 def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
              check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
     """
@@ -243,23 +287,25 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
         for step in range(burn_in + steps):
             for _ in range(dt_iter):
                 vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
-            vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)  # Ensure float32
+            vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)  
             trajectory.append(vf.unsqueeze(0))
         return torch.cat(trajectory).to(dtype=torch.float32)  # Ensure the output is float32
 
     # Define model and dimensions based on dataset type
     if dataset == "lorenz63":
-        model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  # Ensure float32
+        model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  
+    elif dataset == "rossler":
+        model, dim, default_v0 = Rossler, 3, torch.randn(1, 3, dtype=torch.float32)  
     elif dataset == "lorenz96":
-        model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim, dtype=torch.float32) + 5  # Ensure float32
+        model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim, dtype=torch.float32) + 5  
     elif dataset == "circle":
-        model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  # Ensure float32
+        model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
     elif dataset == "Hdoublewell":
-        model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  # Ensure float32
+        model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
     elif dataset == "ks":
         # Kuramoto-Sivashinsky model specifics
         model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
-        # grid = 32 * np.pi * torch.linspace(0, 1, 128 + 1, dtype=torch.float32)[1:]  # Ensure float32
+        # grid = 32 * np.pi * torch.linspace(0, 1, 128 + 1, dtype=torch.float32)[1:]  
         # x0_Kassam = torch.cos(grid / 16) * (1 + torch.sin(grid / 16))
         # x0 = x0_Kassam.clone().unsqueeze(0)
         # # Single 150-step integration to stabilize x0

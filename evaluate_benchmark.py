@@ -26,11 +26,11 @@ def get_benchmarks(args):
     file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
     df = pd.read_csv(file_path, usecols=['method', 'N', 'sigma_y', 'best_loc_rad','best_infl','rmse', 'rrmse_mean'])
 
-    if args.v == "LETKF":
+    if args.v == "LETKF" or (args.v.startswith('iEnKS') and args.dataset != 'lorenz63'):
         method = "LETKF"
-    elif args.v == "EnKF":
+    elif args.v == "EnKF" or args.v.startswith('iEnKS'):
         method = "EnKF_PertObs"
-    elif args.V == "ESRF":
+    elif args.v == "ESRF":
         method = "EnKF_Sqrt"
     else:
         raise NotImplementedError
@@ -62,7 +62,7 @@ if __name__ == "__main__":
         H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
 
         # modify test_batch_size
-        if args.N == 100:
+        if args.N == 100 and args.dataset == 'ks':
             args.test_batch_size = args.test_batch_size // 2
         test_loader = get_dataloader(args, test_only=True)
         
@@ -123,10 +123,6 @@ if __name__ == "__main__":
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
-        if args.cp_load_path != "no":
-            if args.zero_infl:
-                torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}.pt"))
-            else:
-                torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
+        torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
 
 
