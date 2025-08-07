@@ -202,7 +202,7 @@ def get_parameters():
 
     # version setting
     parser.add_argument('--v', type=str,
-                        default='CorrTerms', help='versions')
+                        default='EtE-LRes', help='versions')
 
     args = parser.parse_args()
 

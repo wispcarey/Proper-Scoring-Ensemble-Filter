@@ -44,21 +44,21 @@ seed=42
 
 
 # EtE-LRes es1
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-    --dataset $dataset \
-    --N $N \
-    --sigma_y $sigma_y \
-    --seed $seed \
-    --v EtE-LRes \
-    --no_localization \
-    --normal_output \
-    --test_steps 500 \
-    --pf_verification \
-    --pf_N 1000000 \
-    --sigma_reg None \
-    --cp_load_path save/EtE-LinearCheck/2025-07-06_12-24lorenz63_1.0_10_60_8192_es_joint_EtE-LRes/cp_1000.pth
-done
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#     --dataset $dataset \
+#     --N $N \
+#     --sigma_y $sigma_y \
+#     --seed $seed \
+#     --v EtE-LRes \
+#     --no_localization \
+#     --normal_output \
+#     --test_steps 500 \
+#     --pf_verification \
+#     --pf_N 1000000 \
+#     --sigma_reg None \
+#     --cp_load_path save/EtE-LinearCheck/2025-07-06_12-24lorenz63_1.0_10_60_8192_es_joint_EtE-LRes/cp_1000.pth
+# done
 
 # EtE-LRes es1 nst
 for N in 5 10 15 20 40 60 100; do
@@ -79,41 +79,41 @@ for N in 5 10 15 20 40 60 100; do
 done
 
 # EtE-LRes es1 nmlp
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-    --dataset $dataset \
-    --N $N \
-    --sigma_y $sigma_y \
-    --seed $seed \
-    --v EtE-LRes \
-    --no_localization \
-    --normal_output \
-    --test_steps 500 \
-    --pf_verification \
-    --pf_N 1000000 \
-    --sigma_reg None \
-    --cp_load_path save/EtE-LinearCheck/2025-07-09_23-25lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nimlp/cp_1000.pth \
-    --mlp_y_type noise_innov 
-done
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#     --dataset $dataset \
+#     --N $N \
+#     --sigma_y $sigma_y \
+#     --seed $seed \
+#     --v EtE-LRes \
+#     --no_localization \
+#     --normal_output \
+#     --test_steps 500 \
+#     --pf_verification \
+#     --pf_N 1000000 \
+#     --sigma_reg None \
+#     --cp_load_path save/EtE-LinearCheck/2025-07-09_23-25lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nimlp/cp_1000.pth \
+#     --mlp_y_type noise_innov 
+# done
 
-# EtE-LRes es1 nst & nmlp
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-    --dataset $dataset \
-    --N $N \
-    --sigma_y $sigma_y \
-    --seed $seed \
-    --v EtE-LRes \
-    --no_localization \
-    --normal_output \
-    --test_steps 500 \
-    --pf_verification \
-    --pf_N 1000000 \
-    --sigma_reg None \
-    --cp_load_path save/EtE-LinearCheck/2025-07-09_23-25lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst_nimlp/cp_1000.pth \
-    --noise_st_input \
-    --mlp_y_type noise_innov 
-done
+# # EtE-LRes es1 nst & nmlp
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#     --dataset $dataset \
+#     --N $N \
+#     --sigma_y $sigma_y \
+#     --seed $seed \
+#     --v EtE-LRes \
+#     --no_localization \
+#     --normal_output \
+#     --test_steps 500 \
+#     --pf_verification \
+#     --pf_N 1000000 \
+#     --sigma_reg None \
+#     --cp_load_path save/EtE-LinearCheck/2025-07-09_23-25lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst_nimlp/cp_1000.pth \
+#     --noise_st_input \
+#     --mlp_y_type noise_innov 
+# done
 
 # ete-lres es1
 

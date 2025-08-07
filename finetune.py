@@ -37,14 +37,11 @@ if __name__ == "__main__":
 
 
         ##################### fine-tuning on different N
-        N_list = [5,10,15,20,40,60,100]
+        N_list = [60,100]
         # N_list = [20, 40]
         ori_batch_size = args.batch_size
 
         for N in N_list:
-            # if N == 5:
-            #     args.batch_size = ori_batch_size * 2
-            # el
             if N == 40 or N == 60:
                 args.batch_size = ori_batch_size // 2
             elif N == 100:

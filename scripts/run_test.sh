@@ -2,23 +2,49 @@
 
 cd ..
 
-# lorenz 63
-dataset="lorenz63"
+# Rossler
+dataset="rossler"
 
 sigma_y=1
 seed=42
-save_dir="2025-07-06_16-00lorenz63_1.0_15_60_8192_es_joint_EtE-LRes"
+save_dir="rossler_EtE_LRes/2025-08-06_10-19rossler_1.0_10_60_8192_es_joint_EtE-LRes"
 
 # sigma_y = $sigma_y, EnST
 for N in 5 10 15 20 40 60 100; do
     python evaluate.py \
+        --v EtE-LRes \
         --dataset $dataset \
         --N $N \
         --sigma_y $sigma_y \
         --seed $seed \
         --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth
+        --cp_load_path save/${save_dir}/cp_1000.pth \
+        --pf_verification \
+        --pf_N 10000 \
+        --sigma_reg None 
 done
+
+# # lorenz 63
+# dataset="lorenz63"
+
+# sigma_y=1
+# seed=42
+# save_dir="lorenz63_EtE_LRes/2025-07-09_19-08lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst"
+
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v EtE-LRes \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 1000000 \
+#         --sigma_reg None 
+# done
 
 # sigma_y=0.7
 # seed=42

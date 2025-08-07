@@ -19,7 +19,7 @@ if __name__ == "__main__":
     folder_name = os.path.dirname(args.cp_load_path)
     
     # redirect output
-    with redirect_output(save_output=not args.normal_output, save_folder=args.save_folder, filename="test_output.txt"):
+    with redirect_output(save_output=not args.normal_output, save_folder=folder_name, filename="test_output.txt"):
         if args.seed is not None and args.seed != "None":
             torch.manual_seed(int(args.seed))
 
