@@ -33,7 +33,7 @@ DATASET_INFO = {
         'batch_size': 512,
         'train_steps': 60,
         'train_traj_num': 8192,
-        'sigma_ens': 1,
+        'sigma_ens': 1e-1,
         'sigma_v': 1e-2,
         'colorbar_range': None,
     },
