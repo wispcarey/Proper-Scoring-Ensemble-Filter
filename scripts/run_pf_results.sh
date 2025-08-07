@@ -15,7 +15,7 @@ echo "Python: $(which python)"
 echo "----------------------------------------------------"
 
 SEEDS=(42)
-PARTICLE_NUMBERS=(500000)
+PARTICLE_NUMBERS=(1000000)
 
 for seed_val in "${SEEDS[@]}"; do
     for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
@@ -25,14 +25,15 @@ for seed_val in "${SEEDS[@]}"; do
         echo "============================================================"
         
         python gen_pf_results.py \
-            --dataset rossler \
+            --dataset lorenz96 \
             --sigma_y 1 \
             --seed "$seed_val" \
             --normal_output \
             --test_steps 500 \
             --pf_verification \
             --pf_N "$pf_n_val" \
-            --sigma_reg None
+            --sigma_reg None \
+            --pf_save_figure
 
         echo "Done."
         echo ""

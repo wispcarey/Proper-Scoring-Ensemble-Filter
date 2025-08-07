@@ -594,7 +594,8 @@ def plot_and_test_point_clouds(
         history_traj = history_traj.cpu()
 
     B, N, D = tensor.shape
-    assert D == 3, "Input tensor must be of shape (B, N, 3)"
+    assert D >= 3, f"Input tensor must have at least 3 dimensions, but found shape {tensor.shape}"
+    tensor = tensor[..., :3]
     
     if history_traj is not None:
         T_h, B_h, D_h = history_traj.shape

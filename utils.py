@@ -569,6 +569,9 @@ def get_dataloader(args, x0=None, test_only=False):
         return train_loader, test_loader
     else:
         t = torch.arange(0, args.train_steps * args.train_traj_num * args.dt, args.dt)
+        prefix = f"{args.sigma_v}_{args.train_steps}_{args.train_traj_num}_{args.trail}"
+        if args.dataset in ["lorenz96", "ks"]:
+            prefix = f"{args.ori_dim}_" + prefix
         gen_trajs = gen_data(args.dataset, t, v0=x0, sigma_v=args.sigma_v,
                                                         steps_test=args.test_steps * args.test_traj_num,
                                                         steps_valid=args.valid_steps,
@@ -576,7 +579,7 @@ def get_dataloader(args, x0=None, test_only=False):
                                                         check_disk=args.new_data,
                                                         steps_burn=args.burn_steps,
                                                         dt_iter=args.dt_iter,
-                                                        prefix=f"{args.sigma_v}_{args.train_steps}_{args.train_traj_num}_{args.trail}",
+                                                        prefix=prefix,
                                                         test_only=test_only
                                                         )
         if test_only:
