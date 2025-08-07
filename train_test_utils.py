@@ -560,11 +560,13 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                     H.transpose(1,0), 
                     # H_fun,
                     args.sigma_y,
-                    resampling_method="multinomial", 
+                    resampling_method="systematic", 
                     sigma_reg=args.sigma_reg,
                     max_chunk_size=1000000,
                     resample_on_cpu=False,
                 )
+                
+                pf_ens_v_a = torch.clamp(pf_ens_v_a, min=-args.clamp, max=args.clamp)
                 
                 # if (i + 1) % 250 == 0:
                 # if i < 600:
@@ -920,6 +922,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         forward_fun = L63.forward
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+    elif args.dataset == 'rossler':
+        forward_fun = Rossler.forward
     elif args.dataset == "circle":
         forward_fun = CircleODE.forward
     elif args.dataset == "Hdoublewell":

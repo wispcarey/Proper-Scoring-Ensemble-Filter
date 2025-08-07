@@ -44,8 +44,6 @@ for N in 5 10 15 20 40 60 100; do
             --seed "$seed" \
             --v "$method" \
             --no_localization \
-            --normal_output \
-            --pf_verification \
-            --pf_N 1000000
+            --normal_output 
     done
 done
