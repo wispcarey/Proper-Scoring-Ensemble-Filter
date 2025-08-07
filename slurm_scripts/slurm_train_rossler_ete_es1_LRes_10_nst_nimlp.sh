@@ -38,5 +38,6 @@ python train.py \
    --no_running_loss \
    --noise_st_input \
    --mlp_y_type noise_innov \
-   --suffix _nst_nimlp
+   --suffix _nst_nimlp \
+   --lr_decay_epochs 300,500,700
 

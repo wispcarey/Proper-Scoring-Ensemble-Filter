@@ -37,5 +37,6 @@ python train.py \
    --test_steps 500 \
    --no_running_loss \
    --noise_st_input \
-   --suffix _nst
+   --suffix _nst \
+   --lr_decay_epochs 300,500,700
 

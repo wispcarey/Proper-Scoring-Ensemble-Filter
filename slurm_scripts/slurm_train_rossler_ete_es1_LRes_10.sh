@@ -35,6 +35,7 @@ python train.py \
    --loss_type es \
    --es_p 1 \
    --test_steps 500 \
-   --no_running_loss 
+   --no_running_loss \
+   --lr_decay_epochs 300,500,700
 
 
