@@ -444,7 +444,7 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     scheduler.step()
     return losses.avg
 
-def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calculate_crps=True):
+def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calculate_crps=True, save_figure=False):
     """
     Runs a particle filter, saves results (means, covariances) to a cache file,
     and computes performance metrics (RMSE, optional CRPS).
@@ -569,16 +569,18 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                 pf_ens_v_a = torch.clamp(pf_ens_v_a, min=-args.clamp, max=args.clamp)
                 
                 # if (i + 1) % 250 == 0:
-                # if i < 600:
-                #     prefix = f'save/pf_vis/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_timestep{i+1}_{args.seed}'
-                #     plot_and_test_point_clouds(args,
-                #                             pf_ens_v_a, 
-                #                             num_samples_plot=100000, 
-                #                             num_samples_test=10000, 
-                #                             prefix=prefix, 
-                #                             num_repeats=1, 
-                #                             plot_indices=[0, 1],
-                #                             history_traj=batch_v[1:i+2],)
+                if i < 600 and save_figure:
+                    save_folder = f'save/{args.dataset}_pf_vis'
+                    prefix = f'{save_folder}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_timestep{i+1}_{args.seed}'
+                    os.makedirs(save_folder, exist_ok=True)
+                    plot_and_test_point_clouds(args,
+                                            pf_ens_v_a, 
+                                            num_samples_plot=100000, 
+                                            num_samples_test=10000, 
+                                            prefix=prefix, 
+                                            num_repeats=10, 
+                                            plot_indices=[0, 1],
+                                            history_traj=batch_v[1:i+2],)
 
                 # Store results for caching and metrics
                 pf_mean_a = torch.mean(pf_ens_v_a, dim=1)
