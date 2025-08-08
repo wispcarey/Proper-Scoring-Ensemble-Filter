@@ -7,7 +7,7 @@ dataset="lorenz63"
 
 sigma_y=1
 seed=42
-save_dir="lorenz63_EtE_LRes/2025-08-07_11-00lorenz63_1.0_20_60_8192_nl2_joint_EtE-LRes_tuned"
+save_dir="lorenz63_EtE_LRes/2025-08-07_15-37lorenz63_1.0_20_60_8192_nl2_joint_EtE-LRes_nst_tuned"
 
 # sigma_y = $sigma_y, EnST
 for N in 5 10 15 20 40 60 100; do

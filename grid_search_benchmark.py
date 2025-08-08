@@ -35,9 +35,9 @@ if __name__ == "__main__":
         infl_range = np.linspace(1.0, 1.15, 16)  
         
         # Determine if localization is needed based on the filter method
-        needs_localization = args.v == "LETKF" or (args.v.startswith('iEnKS') and args.dataset != 'lorenz63' and args.dataset != 'rossler')
+        needs_localization = args.v == "LETKF" or ((args.v.startswith('iEnKS') or args.v == "EnKF") and args.dataset != 'lorenz63' and args.dataset != 'rossler')
         if needs_localization:
-            loc_radius_range = np.arange(2.0, 10.5, 0.5) # Search from 2 to 10 with step 0.5
+            loc_radius_range = np.array([0.001, 1.0, 2.0, 3.0])
         else:
             loc_radius_range = [None] # For methods without localization like EnKF
 

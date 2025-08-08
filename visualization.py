@@ -650,8 +650,16 @@ def plot_and_test_point_clouds(
 
         # --- Plot 2: Fixed Axes (Conditional on dataset) ---
         if args.dataset == 'lorenz63':
-            lorenz_limits = {'xlim': (-25, 25), 'ylim': (-35, 35), 'zlim': (0, 60)}
-            fixed_title = rf"Lorenz 63: $\Delta t$ = {args.dt}, time step = {len(history_traj)}, T = {round(args.dt*len(history_traj)*100)/100:.2f}" 
+            _limits = {'xlim': (-25, 25), 'ylim': (-35, 35), 'zlim': (0, 60)}
+        elif args.dataset == 'rossler':
+            _limits = {'xlim': (-15, 15), 'ylim': (-15, 15), 'zlim': (0, 30)}
+        elif args.dataset == 'lorenz96':
+            _limits = {'xlim': (-10, 10), 'ylim': (-10, 10), 'zlim': (-10, 10)}
+        else:
+            _limits = None
+            
+        if _limits is not None:
+            fixed_title = rf"{args.dataset}: $\Delta t$ = {args.dt}, time step = {len(history_traj)}, T = {round(args.dt*len(history_traj)*100)/100:.2f}" 
             
             fig_fixed = plt.figure(figsize=(8, 8))
             ax_fixed = fig_fixed.add_subplot(111, projection='3d')
@@ -663,41 +671,13 @@ def plot_and_test_point_clouds(
 
             ax_fixed.set_xlabel("X-axis"); ax_fixed.set_ylabel("Y-axis"); ax_fixed.set_zlabel("Z-axis")
             ax_fixed.set_title(fixed_title, fontsize=12)
-            ax_fixed.set_xlim(lorenz_limits['xlim']); ax_fixed.set_ylim(lorenz_limits['ylim']); ax_fixed.set_zlim(lorenz_limits['zlim'])
+            ax_fixed.set_xlim(_limits['xlim']); ax_fixed.set_ylim(_limits['ylim']); ax_fixed.set_zlim(_limits['zlim'])
             ax_fixed.legend()
             fig_fixed.savefig(f"{prefix}_{i}_fixed.png", bbox_inches='tight', dpi=150)
             plt.close(fig_fixed)
-        if args.dataset == 'rossler':
-            # Define plot limits and title for the Rössler system
-            rossler_limits = {'xlim': (-15, 15), 'ylim': (-15, 15), 'zlim': (0, 30)}
-            fixed_title = rf"Rössler: $\Delta t$ = {args.dt}, time step = {len(history_traj)}, T = {round(args.dt*len(history_traj)*100)/100:.2f}" 
-            
-            # Create figure and 3D axes
-            fig_fixed = plt.figure(figsize=(8, 8))
-            ax_fixed = fig_fixed.add_subplot(111, projection='3d')
-            
-            # Plot the particle filter's distribution
-            ax_fixed.scatter(points_to_plot[:, 0], points_to_plot[:, 1], points_to_plot[:, 2], s=5, alpha=0.7, label='filtering distribution')
-            
-            # Plot the historical trajectory if it exists
-            if history_traj is not None:
-                traj_to_plot = history_traj[:, i, :].numpy()
-                ax_fixed.plot(traj_to_plot[:, 0], traj_to_plot[:, 1], traj_to_plot[:, 2], color='red', linewidth=1.5, label='History')
-            
-            ax_fixed.set_xlabel("X-axis")
-            ax_fixed.set_ylabel("Y-axis")
-            ax_fixed.set_zlabel("Z-axis")
-            ax_fixed.set_title(fixed_title, fontsize=12)
-            ax_fixed.set_xlim(rossler_limits['xlim'])
-            ax_fixed.set_ylim(rossler_limits['ylim'])
-            ax_fixed.set_zlim(rossler_limits['zlim'])
-            ax_fixed.legend()
-            
-            # Save the figure and close the plot to free memory
-            fig_fixed.savefig(f"{prefix}_{i}_fixed.png", bbox_inches='tight', dpi=150)
-            plt.close(fig_fixed)
+        
 
     # --- Final Print Statement ---
     num_processed = len(indices_to_process) if isinstance(indices_to_process, list) else B
-    plot_types_str = "2 plots (adaptive/fixed)" if args.dataset == 'lorenz63' else "1 plot (adaptive)"
+    plot_types_str = "2 plots (adaptive/fixed)" if _limits is not None else "1 plot (adaptive)"
     print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")

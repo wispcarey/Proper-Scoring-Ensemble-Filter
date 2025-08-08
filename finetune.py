@@ -37,7 +37,7 @@ if __name__ == "__main__":
 
 
         ##################### fine-tuning on different N
-        N_list = [60,100]
+        N_list = [5,10,15,20,40,60,100]
         # N_list = [20, 40]
         ori_batch_size = args.batch_size
 

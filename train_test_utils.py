@@ -1021,14 +1021,14 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 }
                 
                 if args.v == 'EnKF':
-                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
                     ens_v_a, _ = ensemble_kalman_filter_analysis(
                         ens_v_f, **common_enkf_args, method='EnKF-PertObs',
                         localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
                 elif args.v == 'ESRF':
-                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius, dim1=D_state, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
-                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius, dim1=d_obs_shape, dim2=d_obs_shape, device=args.device).unsqueeze(0) if loc_radius is not None else None
+                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
                     ens_v_a, _ = ensemble_kalman_filter_analysis(
                         ens_v_f, **common_enkf_args, method='ESRF',
                         localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
@@ -1064,9 +1064,6 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                         ienks_wtol=1e-5,
                         model_args=model_args_ienks
                     )
-                    if torch.isnan(E_smoothed_at_start).all():
-                        print(i)
-                        raise ValueError
 
                     ens_v_a_forecast_input = E_smoothed_at_start.clone().view(-1, args.ori_dim)
                     for j_iter in range(args.dt_iter):
