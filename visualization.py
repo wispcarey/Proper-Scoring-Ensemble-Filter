@@ -654,7 +654,7 @@ def plot_and_test_point_clouds(
         elif args.dataset == 'rossler':
             _limits = {'xlim': (-15, 15), 'ylim': (-15, 15), 'zlim': (0, 30)}
         elif args.dataset == 'lorenz96':
-            _limits = {'xlim': (-10, 10), 'ylim': (-10, 10), 'zlim': (-10, 10)}
+            _limits = {'xlim': (-13, 13), 'ylim': (-13, 13), 'zlim': (-13, 13)}
         else:
             _limits = None
             

@@ -578,7 +578,7 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                                             num_samples_plot=100000, 
                                             num_samples_test=10000, 
                                             prefix=prefix, 
-                                            num_repeats=10, 
+                                            num_repeats=1, 
                                             plot_indices=[0, 1],
                                             history_traj=batch_v[1:i+2],)
 
