@@ -7,7 +7,7 @@ dataset="rossler"
 
 sigma_y=1
 seed=42
-save_dir="rossler_EtE_LRes/2025-08-07_16-44rossler_1.0_10_60_8192_es_joint_EtE-LRes"
+save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes"
 
 # sigma_y = $sigma_y, EnST
 for N in 5 10 15 20 40 60 100; do
@@ -20,7 +20,7 @@ for N in 5 10 15 20 40 60 100; do
         --no_localization \
         --cp_load_path save/${save_dir}/cp_1000.pth \
         --pf_verification \
-        --pf_N 10000 \
+        --pf_N 500000 \
         --sigma_reg None 
 done
 
@@ -28,7 +28,7 @@ dataset="rossler"
 
 sigma_y=1
 seed=42
-save_dir="rossler_EtE_LRes/2025-08-07_16-44rossler_1.0_10_60_8192_es_joint_EtE-LRes_nst"
+save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes_nst"
 
 # sigma_y = $sigma_y, EnST
 for N in 5 10 15 20 40 60 100; do
@@ -41,7 +41,7 @@ for N in 5 10 15 20 40 60 100; do
         --no_localization \
         --cp_load_path save/${save_dir}/cp_1000.pth \
         --pf_verification \
-        --pf_N 10000 \
+        --pf_N 100000 \
         --sigma_reg None 
 done
 

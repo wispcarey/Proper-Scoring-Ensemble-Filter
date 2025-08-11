@@ -22,7 +22,7 @@ for N in 5 10 15 20 40 60 100; do
             --no_localization \
             --normal_output \
             --pf_verification \
-            --pf_N 1000000
+            --pf_N 100000
     done
 done
 

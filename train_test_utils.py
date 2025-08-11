@@ -562,7 +562,7 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                     args.sigma_y,
                     resampling_method="systematic", 
                     sigma_reg=args.sigma_reg,
-                    max_chunk_size=500000,
+                    max_chunk_size=1000000,
                     resample_on_cpu=False,
                 )
                 
