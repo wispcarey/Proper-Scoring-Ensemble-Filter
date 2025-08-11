@@ -560,7 +560,7 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                     H.transpose(1,0), 
                     # H_fun,
                     args.sigma_y,
-                    resampling_method="systematic", 
+                    resampling_method="multinomial", 
                     sigma_reg=args.sigma_reg,
                     max_chunk_size=1000000,
                     resample_on_cpu=False,
@@ -578,7 +578,7 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
                                             num_samples_plot=100000, 
                                             num_samples_test=10000, 
                                             prefix=prefix, 
-                                            num_repeats=1, 
+                                            num_repeats=10, 
                                             plot_indices=[0, 1],
                                             history_traj=batch_v[1:i+2],)
 
@@ -709,6 +709,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'pf_rmse': torch.empty(0, device=args.device),
+        'pf_rrmse': torch.empty(0, device=args.device),
     }
     loc_tensor_all_batches = None
 
@@ -763,11 +764,16 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
                     our_method_mean_a = torch.mean(ens_v_a, dim=1)
                     pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))
+                    if args.dataset == 'rossler':
+                        pf_rmse[batch_v[i + 1, :, 2] <= 5] = float('nan')
                     pf_rmse_list.append(pf_rmse)
                     
                     cov_ens_a = get_ens_cov(ens_v_a)
                     cov_diff = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1)) 
                     rcov_diff = cov_diff / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    if args.dataset == 'rossler':
+                        cov_diff[batch_v[i + 1, :, 2] <= 5] = float('nan')
+                        rcov_diff[batch_v[i + 1, :, 2] <= 5] = float('nan')
                     cov_diff_list.append(cov_diff)
                     rcov_diff_list.append(rcov_diff)
 
@@ -786,9 +792,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
             if args.pf_verification:
-                all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
-                all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
-                all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
+                all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).nanmean(0)))
+                all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).nanmean(0)))
+                all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).nanmean(0)))
+                all_results['pf_rrmse'] = torch.cat((all_results['pf_rrmse'], torch.stack(pf_rmse_list).nanmean(0) / rms_val))
             
             if args.v != "EtE" and not args.no_localization and loc_records:
                 current_loc_tensor = torch.stack(loc_records).unsqueeze(0)
@@ -848,7 +855,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
                         'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
                         'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
-                        'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+                        'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                        'mean_pf_rrmse', 'std_pf_rrmse']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
@@ -859,7 +867,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
                             'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
                             'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
-                            'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+                            'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                            'mean_pf_rrmse', 'std_pf_rrmse']
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
         else:
@@ -873,6 +882,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
                 final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
+                final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
     final_loc_tensor_to_return = loc_tensor_all_batches[0] if loc_tensor_all_batches is not None and loc_tensor_all_batches.shape[0] > 0 else torch.empty(1, device=args.device)
     final_metrics['loc_tensor'] = final_loc_tensor_to_return
@@ -896,6 +906,8 @@ def print_test_results(results):
         print(f"RCov-Diff: {results['mean_rcov_diff']:.3f} ± {results['std_rcov_diff']:.3f}")
     if 'mean_pf_rmse' in results and 'std_pf_rmse' in results:
         print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
+    if 'mean_pf_rrmse' in results and 'std_pf_rrmse' in results:
+        print(f"PF-RRMSE: {results['mean_pf_rrmse']:.3f} ± {results['std_pf_rrmse']:.3f}")
     if 'no_nan_percent' in results:
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
 
@@ -974,6 +986,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'pf_rmse': torch.empty(0, device=args.device),
+        'pf_rrmse': torch.empty(0, device=args.device),
     }
 
     with torch.no_grad():
@@ -1110,7 +1123,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
                 all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
-            
+                all_results['pf_rrmse'] = torch.cat((all_results['pf_rrmse'], torch.stack(pf_rmse_list).nanmean(0) / rms_val))
+                
             obs_tensor = torch.stack(obs_y_list).squeeze(2)
             observations = torch.full_like(batch_v, float('nan'), device=args.device)
             if hasattr(args, 'obs_inds') and args.obs_inds is not None:
@@ -1150,7 +1164,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
                         'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
-                        'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+                        'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                        'mean_pf_rrmse', 'std_pf_rrmse']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
@@ -1160,7 +1175,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         if not valid_B_mask.any():
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
                             'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
-                            'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse']
+                            'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                            'mean_pf_rrmse', 'std_pf_rrmse']
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
         else:
@@ -1174,6 +1190,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
                 final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
+                final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
     return final_metrics
 

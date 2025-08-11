@@ -35,6 +35,5 @@ python train.py \
    --es_p 1 \
    --test_steps 500 \
    --no_running_loss \
-   --noise_st_input \
-   --suffix _nst_low
+   --suffix _low
 

@@ -90,6 +90,7 @@ if __name__ == "__main__":
         # print(f"RRMSE from DAPPER: {rrmse_dapper:.3f}.")
         # print(f"Inflation: {infl}; Localization Radius: {loc_radius}")
         infl, loc_radius, mean_crps = get_benchmarks(args)
+        print(f"Inflation: {infl}; Localization Radius: {loc_radius}")
         print(f"Recorded CRPS from Grid Search: {mean_crps:.3f}.")
         
         # test
@@ -99,11 +100,12 @@ if __name__ == "__main__":
             test_ClassicFilter(test_loader, 
                             args, 
                             H_info=H_info, 
-                            plot_figures=True, 
-                            fig_name=f'{folder_name}/test_{args.N}', 
+                            plot_figures=False, 
+                            # fig_name=f'{folder_name}/test_{args.N}', 
                             infl=infl, 
                             loc_radius=loc_radius, 
-                            save_pdf=True)
+                            # save_pdf=True
+                            )
         print_test_results(test_results)
 
             

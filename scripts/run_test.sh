@@ -2,48 +2,49 @@
 
 cd ..
 
-# Rossler
-dataset="rossler"
+# # Rossler
+# dataset="rossler"
 
-sigma_y=1
-seed=42
-save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes"
+# sigma_y=1
+# seed=42
+# save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes"
 
-# sigma_y = $sigma_y, EnST
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-        --v EtE-LRes \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth \
-        --pf_verification \
-        --pf_N 500000 \
-        --sigma_reg None 
-done
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v EtE-LRes \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 100000 \
+#         --sigma_reg None \
+#         --normal_output
+# done
 
-dataset="rossler"
+# dataset="rossler"
 
-sigma_y=1
-seed=42
-save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes_nst"
+# sigma_y=1
+# seed=42
+# save_dir="rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes_nst"
 
-# sigma_y = $sigma_y, EnST
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-        --v EtE-LRes \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth \
-        --pf_verification \
-        --pf_N 100000 \
-        --sigma_reg None 
-done
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v EtE-LRes \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 100000 \
+#         --sigma_reg None 
+# done
 
 # # lorenz 63
 # dataset="lorenz63"
@@ -82,22 +83,22 @@ done
 #         --cp_load_path save/${save_dir}/cp_1000.pth
 # done
 
-# # lorenz 96
-# dataset="lorenz96"
+# lorenz 96
+dataset="lorenz96"
 
-# sigma_y=1
-# seed=42
-# save_dir="2025-04-10_09-31lorenz96_1.0_10_60_8192_norm_EnST_joint"
+sigma_y=1
+seed=42
+save_dir="2025-04-10_09-31lorenz96_1.0_10_60_8192_norm_EnST_joint"
 
-# # sigma_y = $sigma_y, EnST
-# for N in 5 10 15 20 40 60 100; do
-#     python evaluate.py \
-#         --dataset $dataset \
-#         --N $N \
-#         --sigma_y $sigma_y \
-#         --seed $seed \
-#         --cp_load_path save/${save_dir}/cp_1000.pth
-# done
+# sigma_y = $sigma_y, EnST
+for N in 5 10 15 20 40 60 100; do
+    python evaluate.py \
+        --dataset $dataset \
+        --N $N \
+        --sigma_y $sigma_y \
+        --seed $seed \
+        --cp_load_path save/${save_dir}/cp_1000.pth
+done
 
 # sigma_y=0.7
 # seed=42
