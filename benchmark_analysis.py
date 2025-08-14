@@ -194,17 +194,34 @@ def bootstrap_particle_filter_analysis(
         else:
             raise TypeError("observation_operator must be a callable or a torch.Tensor")
             
-        max_log_w = torch.max(log_weights, dim=1, keepdim=True)[0]
-        weights_unnormalized = torch.exp(log_weights - max_log_w)
-        sum_weights = torch.sum(weights_unnormalized, dim=1, keepdim=True)
-        
-        uniform_dist = torch.full((N_particles,), 1.0 / N_particles, device=device, dtype=compute_dtype)
-        weights = uniform_dist.unsqueeze(0).expand(batch_size, -1).clone()
+        # print("\n--- [Method 1] Manual Calculation Diagnostics ---")
+        # max_log_w = torch.max(log_weights, dim=1, keepdim=True)[0]
+        # weights_unnormalized = torch.exp(log_weights - max_log_w)
+        # sum_weights = torch.sum(weights_unnormalized, dim=1, keepdim=True)
 
-        good_batches_mask = (sum_weights > 1e-6).squeeze(-1)
-        if good_batches_mask.any():
-            normalized_w_good = weights_unnormalized[good_batches_mask] / sum_weights[good_batches_mask]
-            weights[good_batches_mask] = normalized_w_good
+        # # This is the key value that underflows to zero when N is large.
+        # # Let's check its average and minimum value across the batch.
+        # print(f"Manual 'sum_weights' (mean): {sum_weights.mean().item():.4e}")
+        # print(f"Manual 'sum_weights' (min):  {sum_weights.min().item():.4e}")
+
+        # # Your original logic with a fallback to uniform distribution
+        # weights_manual = torch.full((batch_size, N_particles), 1.0 / N_particles, device=device, dtype=compute_dtype)
+        # good_batches_mask = (sum_weights.squeeze(-1) > 1e-6)
+        # num_bad_batches = batch_size - torch.sum(good_batches_mask)
+
+        # # This tells you how many batches failed the underflow check
+        # print(f"Batches failing safety check (sum < 1e-6): {num_bad_batches.item()} / {batch_size}")
+
+        # if good_batches_mask.any():
+        #     normalized_w_good = weights_unnormalized[good_batches_mask] / sum_weights[good_batches_mask]
+        #     weights_manual[good_batches_mask] = normalized_w_good
+
+
+        # # --- Method 2: Log-Sum-Exp Calculation (The recommended, stable method) ---
+        # print("\n--- [Method 2] LogSumExp Calculation Diagnostics ---")
+        log_sum_w = torch.logsumexp(log_weights, dim=1, keepdim=True)
+        weights = torch.exp(log_weights - log_sum_w)
+
     else:
         weights = torch.full((batch_size, N_particles), 1.0 / N_particles, device=device, dtype=compute_dtype)
 

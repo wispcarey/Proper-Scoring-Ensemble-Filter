@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.nn as nn
+import time
 
 from config.cli import get_parameters
 
@@ -47,8 +48,11 @@ if __name__ == "__main__":
 
         # test
         print("Test NN Results")
+        t_start = time.time()
         test_results = test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/ft_test_{args.N}_0', save_pdf=False)
         print_test_results(test_results)
+        t_inference = time.time() - t_start
+        print(f"Inference finished with time {t_inference: .2f}s.")
         
         loc_tensor= test_results['loc_tensor']
         if args.no_localization:
@@ -78,6 +82,7 @@ if __name__ == "__main__":
             },
             'cp_load_path': getattr(args, 'cp_load_path', None),
             'sigma_y': getattr(args, 'sigma_y', None),
+            'time': t_inference,
         }
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])

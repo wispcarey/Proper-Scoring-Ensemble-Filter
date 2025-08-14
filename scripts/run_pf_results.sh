@@ -25,15 +25,14 @@ for seed_val in "${SEEDS[@]}"; do
         echo "============================================================"
         
         python gen_pf_results.py \
-            --dataset lorenz96 \
+            --dataset rossler \
             --sigma_y 1 \
             --seed "$seed_val" \
             --normal_output \
             --test_steps 500 \
             --pf_verification \
             --pf_N "$pf_n_val" \
-            --sigma_reg None \
-            --pf_save_figure
+            --sigma_reg None 
         
         echo "Done."
         echo ""

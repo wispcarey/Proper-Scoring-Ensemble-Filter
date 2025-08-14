@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+import time
 
 from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
@@ -55,6 +56,7 @@ if __name__ == "__main__":
         metrics_to_track = ['mean_crps', 'mean_rmse', 'mean_rrmse', 'mean_rmv', 'valid_percent']
         results_grid = {metric: np.full((num_infl, num_loc), np.nan) for metric in metrics_to_track}
 
+        t_start = time.time()
         # --- Perform Grid Search ---
         for i, infl in enumerate(infl_range):
             for j, loc_radius in enumerate(loc_radius_range):
@@ -76,6 +78,8 @@ if __name__ == "__main__":
                 
                 print(f" > Results: mean_crps={results_grid['mean_crps'][i, j]:.4f}, mean_rmse={results_grid['mean_rmse'][i, j]:.4f}")
 
+        t_grid_search = time.time() - t_start
+        print(f"Grid search finished with time {t_grid_search: .2f}s.")
         # --- Find and Print Optimal Parameters based on Mean CRPS ---
         best_crps_val = np.nanmin(results_grid['mean_crps'])
         
@@ -119,7 +123,8 @@ if __name__ == "__main__":
             'loc_radius_range': loc_radius_range,
             'results_grid': results_grid,
             'best_params': best_params_dict,
-            'args': vars(args)
+            'args': vars(args),
+            'time': t_grid_search,
         }
         
         # Save results as a PyTorch tensor file

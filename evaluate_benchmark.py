@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+import time
 
 from config.cli import get_parameters
 
@@ -95,6 +96,7 @@ if __name__ == "__main__":
         
         # test
         print(f"Test {args.v} Results")
+        t_start = time.time()
         loss_list_nn = []
         test_results = \
             test_ClassicFilter(test_loader, 
@@ -107,6 +109,8 @@ if __name__ == "__main__":
                             # save_pdf=True
                             )
         print_test_results(test_results)
+        t_inference = time.time() - t_start
+        print(f"Inference finished with time {t_inference: .2f}s.")
 
             
         # save results
@@ -129,6 +133,7 @@ if __name__ == "__main__":
             },
             'cp_load_path': getattr(args, 'cp_load_path', None),
             'sigma_y': getattr(args, 'sigma_y', None),
+            'time': t_inference,
         }
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
