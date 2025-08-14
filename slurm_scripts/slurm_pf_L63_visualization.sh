@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
-#SBATCH -J "bpf-rossl-visvis"   # job name
+#SBATCH -J "bpf-lorenz63-vis"   # job name
 #SBATCH --mail-user=bhchen@caltech.edu # email address
 #SBATCH --mail-type=BEGIN   # email notification at start
 #SBATCH --mail-type=END     # email notification at end
