@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
-#SBATCH -J "bpf-L96_visualization"   # job name
+#SBATCH -J "bpf-rossl-visvis"   # job name
 #SBATCH --mail-user=bhchen@caltech.edu # email address
 #SBATCH --mail-type=BEGIN   # email notification at start
 #SBATCH --mail-type=END     # email notification at end
@@ -40,7 +40,7 @@ for seed_val in "${SEEDS[@]}"; do
         echo "============================================================"
         
         python gen_pf_results.py \
-            --dataset lorenz96 \
+            --dataset lorenz63 \
             --sigma_y 1 \
             --seed "$seed_val" \
             --normal_output \

@@ -4,8 +4,7 @@
 
 #SBATCH --time=1-00:00:00     # walltime (1 days)
 #SBATCH --nodes=1           # number of nodes (1 node)
-#SBATCH --gres=gpu:v100:1
-#SBATCH --constraint="cascadelake"
+#SBATCH --gres=gpu:1
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
 #SBATCH -J "bpf-rossl-visvis"   # job name
@@ -31,7 +30,7 @@ echo "Python: $(which python)"
 echo "----------------------------------------------------"
 
 SEEDS=(42)
-PARTICLE_NUMBERS=(1000000)
+PARTICLE_NUMBERS=(100000)
 
 for seed_val in "${SEEDS[@]}"; do
     for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
