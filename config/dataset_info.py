@@ -77,13 +77,13 @@ DATASET_INFO = {
         'colorbar_range': (-6,6)
     },
     'linear': {
-        'dim': 10,
-        'obs_dim': 5,
-        'test_steps': 100,
+        'dim': 2,
+        'obs_dim': 1,
+        'test_steps': 500,
         'test_traj_num': 64,
-        'hidden_dim': 64,
+        'hidden_dim': 32,
         'learning_rate': 1e-3, 
-        'batch_size': 512,
+        'batch_size': 1024,
         'train_steps': 60,
         'train_traj_num': 8192,
         'sigma_ens': 1,

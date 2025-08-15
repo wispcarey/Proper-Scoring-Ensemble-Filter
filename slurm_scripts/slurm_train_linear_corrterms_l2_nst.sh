@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1        # 4 GPUs of any type
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
-#SBATCH -J "Linear-checkcorr-nst"   # job name
+#SBATCH -J "Linear-corrterms-l2-nst"   # job name
 #SBATCH --mail-user=bhchen@caltech.edu # email address
 #SBATCH --mail-type=BEGIN   # email notification at start
 #SBATCH --mail-type=END     # email notification at end
@@ -31,11 +31,8 @@ python train_v2.py \
     --seed 42 \
     --v CorrTerms \
     --no_localization \
-    --loss_type es \
-    --es_p 1 \
-    --weight_decay 1e-2 \
-    --noise_st_input \
-    --suffix _nst \
+    --loss_type l2 \
+    --weight_decay 1e-3 \
     --no_running_loss
 
 

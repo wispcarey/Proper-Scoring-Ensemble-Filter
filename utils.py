@@ -528,7 +528,6 @@ def get_dataloader(args, x0=None, test_only=False):
         print("\nEigenvalues of A:")
         print(eigenvalues)
         
-        
         H = torch.zeros(args.obs_dim, args.ori_dim)
         for i in range(args.obs_dim):
             H[i, 2*i] = 1
