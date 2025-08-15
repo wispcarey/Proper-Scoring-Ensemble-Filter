@@ -3,33 +3,38 @@
 cd ..
 
 # # Lorenz 63
-python finetune.py \
-    --epochs 20 \
-    --save_epoch 20 \
-    --dataset lorenz63 \
-    --train_steps 60 \
-    --train_traj_num 8192 \
-    --sigma_y 1 \
-    --seed 42 \
-    --v EtE-LRes \
-    --learning_rate 1e-4 \
-    --cp_load_path save/EtE-LinearCheck/2025-07-09_19-08lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst/cp_1000.pth \
-    --no_running_loss \
-    --no_localization \
-    --noise_st_input \
-    --suffix _nst
-
 # python finetune.py \
 #     --epochs 20 \
 #     --save_epoch 20 \
 #     --dataset lorenz63 \
 #     --train_steps 60 \
 #     --train_traj_num 8192 \
-#     --sigma_y 0.7 \
+#     --sigma_y 1 \
 #     --seed 42 \
+#     --v EtE-LRes \
 #     --learning_rate 1e-4 \
-#     --cp_load_path save/2025-04-10_19-40lorenz63_0.7_10_60_8192_norm_EnST_joint/cp_1000.pth \
-#     --no_localization 
+#     --cp_load_path save/EtE-LinearCheck/2025-07-09_19-08lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst/cp_1000.pth \
+#     --no_running_loss \
+#     --no_localization \
+#     --noise_st_input \
+#     --suffix _nst
+
+# Lorenz 63
+python finetune.py \
+    --epochs 20 \
+    --save_epoch 20 \
+    --dataset rossler \
+    --train_steps 60 \
+    --train_traj_num 8192 \
+    --sigma_y 1 \
+    --seed 42 \
+    --v EtE-LRes \
+    --learning_rate 1e-4 \
+    --cp_load_path save/rossler_EtE_LRes/2025-08-08_09-55rossler_1.0_10_60_8192_es_joint_EtE-LRes_nst/cp_1000.pth \
+    --no_running_loss \
+    --no_localization \
+    --noise_st_input \
+    --suffix _nst
 
 # # Lorenz 96
 # python finetune.py \
