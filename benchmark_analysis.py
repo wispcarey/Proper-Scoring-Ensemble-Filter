@@ -722,8 +722,9 @@ def _ienks_analysis(
             Y_eff = Y * R_inv_sqrt
             
             za = float(N1)
-            Tinv = torch.linalg.inv(T)
-            Y_iter = Tinv @ Y_eff
+            # Tinv = torch.linalg.inv(T)
+            # Y_iter = Tinv @ Y_eff
+            Y_iter = torch.linalg.solve(T, Y_eff)
             
             C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device).unsqueeze(0)
 
@@ -792,8 +793,9 @@ def _ienks_analysis(
                 Y_local_eff = Y_local * R_inv_sqrt * sqrt_rho_bcast
                 
                 za = float(N1)
-                Tinv_k = torch.linalg.inv(T_k)
-                Y_iter_local = Tinv_k @ Y_local_eff
+                # Tinv_k = torch.linalg.inv(T_k)
+                # Y_iter_local = Tinv_k @ Y_local_eff
+                Y_iter_local = torch.linalg.solve(T_k, Y_local_eff)
 
                 C_tilde = (Y_iter_local @ Y_iter_local.transpose(-2, -1)) + za*torch.eye(N, device=device)
                 eig_vals, U = robust_eigh(C_tilde)
@@ -922,7 +924,7 @@ def ensemble_kalman_filter_analysis(
     localization_domain=None,   # (D_coord,)
     # --- Parameters for iEnKS ---
     ienks_lag=1,
-    ienks_niter=10,
+    ienks_niter=5,
     ienks_wtol=1e-5,
     model_args=None             # Dict for model propagator info needed by iEnKS
 ):

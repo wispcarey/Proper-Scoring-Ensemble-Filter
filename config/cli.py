@@ -10,7 +10,19 @@ from .dataset_info import DATASET_INFO
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from localization import pairwise_distances
 
-
+def parse_obs_inds(value):
+    """
+    Parses a comma-separated string into a torch.Tensor, or returns 'default'.
+    Input: str (e.g., "0,2,4" or "default")
+    Output: torch.Tensor or "default"
+    """
+    if value == "default":
+        return "default"
+    try:
+        return torch.tensor([int(x) for x in value.split(',')])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value for obs_inds: {value}")
+    
 def float_or_random(value):
     try:
         return float(value)
@@ -90,6 +102,12 @@ def get_parameters():
                         help='noise std in the latent process (can be float or "none")')
     parser.add_argument('--sigma_y', type=float_or_none_or_default, default="default",
                         help='noise std in the observation (can be float or "none")')
+    parser.add_argument('--dim', type=int_or_default, default="default",
+                        help='System dimension (overrides dataset default)')
+    parser.add_argument('--obs_dim', type=int_or_default, default="default",
+                        help='Observation dimension (overrides dataset default)')
+    parser.add_argument('--obs_inds', type=parse_obs_inds, default="default",
+                        help='Observation indices, comma separated e.g., "0,2,4" (overrides dataset default)')
 
     # loss function
     parser.add_argument('--ignore_first', type=int, default=0,
@@ -269,9 +287,17 @@ def get_parameters():
     else:
         args.running_loss = True
 
-    args.ori_dim = dataset_config.get('dim')
-    args.obs_dim = dataset_config.get('obs_dim')
-    args.obs_inds = dataset_config.get('obs_inds')
+    if args.dim == 'default':
+        args.ori_dim = dataset_config.get('dim')
+    else:
+        args.ori_dim = args.dim
+
+    if args.obs_dim == 'default':
+        args.obs_dim = dataset_config.get('obs_dim')
+        
+    if isinstance(args.obs_inds, str) and args.obs_inds == 'default':
+        args.obs_inds = dataset_config.get('obs_inds')
+        
     args.clamp = dataset_config.get('clamp')
 
     if args.device == 'cuda':
@@ -287,6 +313,7 @@ def get_parameters():
             print(f"Do not Use DataParallel")
     else:
         print("Use CPU")
+        args.use_data_parallel = False
 
 
     if args.GPU_memory != 16 and args.batch_size is not None:

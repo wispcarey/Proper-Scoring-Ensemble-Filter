@@ -44,13 +44,13 @@ DATASET_METHODS = {
                 "iEnKF_PertObs", 
                 # "MLF",
                 ],
-    'lorenz96': ["EnKF_PertObs", 
+    'lorenz96': ["EnKF_loc", 
                 "EnKF_Sqrt", 
                 "LETKF", 
                 "iEnKF_PertObs", 
                 # "MLF",
                 ],
-    'ks': ["EnKF_PertObs", 
+    'ks': ["EnKF_loc", 
         "EnKF_Sqrt", 
         "LETKF", 
         "iEnKF_PertObs", 
@@ -135,7 +135,7 @@ def plot_with_type(x_inds, mean_values, std_values, key, args, ax=None, highligh
         line = ax.errorbar(
             x_inds, mean_values, yerr=std_values,
             linestyle='-', capsize=3, capthick=2, 
-            color=color, marker='D', markersize=args.marker_size,
+            color=color, marker='o', markersize=args.marker_size,
             linewidth=args.line_width, 
             alpha=alpha, label=label, 
         )
@@ -143,7 +143,7 @@ def plot_with_type(x_inds, mean_values, std_values, key, args, ax=None, highligh
         # Plot only the mean values
         line, = ax.plot(
             x_inds, mean_values,
-            linestyle='-', color=color, marker='D', markersize=args.marker_size,
+            linestyle='-', color=color, marker='o', markersize=args.marker_size,
             linewidth=args.line_width, alpha=alpha, label=label
         )
     elif args.plot_type == 'std':
@@ -158,7 +158,7 @@ def plot_with_type(x_inds, mean_values, std_values, key, args, ax=None, highligh
         line = ax.errorbar(
             x_inds, mean_values, yerr=std_values,
             linestyle='-', capsize=3, capthick=2, 
-            color=color, marker='D', markersize=args.marker_size,
+            color=color, marker='o', markersize=args.marker_size,
             linewidth=args.line_width, 
             alpha=alpha, label=label
         )
@@ -204,7 +204,7 @@ def get_benchmarks(args):
             method_name = 'IEnKF'
         elif method == 'EnKF_Sqrt':
             method_name = 'ESRF'
-        elif method == 'EnKF_PertObs':
+        elif method == 'EnKF_loc':
             method_name = 'EnKF'
         elif method == 'MLF':
             method_name = 'MLEF'
@@ -233,8 +233,8 @@ def save_legend(args):
             item_name = rf"$\mathbf{{{item}}}^*$"
         else:
             item_name = item
-        line, = ax.plot([], [], linestyle='-', color=COLOR_DICT[item], 
-                       marker='D', linewidth=args.line_width, alpha=0.75, label=item_name)
+        line, = ax.plot([], [], linestyle='-', color=COLOR_DICT[item], markersize=args.marker_size,
+                       marker='o', linewidth=args.line_width, alpha=0.75, label=item_name)
         lines.append(line)
     
     # Create horizontal legend
@@ -435,101 +435,131 @@ def plot_results_all(args):
             print("Image saved to", os.path.join('../save/figures', f"{args.dataset}_{save_figure_suffix[i]}.png"))
         plt.close()  
     
-    # Relative improvement plots - split into sigma_y=1.0 and sigma_y=0.7
-    # Plot for sigma_y=1.0
-    plt.figure(figsize=figsize)
 
-    # Calculate relative improvement for sigma_y=1.0
+    # =========================
+    # Relative improvement plots
+    # Now produce THREE figures:
+    #   (1) sigma_y = 1.0 only
+    #   (2) sigma_y = 0.7 only
+    #   (3) Combined (overlay 1.0 and 0.7)
+    # =========================
+    figsize = (10, 5)
+
+    # ---- Compute relative improvement arrays for sigma_y = 1.0 ----
     relative_imp_1_enkf = (other_results['EnKF'][0,:,2] - ours_best[0,:,2]) / other_results['EnKF'][0,:,2]
     relative_imp_1_ienkf = (other_results['IEnKF'][0,:,2] - ours_best[0,:,2]) / other_results['IEnKF'][0,:,2]
-    
-    # Plot relative improvement with consistent colors
+    min_val_1 = np.minimum(np.min(relative_imp_1_enkf), np.min(relative_imp_1_ienkf))
+    if args.dataset != 'lorenz63':
+        relative_imp_1_letkf = (other_results['LETKF'][0,:,2] - ours_best[0,:,2]) / other_results['LETKF'][0,:,2]
+        min_val_1 = np.minimum(min_val_1, np.min(relative_imp_1_letkf))
+    else:
+        relative_imp_1_letkf = None  # Not available
+
+    # ---- Plot sigma_y = 1.0 only ----
+    plt.figure(figsize=figsize)
     plt.plot(x_inds, relative_imp_1_enkf, linestyle='-', marker='o', markersize=args.marker_size, 
              linewidth=args.line_width, color=COLOR_DICT['EnKF'], label="EnKF")
     plt.plot(x_inds, relative_imp_1_ienkf, linestyle='-', marker='o', markersize=args.marker_size, 
              linewidth=args.line_width, color=COLOR_DICT['IEnKF'], label="IEnKF")
-    
-    min_val_1 = np.minimum(np.min(relative_imp_1_enkf), np.min(relative_imp_1_ienkf))
-    
-    if args.dataset != 'lorenz63':
-        relative_imp_1_letkf = (other_results['LETKF'][0,:,2] - ours_best[0,:,2]) / other_results['LETKF'][0,:,2]
+    if relative_imp_1_letkf is not None:
         plt.plot(x_inds, relative_imp_1_letkf, linestyle='-', marker='o', markersize=args.marker_size, 
                  linewidth=args.line_width, color=COLOR_DICT['LETKF'], label="LETKF")
-        min_val_1 = np.minimum(min_val_1, np.min(relative_imp_1_letkf))
 
-    # Remove legend and labels
-    # plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
-    # plt.xlabel("Ensemble Size")
-    # plt.ylabel("Relative Improvement (%)")
-
-    # Set x ticks
+    # Keep style consistent with existing figures (no legend text on plot)
     plt.xticks([5, 10, 15, 20, 40, 60, 100], fontsize=args.tick_fontsize)
-
-    # Set y axis to start at 0 and format as percentage
     plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
     plt.yticks(fontsize=args.tick_fontsize)
-
     if min_val_1 > 0:
         plt.gca().set_ylim(0, None)
-
-    # Add grid
     plt.grid(True)
     plt.tight_layout()
-
-    # Save the figure for sigma_y=1.0
-    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_1.0.pdf"), 
-                bbox_inches="tight", dpi=300)
-    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_1.0.png"), 
-                bbox_inches="tight", dpi=300)
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_1.0.pdf"), bbox_inches="tight", dpi=300)
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_1.0.png"), bbox_inches="tight", dpi=300)
     print("Image saved to", os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_1.0.png"))
     plt.close()
 
-    # Plot for sigma_y=0.7
-    plt.figure(figsize=figsize)
-
-    # Calculate relative improvement for sigma_y=0.7
+    # ---- Compute relative improvement arrays for sigma_y = 0.7 ----
     relative_imp_07_enkf = (other_results['EnKF'][1,:,2] - ours_best[1,:,2]) / other_results['EnKF'][1,:,2]
     relative_imp_07_ienkf = (other_results['IEnKF'][1,:,2] - ours_best[1,:,2]) / other_results['IEnKF'][1,:,2]
-    
-    # Plot relative improvement with consistent colors
+    min_val_07 = np.minimum(np.min(relative_imp_07_enkf), np.min(relative_imp_07_ienkf))
+    if args.dataset != 'lorenz63':
+        relative_imp_07_letkf = (other_results['LETKF'][1,:,2] - ours_best[1,:,2]) / other_results['LETKF'][1,:,2]
+        min_val_07 = np.minimum(min_val_07, np.min(relative_imp_07_letkf))
+    else:
+        relative_imp_07_letkf = None  # Not available
+
+    # ---- Plot sigma_y = 0.7 only ----
+    plt.figure(figsize=figsize)
     plt.plot(x_inds, relative_imp_07_enkf, linestyle='-', marker='o', markersize=args.marker_size, 
              linewidth=args.line_width, color=COLOR_DICT['EnKF'], label="EnKF")
     plt.plot(x_inds, relative_imp_07_ienkf, linestyle='-', marker='o', markersize=args.marker_size, 
              linewidth=args.line_width, color=COLOR_DICT['IEnKF'], label="IEnKF")
-    
-    min_val_07 = np.minimum(np.min(relative_imp_07_enkf), np.min(relative_imp_07_ienkf))
-    
-    if args.dataset != 'lorenz63':
-        relative_imp_07_letkf = (other_results['LETKF'][1,:,2] - ours_best[1,:,2]) / other_results['LETKF'][1,:,2]
+    if relative_imp_07_letkf is not None:
         plt.plot(x_inds, relative_imp_07_letkf, linestyle='-', marker='o', markersize=args.marker_size, 
                  linewidth=args.line_width, color=COLOR_DICT['LETKF'], label="LETKF")
-        min_val_07 = np.minimum(min_val_07, np.min(relative_imp_07_letkf))
 
-    # Remove legend and labels
-    # plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
-    # plt.xlabel("Ensemble Size")
-    # plt.ylabel("Relative Improvement (%)")
-
-    # Set x ticks
+    # Keep style consistent with existing figures (no legend text on plot)
     plt.xticks([5, 10, 15, 20, 40, 60, 100], fontsize=args.tick_fontsize)
+    plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    plt.yticks(fontsize=args.tick_fontsize)
+    if min_val_07 > 0:
+        plt.gca().set_ylim(0, None)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.pdf"), bbox_inches="tight", dpi=300)
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.png"), bbox_inches="tight", dpi=300)
+    print("Image saved to", os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.png"))
+    plt.close()
 
-    # Set y axis to start at 0 and format as percentage
+    # ---- Plot combined figure: overlay sigma_y = 1.0 (solid) and 0.7 (dashed) ----
+    plt.figure(figsize=(12,5))
+
+    # EnKF
+    plt.plot(x_inds, relative_imp_1_enkf, linestyle='-', marker='o', markersize=args.marker_size,
+             linewidth=args.line_width, color=COLOR_DICT['EnKF'], label="EnKF (1.0)")
+    plt.plot(x_inds, relative_imp_07_enkf, linestyle='--', marker='o', markersize=args.marker_size,
+             linewidth=args.line_width, color=COLOR_DICT['EnKF'], label="EnKF (0.7)")
+
+    # IEnKF
+    plt.plot(x_inds, relative_imp_1_ienkf, linestyle='-', marker='o', markersize=args.marker_size,
+             linewidth=args.line_width, color=COLOR_DICT['IEnKF'], label="IEnKF (1.0)")
+    plt.plot(x_inds, relative_imp_07_ienkf, linestyle='--', marker='o', markersize=args.marker_size,
+             linewidth=args.line_width, color=COLOR_DICT['IEnKF'], label="IEnKF (0.7)")
+
+    # LETKF if available
+    if relative_imp_1_letkf is not None and relative_imp_07_letkf is not None:
+        plt.plot(x_inds, relative_imp_1_letkf, linestyle='-', marker='o', markersize=args.marker_size,
+                 linewidth=args.line_width, color=COLOR_DICT['LETKF'], label="LETKF (1.0)")
+        plt.plot(x_inds, relative_imp_07_letkf, linestyle='--', marker='o', markersize=args.marker_size,
+                 linewidth=args.line_width, color=COLOR_DICT['LETKF'], label="LETKF (0.7)")
+
+    # >>> NEW: add legend on the right, outside the axes
+    # Keep frame off to match existing minimalist style; adjust fontsize to tick size.
+    legend = plt.legend(
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        fontsize=args.tick_fontsize * 0.8
+    )
+    # <<< END NEW
+
+    plt.xticks([5, 10, 15, 20, 40, 60, 100], fontsize=args.tick_fontsize)
     plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
     plt.yticks(fontsize=args.tick_fontsize)
 
-    if min_val_07 > 0:
+    # Determine lower bound across both sigmas to optionally start from 0
+    all_mins = [np.min(relative_imp_1_enkf), np.min(relative_imp_07_enkf),
+                np.min(relative_imp_1_ienkf), np.min(relative_imp_07_ienkf)]
+    if relative_imp_1_letkf is not None and relative_imp_07_letkf is not None:
+        all_mins.extend([np.min(relative_imp_1_letkf), np.min(relative_imp_07_letkf)])
+    if np.min(all_mins) > 0:
         plt.gca().set_ylim(0, None)
 
-    # Add grid
     plt.grid(True)
     plt.tight_layout()
-
-    # Save the figure for sigma_y=0.7
-    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.pdf"), 
-                bbox_inches="tight", dpi=300)
-    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.png"), 
-                bbox_inches="tight", dpi=300)
-    print("Image saved to", os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_0.7.png"))
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_Both.pdf"), bbox_inches="tight", dpi=300)
+    plt.savefig(os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_Both.png"), bbox_inches="tight", dpi=300)
+    print("Image saved to", os.path.join('../save/figures', f"{args.dataset}_Relative_Imp_Both.png"))
     plt.close()
 
     # Save unified legend

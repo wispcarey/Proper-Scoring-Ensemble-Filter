@@ -46,18 +46,19 @@ if __name__ == "__main__":
         # Training
         train_loss_list = []
         test_epochs = []
-        train_records = {"train_loss": [], "test_epochs": []}
+        train_records = {"train_loss": [], "test_epochs": [], "test_results": []}
         
         print("Training Start")
         
         # Initial test before training
-        initial_test_results = test_model_v2(test_loader, model_list, args, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False)
+        initial_test_results = test_model_v2(test_loader, model_list, args, plot_figures=False, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False)
         print_test_results_v2(initial_test_results)
         
         for key, value in initial_test_results.items():
             if key != "loc_tensor":
                 train_records[key] = [value]
         train_records['test_epochs'].append(0)
+        train_records['test_results'].append(initial_test_results)
         
         for epoch in range(1, 1 + args.epochs):
             train_loss = train_model_v2(epoch, train_loader, model_list, optimizer, scheduler, args)
@@ -68,13 +69,14 @@ if __name__ == "__main__":
 
             if epoch % args.save_epoch == 0:
                 # Test at each save epoch
-                epoch_test_results = test_model_v2(test_loader, model_list, args, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}_{epoch}', save_pdf=False)
+                epoch_test_results = test_model_v2(test_loader, model_list, args, plot_figures=False, fig_name=f'{folder_name}/test_{args.N}_{epoch}', save_pdf=False)
                 print_test_results_v2(epoch_test_results)
                 
                 for key, value in epoch_test_results.items():
                     if key != "loc_tensor":
                         train_records[key].append(value)
                 train_records['test_epochs'].append(epoch)
+                train_records['test_results'].append(epoch_test_results)
                 
                 # Save training records and model checkpoint
                 torch.save(train_records, os.path.join(folder_name, f"training_records.pt"))

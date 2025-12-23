@@ -33,12 +33,14 @@ if __name__ == "__main__":
         # --- Grid Search Setup ---
         # Define search ranges for inflation and localization radius.
         # These can be adjusted for a finer or coarser search.
-        infl_range = np.linspace(1.0, 1.15, 16)  
+        infl_range = np.linspace(1.0, 1.15, 6)  
         
         # Determine if localization is needed based on the filter method
         needs_localization = args.v == "LETKF" or ((args.v.startswith('iEnKS') or args.v == "EnKF") and args.dataset != 'lorenz63' and args.dataset != 'rossler')
+        # needs_localization = False
         if needs_localization:
-            loc_radius_range = np.array([0.001, 1.0, 2.0, 3.0])
+            loc_radius_range = np.array([0.001, 1.0, 3.0, 5.0, 7.0])
+            # loc_radius_range = np.array([9.0, 12.0, 15.0, 18.0, 21.0]) 
         else:
             loc_radius_range = [None] # For methods without localization like EnKF
 

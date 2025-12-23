@@ -14,8 +14,12 @@ from train_test_utils import test_linear_sampling_error, print_test_results_v2
 if __name__ == "__main__":
     args = get_parameters()
     
+    folder_name = os.path.join("save", f"linear_unc_{args.sigma_y}")
+    if not os.path.isdir(folder_name):
+        os.makedirs(folder_name)
+    
     # redirect output
-    with redirect_output(save_output=not args.normal_output, save_folder='save', filename="test_output.txt"):
+    with redirect_output(save_output=not args.normal_output, save_folder=folder_name, filename="test_output.txt"):
         if args.seed is not None and args.seed != "None":
             torch.manual_seed(int(args.seed))
 

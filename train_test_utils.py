@@ -13,6 +13,9 @@ from localization import dist2coeff, create_loc_mat
 from loss import compute_loss, compute_es, wasserstein2_multivariate_gaussian
 from networks import NaiveNetwork, SetTransformer, Simple_MLP, ConditionTransformerNetwork
 from benchmark_analysis import ensemble_kalman_filter_analysis, bootstrap_particle_filter_analysis
+from typing import Optional, List, Tuple, Dict, Any
+
+from tqdm.auto import tqdm
 
 
 def set_models(args):
@@ -444,24 +447,38 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     scheduler.step()
     return losses.avg
 
-def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calculate_crps=True, save_figure=False):
+
+def generate_and_cache_pf_results(
+    loader,
+    args,
+    H_info,
+    check_disk: bool = True,
+    calculate_crps: bool = True,
+    save_figure: bool = False,
+):
     """
     Runs a particle filter, saves results (means, covariances) to a cache file,
     and computes performance metrics (RMSE, optional CRPS).
 
-    This version is memory-efficient and conditionally calculates metrics.
+    NEW IN THIS VERSION:
+    - Records BOTH prior (forecast) and posterior (analysis) ensemble statistics in the cache:
+        {'prior_means', 'prior_covs', 'post_means', 'post_covs'}
+    - Plots TWO figures per selected batch index and time step when `save_figure=True`:
+        (1) Prior (blue points) + black history trajectory + orange observation star
+        (2) Posterior (red points) + black history trajectory + orange observation star
+
     If calculate_crps is False, CRPS keys are omitted from the output.
 
     Args:
-        loader (torch.utils.data.DataLoader): DataLoader providing the dataset batches.
-        args (argparse.Namespace): A namespace object containing script arguments.
-        H_info (tuple): A tuple containing the observation operator function and matrix (H_fun, H).
-        check_disk (bool): If True, checks if the cache file already exists and skips computation.
+        loader (torch.utils.data.DataLoader): DataLoader providing dataset batches (shape: T x B x D).
+        args (argparse.Namespace): Script arguments (expects fields used below).
+        H_info (tuple): (H_fun, H) observation operator function and matrix; if None, uses mystery_operator.
+        check_disk (bool): If True, checks cache file existence and returns NaNs (metrics) if present.
         calculate_crps (bool): If True, calculates CRPS and RCRPS metrics.
+        save_figure (bool): If True, saves prior/posterior figures at selected steps.
 
     Returns:
-        dict: A dictionary containing performance metrics. CRPS-related keys are
-            only present if calculate_crps is True.
+        dict: A dictionary containing performance metrics. CRPS-related keys exist only if calculate_crps=True.
     """
 
     # --- Model and Observation Initialization ---
@@ -498,7 +515,6 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
     # --- Check for Existing Cache ---
     if check_disk and os.path.exists(cache_filepath):
         print(f"Particle filter results already exist at: {cache_filepath}")
-        # Return empty metrics if cache exists
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse']
         if calculate_crps:
             metrics_keys.extend(['mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps'])
@@ -516,98 +532,170 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
         all_pf_metrics['crps'] = torch.empty(0, device=args.device)
         all_pf_metrics['rcrps'] = torch.empty(0, device=args.device)
 
+    # --- Which batch indices to visualize when saving figures ---
+    # (Matches your previous behavior of plotting the first two items if available.)
+    vis_indices: List[int] = [i for i in [0, 1] if i < batch_size]
+
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
-            batch_v = batch_v.to(device=args.device)
+            batch_v = batch_v.to(device=args.device)  # shape: (T, B, D)
 
             # --- Particle Filter Initialization ---
-            pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)
+            pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)  # (B, Np, D)
             pf_ens_v_a += torch.randn_like(pf_ens_v_a, device=args.device) * args.sigma_ens
 
-            batch_pf_means_to_cache, batch_pf_covs_to_cache = [], []
+            # These will be stacked and cached per-batch
+            batch_prior_means_to_cache, batch_prior_covs_to_cache = [], []
+            batch_post_means_to_cache,  batch_post_covs_to_cache  = [], []
+
             batch_rmse_steps = []
             if calculate_crps:
                 batch_crps_steps = []
 
-            # --- Calculate metrics for the initial state (t=0) ---
-            true_state_t0 = batch_v[0]
+            # --- Metrics at t=0 (posterior at initialization) ---
+            true_state_t0 = batch_v[0]  # (B, D)
             rmse_t0 = torch.sqrt(torch.mean((pf_ens_v_a.mean(dim=1) - true_state_t0) ** 2, dim=1))
             batch_rmse_steps.append(rmse_t0)
             if calculate_crps:
                 crps_t0 = compute_es(pf_ens_v_a.unsqueeze(0), true_state_t0.unsqueeze(0), norm_p=1)
                 batch_crps_steps.append(crps_t0)
 
-            # --- Generate Observations ---
-            obs_y_list = [H_fun(batch_v[i].unsqueeze(1)) + args.sigma_y * torch.randn_like(H_fun(batch_v[i].unsqueeze(1))) for i in range(len(batch_v))]
+            # --- Generate Observations y_t ---
+            obs_y_list = [
+                H_fun(batch_v[i].unsqueeze(1)) + args.sigma_y * torch.randn_like(H_fun(batch_v[i].unsqueeze(1)))
+                for i in range(len(batch_v))
+            ]
 
-            # --- Main Particle Filter Assimilation Loop ---
+            # --- Main PF Assimilation Loop ---
             for i in range(len(batch_v) - 1):
-                # Forecast Step
-                pf_ens_v_a_forecast_input = pf_ens_v_a.view(-1, args.ori_dim)
+                # -------- Forecast (PRIOR) step --------
+                pf_ens_v_a_forecast_input = pf_ens_v_a.view(-1, args.ori_dim)  # (B*Np, D)
                 for j_iter in range(args.dt_iter):
                     if args.dataset == 'ks':
-                        pf_ens_v_a_forecast_input = forward_fun(pf_ens_v_a_forecast_input, None, args.dt / args.dt_iter)
+                        pf_ens_v_a_forecast_input = forward_fun(
+                            pf_ens_v_a_forecast_input, None, args.dt / args.dt_iter
+                        )
                     else:
                         current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                        pf_ens_v_a_forecast_input = rk4(forward_fun, pf_ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                pf_ens_v_f = pf_ens_v_a_forecast_input.view(-1, args.pf_N, args.ori_dim)
+                        pf_ens_v_a_forecast_input = rk4(
+                            forward_fun, pf_ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter
+                        )
+
+                pf_ens_v_f = pf_ens_v_a_forecast_input.view(-1, args.pf_N, args.ori_dim)  # (B, Np, D)
                 pf_ens_v_f += torch.randn_like(pf_ens_v_f) * args.sigma_v
 
-                # Analysis Step
+                # Cache PRIOR stats (means/covs)
+                prior_mean = torch.mean(pf_ens_v_f, dim=1)                     # (B, D)
+                prior_cov  = get_ens_cov(pf_ens_v_f)                           # (B, D, D)
+                batch_prior_means_to_cache.append(prior_mean)
+                batch_prior_covs_to_cache.append(prior_cov)
+
+                # Prepare state-space "observation" position for plotting (use true state at t=i+1)
+                # This gives a 3D anchor to show as an orange star.
+                # If your desired "observation" lives in obs-space, adapt this mapping accordingly.
+                true_state_ti1 = batch_v[i + 1]  # (B, D)
+                obs_for_plot = true_state_ti1[:, :3].detach().cpu()  # (B, 3)
+
+                # -------- Analysis (POSTERIOR) step --------
                 pf_ens_v_a = bootstrap_particle_filter_analysis(
-                    pf_ens_v_f, 
-                    obs_y_list[i + 1].squeeze(1), 
-                    H.transpose(1,0), 
-                    # H_fun,
+                    pf_ens_v_f,
+                    obs_y_list[i + 1].squeeze(1),  # (B, obs_dim)
+                    H.transpose(1, 0),
                     args.sigma_y,
-                    resampling_method="multinomial", 
+                    resampling_method="multinomial",
                     sigma_reg=args.sigma_reg,
                     max_chunk_size=1000000,
                     resample_on_cpu=False,
                 )
-                
                 pf_ens_v_a = torch.clamp(pf_ens_v_a, min=-args.clamp, max=args.clamp)
-                
-                # if (i + 1) % 250 == 0:
-                if i < 600 and save_figure:
-                    save_folder = f'save/{args.dataset}_pf_vis'
-                    prefix = f'{save_folder}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_timestep{i+1}_{args.seed}'
-                    os.makedirs(save_folder, exist_ok=True)
-                    plot_and_test_point_clouds(args,
-                                            pf_ens_v_a, 
-                                            num_samples_plot=100000, 
-                                            num_samples_test=10000, 
-                                            prefix=prefix, 
-                                            num_repeats=10, 
-                                            plot_indices=[0, 1],
-                                            history_traj=batch_v[1:i+2],)
 
-                # Store results for caching and metrics
-                pf_mean_a = torch.mean(pf_ens_v_a, dim=1)
-                batch_pf_means_to_cache.append(pf_mean_a)
-                batch_pf_covs_to_cache.append(get_ens_cov(pf_ens_v_a))
-                
-                true_state_ti = batch_v[i + 1]
-                rmse_ti = torch.sqrt(torch.mean((pf_mean_a - true_state_ti) ** 2, dim=1))
+                # Cache POSTERIOR stats (means/covs)
+                post_mean = torch.mean(pf_ens_v_a, dim=1)                      # (B, D)
+                post_cov  = get_ens_cov(pf_ens_v_a)                            # (B, D, D)
+                batch_post_means_to_cache.append(post_mean)
+                batch_post_covs_to_cache.append(post_cov)
+
+                # Metrics at t=i+1 using POSTERIOR mean
+                rmse_ti = torch.sqrt(torch.mean((post_mean - true_state_ti1) ** 2, dim=1))
                 batch_rmse_steps.append(rmse_ti)
                 if calculate_crps:
-                    crps_ti = compute_es(pf_ens_v_a.unsqueeze(0), true_state_ti.unsqueeze(0), norm_p=1)
+                    crps_ti = compute_es(pf_ens_v_a.unsqueeze(0), true_state_ti1.unsqueeze(0), norm_p=1)
                     batch_crps_steps.append(crps_ti)
 
+                # -------- Visualization (PRIOR + POSTERIOR), both include observation --------
+                if i < 600 and save_figure:
+                    save_folder = f'save/{args.dataset}_pf_vis'
+                    os.makedirs(save_folder, exist_ok=True)
+
+                    # Use the same time step prefix, but suffix per batch index and type
+                    base_prefix = (
+                        f'{save_folder}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}'
+                        f'_timestep{i+1}_{args.seed}'
+                    )
+
+                    # We plot per selected batch index so each figure gets the correct observation vector
+                    for bidx in vis_indices:
+                        # Prepare per-item tensors for the plotting helper (shape: (1, Np, 3))
+                        prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :3].detach().cpu()
+                        posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :3].detach().cpu()
+
+                        # History trajectory for this item up to current step (shape: steps x 1 x 3)
+                        hist_traj = batch_v[1:i+2, bidx:bidx+1, :3].detach().cpu()
+
+                        # Per-item observation vector (3,)
+                        obs_vec = obs_for_plot[bidx]  # (3,)
+
+                        # PRIOR (blue)
+                        prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
+                        plot_and_test_point_clouds(
+                            args,
+                            prior_cloud_for_plot,             # (1, Np, 3)
+                            num_samples_plot=100000,
+                            num_samples_test=1000,
+                            prefix=prefix_prior,
+                            point_color="blue",
+                            # observation=obs_vec,
+                            observation=None,
+                            num_repeats=1,
+                            plot_indices=[0],
+                            history_traj=hist_traj,
+                        )
+
+                        # POSTERIOR (red)
+                        prefix_post = f"{base_prefix}_b{bidx}_POST"
+                        plot_and_test_point_clouds(
+                            args,
+                            posterior_cloud_for_plot,         # (1, Np, 3)
+                            num_samples_plot=100000,
+                            num_samples_test=1000,
+                            prefix=prefix_post,
+                            point_color="red",
+                            # observation=obs_vec,
+                            observation=None,
+                            num_repeats=1,
+                            plot_indices=[0],
+                            history_traj=hist_traj,
+                        )
+
             # --- Aggregate and Cache Batch Results ---
-            all_pf_results_to_cache.append({'means': torch.stack(batch_pf_means_to_cache), 'covs': torch.stack(batch_pf_covs_to_cache)})
-            
-            # --- Calculate and Aggregate Average Metrics for the Batch ---
-            rmse_val = torch.mean(torch.stack(batch_rmse_steps), dim=0)
-            rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
-            all_pf_metrics['rmse'] = torch.cat((all_pf_metrics['rmse'], rmse_val))
+            all_pf_results_to_cache.append({
+                'prior_means': torch.stack(batch_prior_means_to_cache),  # (T-1, B, D)
+                'prior_covs':  torch.stack(batch_prior_covs_to_cache),   # (T-1, B, D, D)
+                'post_means':  torch.stack(batch_post_means_to_cache),   # (T-1, B, D)
+                'post_covs':   torch.stack(batch_post_covs_to_cache),    # (T-1, B, D, D)
+            })
+
+            # --- Calculate and Aggregate Average Metrics for the Batch (posterior-based) ---
+            rmse_val = torch.mean(torch.stack(batch_rmse_steps), dim=0)                 # (B,)
+            rms_val  = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0) # (B,)
+            all_pf_metrics['rmse']  = torch.cat((all_pf_metrics['rmse'],  rmse_val))
             all_pf_metrics['rrmse'] = torch.cat((all_pf_metrics['rrmse'], rmse_val / rms_val))
             if calculate_crps:
-                crps_val = torch.mean(torch.stack(batch_crps_steps), dim=0)
+                crps_val  = torch.mean(torch.stack(batch_crps_steps), dim=0)            # (B,)
                 rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
-                all_pf_metrics['crps'] = torch.cat((all_pf_metrics['crps'], crps_val))
+                all_pf_metrics['crps']  = torch.cat((all_pf_metrics['crps'],  crps_val))
                 all_pf_metrics['rcrps'] = torch.cat((all_pf_metrics['rcrps'], rcrps_val))
-            
+
             print("update results")
 
     # --- Save All Results to Cache File ---
@@ -615,44 +703,59 @@ def generate_and_cache_pf_results(loader, args, H_info, check_disk=True, calcula
     os.makedirs(cache_dir, exist_ok=True)
     torch.save(all_pf_results_to_cache, cache_filepath)
 
-    # --- Final Metrics Calculation ---
+    # --- Final Metrics Calculation (posterior-based) ---
     if all_pf_metrics['rrmse'].numel() == 0:
-        return {} # Return empty dict if no results were produced
+        return {}
 
     valid_B_mask = ~torch.isnan(all_pf_metrics['rrmse'])
     if not valid_B_mask.any():
-        return {} # Return empty dict if all results are invalid
+        return {}
 
-    # Calculate final metrics only for valid results
     mean_rrmse, std_rrmse = get_mean_std(all_pf_metrics['rrmse'][valid_B_mask])
-    mean_rmse, std_rmse = get_mean_std(all_pf_metrics['rmse'][valid_B_mask])
-    
+    mean_rmse,  std_rmse  = get_mean_std(all_pf_metrics['rmse'][valid_B_mask])
+
     final_metrics = {
         'mean_rrmse': mean_rrmse,
-        'std_rrmse': std_rrmse,
-        'mean_rmse': mean_rmse,
-        'std_rmse': std_rmse,
+        'std_rrmse':  std_rrmse,
+        'mean_rmse':  mean_rmse,
+        'std_rmse':   std_rmse,
     }
 
     if calculate_crps:
-        mean_crps, std_crps = get_mean_std(all_pf_metrics['crps'][valid_B_mask])
+        mean_crps,  std_crps  = get_mean_std(all_pf_metrics['crps'][valid_B_mask])
         mean_rcrps, std_rcrps = get_mean_std(all_pf_metrics['rcrps'][valid_B_mask])
         final_metrics.update({
-            'mean_crps': mean_crps,
-            'std_crps': std_crps,
+            'mean_crps':  mean_crps,
+            'std_crps':   std_crps,
             'mean_rcrps': mean_rcrps,
-            'std_rcrps': std_rcrps,
+            'std_rcrps':  std_rcrps,
         })
-        
+
     final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_pf_metrics['rrmse'].numel() * 100.0
 
     return final_metrics
 
 
 def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', save_pdf=False):
+    """
+    Runs the learned model-based assimilation and (optionally) compares with PF.
+
+    NEW (timing): Records wall-clock time ONLY for the analysis step per i
+    (on active trajectories), across all batches. Also records a trajectory-
+    weighted variant that replicates each step duration by the number of
+    active trajectories during that step. Appends mean/std (in seconds) to
+    final_metrics with keys:
+        - 'assim_step_time_mean', 'assim_step_time_std'
+        - 'assim_step_time_mean_weighted', 'assim_step_time_std_weighted'
+    """
+    import os
+    import time  # <-- NEW: timing
+    import torch
+
     model, infl_model, local_model, st_model1, st_model2 = model_list
     m = args.N
     
+    # Select forward function
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
     elif args.dataset == 'rossler':
@@ -670,6 +773,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
+    # Observation operator
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
     else:
@@ -681,6 +785,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     if hasattr(st_model1, 'eval'): st_model1.eval()
     if hasattr(st_model2, 'eval'): st_model2.eval()
     
+    # Optional PF cache
     cached_pf_data = None
     if args.pf_verification:
         first_batch_for_shape = next(iter(loader))
@@ -700,9 +805,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 f"Please run generate_and_cache_pf_results() first."
             )
 
+    # Aggregated results (RMV removed)
     all_results = {
         'rmse': torch.empty(0, device=args.device),
-        'rmv': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
@@ -713,24 +818,48 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     }
     loc_tensor_all_batches = None
 
+    # NEW: analysis-step timing collectors
+    assim_step_times = []              # per analysis step across batches
+    assim_step_times_weighted = []     # replicated by #active trajectories
+
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
-            batch_v = batch_v.to(device=args.device)
+            batch_v = batch_v.to(device=args.device)  # [T, B, d]
+            B = batch_v.shape[1]
+
+            # ---- Active mask per-trajectory (B,) ----
+            active_mask = torch.ones(B, dtype=torch.bool, device=args.device)
+
+            # Initialize ensemble analysis at t0: [B, N, d]
             ens_v_a = batch_v[0].unsqueeze(1).repeat(1, m, 1)
             ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
-            
+
+            # Deactivate any trajectories that already contain NaNs after initialization
+            init_nan = torch.isnan(ens_v_a).any(dim=(1, 2))
+            if init_nan.any():
+                active_mask = active_mask & (~init_nan)
+                ens_v_a[~active_mask] = torch.nan  # keep shapes; mark inactive with NaN
+
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
             ens_list = [ens_v_a]
             loc_records = []
             
+            # Precompute noisy observations for all times (independent of active_mask)
             obs_y_list = []
             for i in range(len(batch_v)):
                 obs_y_step = H_fun(batch_v[i].unsqueeze(1))
                 obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
                 obs_y_list.append(obs_y_step)
 
+            # Time loop
             for i in range(len(batch_v) - 1):
-                ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
+                # Early bail: if no active trajectories remain, append a NaN step to keep time length and continue
+                if not active_mask.any():
+                    ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    continue  # keep T length for plotting/metrics
+
+                # -------- Forecast step (not timed here) --------
+                ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)  # [B*N, d]
                 for j_iter in range(args.dt_iter):
                     if args.dataset == 'ks':
                         ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
@@ -739,65 +868,128 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                         ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
                 ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
                 ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
-                
-                hv = H_fun(ens_v_f)
-                obs_y = obs_y_list[i + 1]
-                r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
-                ens_i_innov = obs_y - hv - r_noise
-                
-                mean_hv = torch.mean(hv, dim=1, keepdim=True)
-                mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
-                
-                ens_v_a, loc_nn_output = _process_analysis_step(
-                    args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv
-                )
-                
-                if loc_nn_output is not None:
-                    loc_records.append(loc_nn_output)
-                    
-                ens_v_a = post_process(ens_v_a, infl=infl)
+
+                # Deactivate offending trajectories that became NaN after forecast
+                nan_now = torch.isnan(ens_v_f).any(dim=(1, 2))
+                if nan_now.any():
+                    active_mask = active_mask & (~nan_now)
+                    ens_v_f[~active_mask] = torch.nan
+
+                # Active indices
+                idx_active = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+
+                # Prepare container for next analysis; default NaNs for inactive
+                ens_v_a_next = torch.full_like(ens_v_f, float('nan'))
+
+                if idx_active.numel() > 0:
+                    # Slice active trajectories only
+                    ens_v_f_active = ens_v_f.index_select(0, idx_active)                 # [B_active, N, d]
+                    obs_y = obs_y_list[i + 1]                                            # [T,B,?] -> [B,1,d_obs]
+                    obs_y_active = obs_y.index_select(0, idx_active)                     # [B_active, 1, d_obs]
+
+                    # ------ BEGIN TIMED ANALYSIS STEP ------
+                    t0 = time.perf_counter()
+
+                    # Compute H(ens) and innovation on active subset
+                    hv_active = H_fun(ens_v_f_active)                                    # [B_active, N, d_obs]
+                    r_noise_active = mean0(args.sigma_y * torch.randn_like(hv_active, device=args.device))
+                    ens_i_innov_active = obs_y_active - hv_active - r_noise_active
+
+                    # Means on active subset
+                    mean_hv_active = torch.mean(hv_active, dim=1, keepdim=True)
+                    mean_ens_v_f_active = torch.mean(ens_v_f_active, dim=1, keepdim=True)
+
+                    # Analysis step (delegated to learned components)
+                    ens_v_a_active, loc_nn_output = _process_analysis_step(
+                        args, model_list, ens_v_f_active, hv_active, obs_y_active, ens_i_innov_active,
+                        mean_ens_v_f_active, mean_hv_active
+                    )
+
+                    # Record localization-related outputs if any
+                    if loc_nn_output is not None:
+                        loc_records.append(loc_nn_output)
+
+                    # Inflation / post-processing on active subset only
+                    ens_v_a_active = post_process(ens_v_a_active, infl=infl)
+
+                    # ------ END TIMED ANALYSIS STEP ------
+                    t1 = time.perf_counter()
+                    duration = t1 - t0
+                    assim_step_times.append(duration)
+                    num_active = int(idx_active.numel())
+                    if num_active > 0:
+                        assim_step_times_weighted.extend([duration] * num_active)
+
+                    # Scatter active results back; inactive remain NaN
+                    ens_v_a_next.index_copy_(0, idx_active, ens_v_a_active)
+
+                # Move to next analysis state
+                ens_v_a = ens_v_a_next
                 ens_list.append(ens_v_a)
-                
-                if args.pf_verification:
-                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
-                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
 
-                    our_method_mean_a = torch.mean(ens_v_a, dim=1)
-                    pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))
-                    if args.dataset == 'rossler':
-                        pf_rmse[batch_v[i + 1, :, 2] <= 5] = float('nan')
-                    pf_rmse_list.append(pf_rmse)
-                    
-                    cov_ens_a = get_ens_cov(ens_v_a)
-                    cov_diff = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1)) 
-                    rcov_diff = cov_diff / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
-                    if args.dataset == 'rossler':
-                        cov_diff[batch_v[i + 1, :, 2] <= 5] = float('nan')
-                        rcov_diff[batch_v[i + 1, :, 2] <= 5] = float('nan')
-                    cov_diff_list.append(cov_diff)
-                    rcov_diff_list.append(rcov_diff)
+                # PF verification: compute only for current active subset, scatter back
+                if args.pf_verification and idx_active.numel() > 0:
+                    pf_mean_a_full = cached_pf_data[batch_ind]['means'][i]     # [B, d]
+                    pf_cov_ens_a_full = cached_pf_data[batch_ind]['covs'][i]   # [B, d, d]
 
+                    pf_mean_a = pf_mean_a_full.index_select(0, idx_active)
+                    pf_cov_ens_a = pf_cov_ens_a_full.index_select(0, idx_active)
+
+                    our_method_mean_a = torch.mean(ens_v_a.index_select(0, idx_active), dim=1)  # [B_active, d]
+                    pf_rmse_active = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))  # [B_active]
+
+                    # Optional dataset-specific masking (rossler)
+                    if args.dataset == 'rossler':
+                        cond = batch_v[i + 1, :, 2] <= 5
+                        cond_active = cond.index_select(0, idx_active)
+                        pf_rmse_active = pf_rmse_active.masked_fill(cond_active, float('nan'))
+
+                    # Scatter PF RMSE back to full B vector
+                    pf_rmse_full = torch.full((B,), float('nan'), device=args.device)
+                    pf_rmse_full.index_copy_(0, idx_active, pf_rmse_active)
+                    pf_rmse_list.append(pf_rmse_full)
+
+                    # Covariance diffs on active subset and scatter back
+                    cov_ens_a_active = get_ens_cov(ens_v_a.index_select(0, idx_active))     # [B_active, d, d]
+                    cov_diff_active = torch.norm(cov_ens_a_active - pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    rcov_diff_active = cov_diff_active / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
+
+                    if args.dataset == 'rossler':
+                        cond_active = cond.index_select(0, idx_active)
+                        cov_diff_active = cov_diff_active.masked_fill(cond_active, float('nan'))
+                        rcov_diff_active = rcov_diff_active.masked_fill(cond_active, float('nan'))
+
+                    cov_diff_full = torch.full((B,), float('nan'), device=args.device)
+                    rcov_diff_full = torch.full((B,), float('nan'), device=args.device)
+                    cov_diff_full.index_copy_(0, idx_active, cov_diff_active)
+                    rcov_diff_full.index_copy_(0, idx_active, rcov_diff_active)
+                    cov_diff_list.append(cov_diff_full)
+                    rcov_diff_list.append(rcov_diff_full)
+
+            # Stack ensembles over time: [T, B, N, d]
             ens_tensor = torch.stack(ens_list)
             
+            # Metrics (RMV removed; NaNs are handled later by masks)
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
-            rmv_val = torch.mean(torch.sqrt(args.N / (args.N - 1) * torch.mean((ens_tensor - batch_v.unsqueeze(2)) ** 2, dim=(2,3))),dim=0)
             
+            # Aggregate metrics
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
-            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
-            if args.pf_verification:
+            if args.pf_verification and len(pf_rmse_list) > 0:
+                # Use nanmean over time for PF-based metrics
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).nanmean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).nanmean(0)))
                 all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).nanmean(0)))
                 all_results['pf_rrmse'] = torch.cat((all_results['pf_rrmse'], torch.stack(pf_rmse_list).nanmean(0) / rms_val))
             
-            if args.v != "EtE" and not args.no_localization and loc_records:
+            # Localization tensor collection (unchanged)
+            if args.v != "EtE" and not args.no_localization and len(loc_records) > 0:
                 current_loc_tensor = torch.stack(loc_records).unsqueeze(0)
                 if loc_tensor_all_batches is None:
                     loc_tensor_all_batches = current_loc_tensor
@@ -807,6 +999,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     except Exception as e:
                         print(f"Warning: Could not concatenate loc_tensors due to shape mismatch or other error: {e}")
 
+            # Build observation tensor for plotting (unchanged)
             obs_tensor = torch.stack(obs_y_list).squeeze(2)
             observations = torch.full_like(batch_v, float('nan'), device=args.device)
             if hasattr(args, 'obs_inds') and args.obs_inds is not None:
@@ -814,6 +1007,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             else:
                 print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
     
+    # Plotting (unchanged)
     if plot_figures: 
         time_idx_plot = -2
         num_dims_plot = 4
@@ -823,36 +1017,41 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             batch_v = cached_pf_data[-1]['means']
             ens_tensor = ens_tensor[1:]
             observations = observations[1:]
-        plot_particle_trajectories_with_histograms(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                                true_traj=batch_v[:,time_idx_plot,:], 
-                                                observation=None, 
-                                                dim_indices=dim_indices_plot,
-                                                start_time=0,
-                                                end_time=ens_tensor.shape[0],
-                                                mode='quantile',
-                                                save_fig=True,
-                                                save_pdf=save_pdf,
-                                                save_name=fig_name + "_hist",
-                                                hist_step=1,
-                                                fontsize=None)
-        plot_particle_trajectories(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                true_traj=batch_v[:,time_idx_plot,:], 
-                                observation=observations[:,time_idx_plot,:],
-                                cmap_name='bwr',
-                                start_time=0,
-                                end_time=ens_tensor.shape[0], 
-                                main_fig_size=(5, 2), 
-                                save_fig=True,
-                                save_pdf=save_pdf,
-                                save_name=fig_name + "_traj",
-                                colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-                                plot_vertical_colorbar=False,
-                                plot_horizontal_colorbar=True)
+        plot_particle_trajectories_with_histograms(
+            particles=ens_tensor[:, time_idx_plot, :, :], 
+            true_traj=batch_v[:, time_idx_plot, :], 
+            observation=None, 
+            dim_indices=dim_indices_plot,
+            start_time=0,
+            end_time=ens_tensor.shape[0],
+            mode='quantile',
+            save_fig=True,
+            save_pdf=save_pdf,
+            save_name=fig_name + "_hist",
+            hist_step=1,
+            fontsize=None
+        )
+        plot_particle_trajectories(
+            particles=ens_tensor[:, time_idx_plot, :, :], 
+            true_traj=batch_v[:, time_idx_plot, :], 
+            observation=observations[:, time_idx_plot, :],
+            cmap_name='bwr',
+            start_time=0,
+            end_time=ens_tensor.shape[0], 
+            main_fig_size=(5, 2), 
+            save_fig=True,
+            save_pdf=save_pdf,
+            save_name=fig_name + "_traj",
+            colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+            plot_vertical_colorbar=False,
+            plot_horizontal_colorbar=True
+        )
 
+    # Final metrics (RMV removed)
     final_metrics = {}
     
     if all_results['rrmse'].numel() == 0:
-        metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
+        metrics_keys = ['mean_rmse', 'std_rmse',
                         'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
                         'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
                         'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
@@ -864,7 +1063,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         valid_B_mask = ~nan_mask
         
         if not valid_B_mask.any():
-            metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
+            metrics_keys = ['mean_rmse', 'std_rmse',
                             'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
                             'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
                             'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
@@ -874,7 +1073,6 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         else:
             final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
             final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
-            final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
             final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
             final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
@@ -884,22 +1082,45 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
+    # ---- NEW: compute analysis-step timing stats and attach to final_metrics ----
+    if len(assim_step_times) > 0:
+        t_tensor = torch.tensor(assim_step_times, dtype=torch.float64)
+        final_metrics['assim_step_time_mean'] = float(t_tensor.mean().item())
+        final_metrics['assim_step_time_std']  = float(t_tensor.std(unbiased=False).item())
+    else:
+        final_metrics['assim_step_time_mean'] = float('nan')
+        final_metrics['assim_step_time_std']  = float('nan')
+
+    if len(assim_step_times_weighted) > 0:
+        tw_tensor = torch.tensor(assim_step_times_weighted, dtype=torch.float64)
+        final_metrics['assim_step_time_mean_weighted'] = float(tw_tensor.mean().item())
+        final_metrics['assim_step_time_std_weighted']  = float(tw_tensor.std(unbiased=False).item())
+    else:
+        final_metrics['assim_step_time_mean_weighted'] = float('nan')
+        final_metrics['assim_step_time_std_weighted']  = float('nan')
+
+    # Return one localization tensor (unchanged)
     final_loc_tensor_to_return = loc_tensor_all_batches[0] if loc_tensor_all_batches is not None and loc_tensor_all_batches.shape[0] > 0 else torch.empty(1, device=args.device)
     final_metrics['loc_tensor'] = final_loc_tensor_to_return
 
     return final_metrics
 
+
+
+
 def print_test_results(results):
+    """Pretty-print test metrics including optional timing stats (times in ms)."""
+    # Core metrics
     if 'mean_rmse' in results and 'std_rmse' in results:
         print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
     if 'mean_rrmse' in results and 'std_rrmse' in results:
         print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
-    if 'mean_rmv' in results and 'std_rmv' in results:
-        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
     if 'mean_crps' in results and 'std_crps' in results:
         print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
     if 'mean_rcrps' in results and 'std_rcrps' in results:
         print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
+
+    # Optional PF verification metrics
     if 'mean_cov_diff' in results and 'std_cov_diff' in results:
         print(f"Cov-Diff: {results['mean_cov_diff']:.3f} ± {results['std_cov_diff']:.3f}")
     if 'mean_rcov_diff' in results and 'std_rcov_diff' in results:
@@ -908,8 +1129,27 @@ def print_test_results(results):
         print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
     if 'mean_pf_rrmse' in results and 'std_pf_rrmse' in results:
         print(f"PF-RRMSE: {results['mean_pf_rrmse']:.3f} ± {results['std_pf_rrmse']:.3f}")
+
+    # Percentage of non-NaN trajectories
     if 'no_nan_percent' in results:
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
+
+    # --- Timing outputs in milliseconds (ms) ---
+
+    # Unweighted per-step assimilation time (originally in seconds)
+    if 'assim_step_time_mean' in results and 'assim_step_time_std' in results:
+        mean_ms = results['assim_step_time_mean'] * 1000.0
+        std_ms  = results['assim_step_time_std'] * 1000.0
+        print(f"Assim-step time (ms): {mean_ms:.3f} ± {std_ms:.3f}")
+
+    # Trajectory-weighted per-step assimilation time
+    if 'assim_step_time_mean_weighted' in results and 'assim_step_time_std_weighted' in results:
+        mean_ms_w = results['assim_step_time_mean_weighted'] * 1000.0
+        std_ms_w  = results['assim_step_time_std_weighted'] * 1000.0
+        print(f"Assim-step time (ms, weighted): {mean_ms_w:.3f} ± {std_ms_w:.3f}")
+
+
+
 
 
 def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig_name='example_fig', loc_radius=None, save_pdf=False):
@@ -917,53 +1157,66 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     Tests a classic data assimilation filter (e.g., EnKF, ESRF, LETKF) and
     optionally compares results against a particle filter baseline.
 
-    Args:
-        loader (DataLoader): DataLoader providing batches of true states.
-        args (Namespace): Arguments containing model and experiment parameters.
-        infl (float, optional): Inflation factor. Defaults to 1.
-        H_info (tuple, optional): Precomputed observation operator. Defaults to None.
-        plot_figures (bool, optional): Whether to plot figures. Defaults to True.
-        fig_name (str, optional): Base name for saved figures. Defaults to 'example_fig'.
-        loc_radius (float, optional): Localization radius. Defaults to None.
-        save_pdf (bool, optional): Whether to save figures as PDF. Defaults to False.
+    NOTE (added): If any trajectory (a specific b in the batch dimension) ever
+    produces NaNs at any step, that trajectory is marked inactive and skipped
+    for all subsequent steps. We keep shape consistency by writing NaNs for its
+    outputs so that downstream metrics (which already NaN-mask) ignore it.
 
-    Returns:
-        dict: A dictionary containing mean and standard deviation of evaluation metrics.
+    CHANGE: All RMV-related computation and metrics were removed to avoid OOM.
+
+    NEW (timing): Records wall-clock time for each assimilation step (per i),
+    aggregates across all batches. Also records a trajectory-weighted variant
+    that replicates each step duration by the number of active trajectories at
+    that step. Returns mean/std for both.
     """
+    import os
+    import time  # <-- NEW: timing
+    import torch
+    from tqdm import tqdm
+
     m = args.N
-    
+
+    # Select forward function
     if args.dataset == "lorenz63":
         forward_fun = L63.forward
+        model_propagator = rk4
     elif args.dataset == "lorenz96":
         forward_fun = L96.forward
+        model_propagator = rk4
     elif args.dataset == 'rossler':
         forward_fun = Rossler.forward
+        model_propagator = rk4
     elif args.dataset == "circle":
         forward_fun = CircleODE.forward
+        model_propagator = rk4
     elif args.dataset == "Hdoublewell":
         forward_fun = DoubleWellODE.forward
+        model_propagator = rk4
     elif args.dataset == "ks":
         if args.dt_iter <= 0:
             raise ValueError("args.dt_iter must be positive for KS model.")
-        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
+        forward_fun = None
+        model_propagator = lambda func, u, t, dt: etd_rk4_wrapper(device=args.device, dt=dt)(u, None, dt)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
+    # Observation operator
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
     else:
         H_fun, H = H_info
-        
+
     if args.no_localization:
         print("Do not use localization")
         loc_radius = None
 
+    # Optional PF cache
     cached_pf_data = None
     if args.pf_verification:
         first_batch_for_shape = next(iter(loader))
         traj_len = first_batch_for_shape.shape[0]
         batch_size = first_batch_for_shape.shape[1]
-        
+
         cache_dir = os.path.join('data', args.dataset)
         cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_avg.pt"
         cache_filepath = os.path.join(cache_dir, cache_filename)
@@ -977,9 +1230,9 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 f"Please run generate_and_cache_pf_results() first."
             )
 
+    # Aggregated results (RMV removed)
     all_results = {
         'rmse': torch.empty(0, device=args.device),
-        'rmv': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
@@ -989,149 +1242,231 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         'pf_rrmse': torch.empty(0, device=args.device),
     }
 
+    # NEW: timing collectors
+    assim_step_times = []              # per-step durations across all batches
+    assim_step_times_weighted = []     # per-trajectory-weighted durations
+
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
-            batch_v = batch_v.to(device=args.device)
+            batch_v = batch_v.to(device=args.device)  # [T, B, d]
 
+            # ---- NEW: active mask per-trajectory (B,) ----
+            B = batch_v.shape[1]
+            active_mask = torch.ones(B, dtype=torch.bool, device=args.device)
+
+            # Initialize ensemble analysis at t0: [B, N, d]
             ens_v_a = batch_v[0].unsqueeze(1).repeat(1, m, 1)
             ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
+
+            # Detect NaN at initialization and deactivate those trajectories
+            init_nan = torch.isnan(ens_v_a).any(dim=(1, 2))
+            if init_nan.any():
+                active_mask = active_mask & (~init_nan)
+                # Fill NaNs for the deactivated ones to keep shapes consistent
+                ens_v_a[~active_mask] = torch.nan
 
             ens_list = [ens_v_a]
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
 
+            # Precompute noisy observations y_t for all t (shape aligned to H_fun outputs)
             obs_y_list = []
             for i in range(len(batch_v)):
                 obs_y_step = H_fun(batch_v[i].unsqueeze(1))
                 obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
                 obs_y_list.append(obs_y_step)
 
-            for i in range(len(batch_v) - 1):
-                obs_y = obs_y_list[i + 1]
+            # Time loop
+            for i in tqdm(range(len(batch_v) - 1), desc="Processing", unit="item"):
+                # Early exit if no active trajectories remain
+                if not active_mask.any():
+                    ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    # Record a zero-duration placeholder for clarity? No: skip to avoid bias
+                    continue
 
+                # ---- NEW: start timing the entire assimilation step (forecast + analysis + book-keeping) ----
+                t0 = time.perf_counter()
+
+                obs_y = obs_y_list[i + 1]  # [B, 1, d_obs]
+
+                # Forecast step
                 if args.v.startswith('iEnKS'):
-                    ens_v_f = ens_v_a
+                    ens_v_f = ens_v_a  # smoothing will handle propagation
                 else:
-                    ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)
+                    ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)  # [B*N, d]
                     for j_iter in range(args.dt_iter):
-                        if args.dataset == 'ks':
-                            ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
-                        else:
-                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                            ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+                        ens_v_a_forecast_input = model_propagator(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
                     ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                    
                     ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
-                
+
+                # ---- NEW: detect NaNs in forecast and deactivate offending trajectories ----
+                nan_now = torch.isnan(ens_v_f).any(dim=(1, 2))
+                if nan_now.any():
+                    active_mask = active_mask & (~nan_now)
+                    ens_v_f[~active_mask] = torch.nan
+
+                # Shapes
                 B_shape, N_ens, D_state = ens_v_f.shape
                 d_obs_shape = obs_y.shape[2]
-                
+
+                # Common args
                 common_enkf_args = {
-                    "observation_y": obs_y.squeeze(1),
+                    "observation_y": None,  # will be filled with subset
                     "observation_operator_ens": H_fun,
                     "sigma_y": args.sigma_y,
                     "sigma_v": args.sigma_v,
                     "inflation_factor": infl
                 }
-                
-                if args.v == 'EnKF':
-                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                    ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args, method='EnKF-PertObs',
-                        localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
-                elif args.v == 'ESRF':
-                    loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                    loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                    ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args, method='ESRF',
-                        localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
-                elif args.v == 'LETKF':
-                    coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                    coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1) if hasattr(args, 'obs_inds') and args.obs_inds is not None else torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
-                    domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
-                    ens_v_a, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f, **common_enkf_args, method='LETKF',
-                        localization_radius=loc_radius, coords_state=coords_state,
-                        coords_obs=coords_obs, localization_domain=domain)
-                elif args.v.startswith('iEnKS'):
-                    coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                    coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1) if hasattr(args, 'obs_inds') and args.obs_inds is not None else torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
-                    domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
-                    
-                    model_args_ienks = {
-                        "propagator": rk4,
-                        "rhs": forward_fun,
-                        "dt": args.dt / args.dt_iter,
-                        "steps_between_analyses": args.dt_iter,
-                    }
-                    E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
-                        ens_v_f,
-                        **common_enkf_args,
-                        method=args.v,
-                        localization_radius=loc_radius, 
-                        coords_state=coords_state,
-                        coords_obs=coords_obs, 
-                        localization_domain=domain,
-                        ienks_lag=1,
-                        ienks_niter=10,
-                        ienks_wtol=1e-5,
-                        model_args=model_args_ienks
-                    )
 
-                    ens_v_a_forecast_input = E_smoothed_at_start.clone().view(-1, args.ori_dim)
-                    for j_iter in range(args.dt_iter):
-                        if args.dataset == 'ks':
-                            raise NotImplementedError
+                # ---- operate only on active indices for the analysis step ----
+                idx_active = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+                ens_v_a_next = torch.full_like(ens_v_f, float('nan'))  # default NaN for inactive
+
+                if idx_active.numel() > 0:
+                    ens_v_f_active = ens_v_f.index_select(0, idx_active)
+                    obs_y_active = obs_y.squeeze(1).index_select(0, idx_active)
+                    common_enkf_args["observation_y"] = obs_y_active
+
+                    if args.v == 'EnKF':
+                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        ens_v_a_active, _ = ensemble_kalman_filter_analysis(
+                            ens_v_f_active, **common_enkf_args, method='EnKF-PertObs',
+                            localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
+
+                    elif args.v == 'ESRF':
+                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        ens_v_a_active, _ = ensemble_kalman_filter_analysis(
+                            ens_v_f_active, **common_enkf_args, method='ESRF',
+                            localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
+
+                    elif args.v == 'LETKF':
+                        coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                        if hasattr(args, 'obs_inds') and args.obs_inds is not None:
+                            coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
                         else:
-                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                            ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                    ens_v_a = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                    ens_v_a += torch.randn_like(ens_v_a, device=args.device) * args.sigma_v
-                else:
-                    raise NotImplementedError(f"The filter {args.v} is not implemented")
+                            coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
+                        domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
+                        ens_v_a_active, _ = ensemble_kalman_filter_analysis(
+                            ens_v_f_active, **common_enkf_args, method='LETKF',
+                            localization_radius=loc_radius, coords_state=coords_state,
+                            coords_obs=coords_obs, localization_domain=domain)
 
-                ens_v_a = torch.clamp(ens_v_a, min=-args.clamp, max=args.clamp)
+                    elif args.v.startswith('iEnKS'):
+                        coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                        if hasattr(args, 'obs_inds') and args.obs_inds is not None:
+                            coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                        else:
+                            coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
+                        domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
+
+                        model_args_ienks = {
+                            "propagator": model_propagator,
+                            "rhs": forward_fun,
+                            "dt": args.dt / args.dt_iter,
+                            "steps_between_analyses": args.dt_iter,
+                        }
+                        E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
+                            ens_v_f_active,
+                            **common_enkf_args,
+                            method=args.v,
+                            localization_radius=loc_radius, 
+                            coords_state=coords_state,
+                            coords_obs=coords_obs, 
+                            localization_domain=domain,
+                            ienks_lag=1,
+                            ienks_niter=10,
+                            ienks_wtol=1e-5,
+                            model_args=model_args_ienks
+                        )
+
+                        # Forecast from smoothed start to analysis time
+                        ens_v_a_forecast_input = E_smoothed_at_start.clone().view(-1, args.ori_dim)
+                        for j_iter in range(args.dt_iter):
+                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
+                            ens_v_a_forecast_input = model_propagator(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
+                        ens_v_a_active = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
+                        ens_v_a_active += torch.randn_like(ens_v_a_active, device=args.device) * args.sigma_v
+
+                    else:
+                        raise NotImplementedError(f"The filter {args.v} is not implemented")
+
+                    # Clamp only on active subset
+                    ens_v_a_active = torch.clamp(ens_v_a_active, min=-args.clamp, max=args.clamp)
+
+                    # Scatter back active results into full tensor; inactive stay NaN
+                    ens_v_a_next.index_copy_(0, idx_active, ens_v_a_active)
+
+                # Move to next analysis state (NaN for inactive, valid values for active)
+                ens_v_a = ens_v_a_next
+
+                # Append for metrics (inactive remain NaN)
                 ens_list.append(ens_v_a)
 
-                if args.pf_verification:
-                    pf_mean_a = cached_pf_data[batch_ind]['means'][i]
-                    pf_cov_ens_a = cached_pf_data[batch_ind]['covs'][i]
-                    our_method_mean_a = torch.mean(ens_v_a, dim=1)
-                    pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a)**2, dim=-1))
-                    pf_rmse_list.append(pf_rmse)
-                    cov_ens_a = get_ens_cov(ens_v_a)
-                    cov_diff = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1))
-                    rcov_diff = cov_diff / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
-                    cov_diff_list.append(cov_diff)
-                    rcov_diff_list.append(rcov_diff)
+                # PF verification (compute only on currently active trajectories)
+                if args.pf_verification and idx_active.numel() > 0:
+                    pf_mean_a_full = cached_pf_data[batch_ind]['means'][i]         # [B, d]
+                    pf_cov_ens_a_full = cached_pf_data[batch_ind]['covs'][i]      # [B, d, d]
 
+                    # Subset PF data to active ones
+                    pf_mean_a = pf_mean_a_full.index_select(0, idx_active)
+                    pf_cov_ens_a = pf_cov_ens_a_full.index_select(0, idx_active)
+
+                    our_method_mean_a = torch.mean(ens_v_a.index_select(0, idx_active), dim=1)  # [B_active, d]
+                    pf_rmse = torch.sqrt(torch.mean((our_method_mean_a - pf_mean_a) ** 2, dim=-1))  # [B_active]
+                    pf_rmse_full = torch.full((B,), float('nan'), device=args.device)
+                    pf_rmse_full.index_copy_(0, idx_active, pf_rmse)
+                    pf_rmse_list.append(pf_rmse_full)
+
+                    cov_ens_a = get_ens_cov(ens_v_a.index_select(0, idx_active))  # [B_active, d, d]
+                    cov_diff_active = torch.norm(cov_ens_a - pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    rcov_diff_active = cov_diff_active / torch.norm(pf_cov_ens_a, p='fro', dim=(-2, -1))
+                    cov_diff_full = torch.full((B,), float('nan'), device=args.device)
+                    rcov_diff_full = torch.full((B,), float('nan'), device=args.device)
+                    cov_diff_full.index_copy_(0, idx_active, cov_diff_active)
+                    rcov_diff_full.index_copy_(0, idx_active, rcov_diff_active)
+                    cov_diff_list.append(cov_diff_full)
+                    rcov_diff_list.append(rcov_diff_full)
+
+                # ---- NEW: stop timing and record ----
+                t1 = time.perf_counter()
+                duration = t1 - t0  # seconds
+                assim_step_times.append(duration)
+                # Weight by #active trajectories at this step
+                num_active = int(idx_active.numel()) if 'idx_active' in locals() else 0
+                if num_active > 0:
+                    assim_step_times_weighted.extend([duration] * num_active)
+                # If no active, we skip weighting to avoid bias
+
+            # Stack ensembles over time: [T, B, N, d]
             ens_tensor = torch.stack(ens_list)
-            
+
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
-            rmv_val = torch.mean(torch.sqrt(N_ens / (N_ens-1) * torch.mean((ens_tensor - batch_v.unsqueeze(2)) ** 2, dim=(2,3))),dim=0)
-            
+
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
-            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
-            if args.pf_verification:
+            if args.pf_verification and len(pf_rmse_list) > 0:
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
                 all_results['pf_rmse'] = torch.cat((all_results['pf_rmse'], torch.stack(pf_rmse_list).mean(0)))
                 all_results['pf_rrmse'] = torch.cat((all_results['pf_rrmse'], torch.stack(pf_rmse_list).nanmean(0) / rms_val))
-                
+            
+            # Build observation tensor for plotting (unchanged)
             obs_tensor = torch.stack(obs_y_list).squeeze(2)
             observations = torch.full_like(batch_v, float('nan'), device=args.device)
             if hasattr(args, 'obs_inds') and args.obs_inds is not None:
                 observations[:, :, args.obs_inds] = obs_tensor
             else:
                 print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
-    
+
+    # Plotting (unchanged)
     if plot_figures: 
         time_idx_plot = -2
         num_dims_plot = 4
@@ -1143,18 +1478,19 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             observations = observations[1:]
 
         plot_particle_trajectories_with_histograms(
-            particles=ens_tensor[:,time_idx_plot,:,:], 
-            true_traj=batch_v[:,time_idx_plot,:], 
-            observation=None, 
+            particles=ens_tensor[:, time_idx_plot, :, :],
+            true_traj=batch_v[:, time_idx_plot, :],
+            observation=None,
             dim_indices=dim_indices_plot,
             start_time=0, end_time=ens_tensor.shape[0], mode='quantile',
             save_fig=True, save_pdf=save_pdf, save_name=fig_name + "_hist_classic",
             hist_step=1, fontsize=None)
+
         plot_particle_trajectories(
-            particles=ens_tensor[:,time_idx_plot,:,:], 
-            true_traj=batch_v[:,time_idx_plot,:], 
-            observation=observations[:,time_idx_plot,:],
-            cmap_name='bwr', start_time=0, end_time=ens_tensor.shape[0], 
+            particles=ens_tensor[:, time_idx_plot, :, :],
+            true_traj=batch_v[:, time_idx_plot, :],
+            observation=observations[:, time_idx_plot, :],
+            cmap_name='bwr', start_time=0, end_time=ens_tensor.shape[0],
             main_fig_size=(5, 2), save_fig=True, save_pdf=save_pdf,
             save_name=fig_name + "_traj_classic",
             colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
@@ -1162,27 +1498,26 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
     final_metrics = {}
     if all_results['rrmse'].numel() == 0:
-        metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
-                        'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
-                        'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
-                        'mean_pf_rrmse', 'std_pf_rrmse']
+        metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
+                        'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
+                        'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
+                        'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
         nan_mask = torch.isnan(all_results['rrmse'])
         valid_B_mask = ~nan_mask
-        
+
         if not valid_B_mask.any():
-            metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 'mean_rrmse', 'std_rrmse',
-                            'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 
-                            'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
-                            'mean_pf_rrmse', 'std_pf_rrmse']
+            metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
+                            'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
+                            'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
+                            'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
         else:
             final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
             final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
-            final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
             final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
             final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
@@ -1192,7 +1527,28 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
+    # ---- NEW: compute timing stats and attach to final_metrics ----
+    # We compute (1) per-step mean/std and (2) trajectory-weighted mean/std.
+    if len(assim_step_times) > 0:
+        t_tensor = torch.tensor(assim_step_times, dtype=torch.float64)
+        final_metrics['assim_step_time_mean'] = float(t_tensor.mean().item())               # seconds
+        final_metrics['assim_step_time_std']  = float(t_tensor.std(unbiased=False).item())  # population std
+    else:
+        final_metrics['assim_step_time_mean'] = float('nan')
+        final_metrics['assim_step_time_std']  = float('nan')
+
+    if len(assim_step_times_weighted) > 0:
+        tw_tensor = torch.tensor(assim_step_times_weighted, dtype=torch.float64)
+        final_metrics['assim_step_time_mean_weighted'] = float(tw_tensor.mean().item())
+        final_metrics['assim_step_time_std_weighted']  = float(tw_tensor.std(unbiased=False).item())
+    else:
+        final_metrics['assim_step_time_mean_weighted'] = float('nan')
+        final_metrics['assim_step_time_std_weighted']  = float('nan')
+
     return final_metrics
+
+
+
 
 
 def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
@@ -1688,6 +2044,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
 
             # --- Main Assimilation Loop ---
             for i in range(args.test_steps - 1):
+                # print(i, args.test_steps-1)
                 # --- Ground Truth Evolution (Kalman Filter) ---
                 Q = (sigma_v.view(B, 1, 1) ** 2) * torch.eye(D, device=args.device)
                 R = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(D_obs, device=args.device)
