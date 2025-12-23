@@ -50,9 +50,10 @@ cd ..
 
 # Lorenz 96
 dataset="lorenz96"
-sigma_y=1
+sigma_y=0.7
 seed=42
-methods=("iEnKS-PertObs" "iEnKS-Sqrt" "iEnKS-Order1" "LETKF" "EnKF") 
+# methods=("iEnKS-PertObs" "iEnKS-Sqrt" "iEnKS-Order1" "LETKF" "EnKF") 
+methods=("iEnKS-Sqrt") 
 
 # --- Evaluation Loop ---
 for N in 5 10 15 20 40 60 100; do

@@ -47,64 +47,64 @@ cd ..
 # done
 
 # lorenz 63
-dataset="lorenz63"
+# dataset="lorenz63"
 
-sigma_y=1
-seed=42
-save_dir="lorenz63_EtE_LRes/2025-07-09_19-08lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst"
+# sigma_y=1
+# seed=42
+# save_dir="lorenz63_EtE_LRes/2025-07-09_19-08lorenz63_1.0_10_60_8192_es_joint_EtE-LRes_nst"
 
-# sigma_y = $sigma_y, EnST
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-        --v EtE-LRes \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth \
-        --pf_verification \
-        --pf_N 1000000 \
-        --sigma_reg None \
-        --noise_st_input \
-        --normal_output
-done
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v EtE-LRes \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 1000000 \
+#         --sigma_reg None \
+#         --noise_st_input \
+#         --normal_output
+# done
 
-save_dir="2025-06-28_21-52lorenz63_1.0_10_60_8192_l2_joint_CorrTerms"
+# save_dir="2025-06-28_21-52lorenz63_1.0_10_60_8192_l2_joint_CorrTerms"
 
-# sigma_y = $sigma_y, EnST
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-        --v CorrTerms \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth \
-        --pf_verification \
-        --pf_N 1000000 \
-        --sigma_reg None \
-        --normal_output
-done
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v CorrTerms \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 1000000 \
+#         --sigma_reg None \
+#         --normal_output
+# done
 
-save_dir="2025-06-28_21-55lorenz63_1.0_10_60_8192_es_joint_CorrTerms"
+# save_dir="2025-06-28_21-55lorenz63_1.0_10_60_8192_es_joint_CorrTerms"
 
-# sigma_y = $sigma_y, EnST
-for N in 5 10 15 20 40 60 100; do
-    python evaluate.py \
-        --v CorrTerms \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $sigma_y \
-        --seed $seed \
-        --no_localization \
-        --cp_load_path save/${save_dir}/cp_1000.pth \
-        --pf_verification \
-        --pf_N 1000000 \
-        --sigma_reg None \
-        --normal_output
-done
+# # sigma_y = $sigma_y, EnST
+# for N in 5 10 15 20 40 60 100; do
+#     python evaluate.py \
+#         --v CorrTerms \
+#         --dataset $dataset \
+#         --N $N \
+#         --sigma_y $sigma_y \
+#         --seed $seed \
+#         --no_localization \
+#         --cp_load_path save/${save_dir}/cp_1000.pth \
+#         --pf_verification \
+#         --pf_N 1000000 \
+#         --sigma_reg None \
+#         --normal_output
+# done
 
 # sigma_y=0.7
 # seed=42
@@ -122,7 +122,7 @@ done
 # done
 
 # # lorenz 96
-# dataset="lorenz96"
+dataset="lorenz96"
 
 # sigma_y=1
 # seed=42
@@ -143,18 +143,21 @@ done
 #         --noise_st_input 
 # done
 
-# sigma_y=0.7
+# sigma_y=1
 # seed=42
 # save_dir="2025-04-10_13-18lorenz96_0.7_10_60_8192_norm_EnST_joint"
 
 # # sigma_y = $sigma_y, EnST
 # for N in 5 10 15 20 40 60 100; do
 #     python evaluate.py \
+#         --device cpu \
 #         --dataset $dataset \
 #         --N $N \
 #         --sigma_y $sigma_y \
 #         --seed $seed \
-#         --cp_load_path save/${save_dir}/cp_1000.pth
+#         --normal_output \
+#         --v CorrTerms 
+#         # --cp_load_path save/${save_dir}/cp_1000.pth 
 # done
 
 # # ks

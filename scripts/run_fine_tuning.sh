@@ -19,9 +19,9 @@ cd ..
 #     --noise_st_input \
 #     --suffix _nst
 
-# Lorenz 63
+# Rossler
 python finetune.py \
-    --epochs 20 \
+    --epochs 40 \
     --save_epoch 20 \
     --dataset rossler \
     --train_steps 60 \

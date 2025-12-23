@@ -1,21 +1,18 @@
 #!/bin/bash
 
 cd ..
-python evaluate_linear_uncertainty.py \
-    --dataset linear \
-    --N 2 \
-    --seed 42 \
-    --normal_output
+dataset="linear"
 
-python evaluate_linear_uncertainty.py \
-    --dataset linear \
-    --N 5 \
-    --seed 42 \
-    --normal_output
+sigma_y=1
+seed=42
 
-python evaluate_linear_uncertainty.py \
-    --dataset linear \
-    --N 10 \
-    --seed 42 \
-    --normal_output
-
+for N in 10; do
+    python evaluate_linear_uncertainty.py \
+    --dataset $dataset \
+    --N $N \
+    --sigma_y $sigma_y \
+    --seed $seed \
+    --normal_output \
+    --dim 10 \
+    --obs_dim 5
+done
