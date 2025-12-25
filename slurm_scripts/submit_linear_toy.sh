@@ -14,14 +14,14 @@ DEFAULT_HIDDEN_DIM=16
 # Format: "EPOCHS LOSS_TYPE LEARNING_RATE DIM [HIDDEN_DIM]"
 # If HIDDEN_DIM is omitted, DEFAULT_HIDDEN_DIM will be used.
 EXPERIMENTS=(
-    "300 es 1e-3 10 64"
-    "300 nl2 1e-3 10 64"
-    "300 es 1e-3 2 64"
-    "300 nl2 1e-3 2 64"
-    "300 es 1e-3 20 64"
-    "300 nl2 1e-3 20 64"
-    # Example with explicit hidden_dim:
-    # "300 es 1e-3 10 64"
+    "300 nes 1e-2 20 16"
+    "300 es 1e-2 20 16"
+    "300 nl2 1e-2 20 16"
+    "300 l2 1e-2 20 16"
+    "300 nes 5e-3 20 16"
+    "300 es 5e-3 20 16"
+    "300 nl2 5e-3 20 16"
+    "300 l2 5e-3 20 16"
 )
 
 # Iterate through the list and submit jobs
