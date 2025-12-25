@@ -10,11 +10,11 @@
 #SBATCH -J "Linear-Train"       # job name
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o slurm.%N.%j.out      # STDOUT
-#SBATCH -e slurm.%N.%j.err      # STDERR
+#SBATCH -o output_record/slurm.%N.%j.out      # STDOUT
+#SBATCH -e output_record/slurm.%N.%j.err      # STDERR
 
 # Description: Slurm script for train_v2.py with auto-calculated obs_dim.
-# Input: Env vars LOSS_TYPE, EPOCHS, LR, DIM, HIDDEN_DIM.
+# Input: Env vars LOSS_TYPE, EPOCHS, LR, DIM, HIDDEN_DIM, SUFFIX.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -23,6 +23,7 @@ EPOCHS=${EPOCHS:-100}           # Default epochs
 LR=${LR:-1e-2}                  # Default learning rate
 DIM=${DIM:-10}                  # Default dimension
 HIDDEN_DIM=${HIDDEN_DIM:-128}   # Default hidden dimension
+SUFFIX=${SUFFIX:-$DIM}          # Default suffix (uses DIM if not set)
 
 # 2. Validation & Calculation
 # Check if DIM is even
@@ -32,7 +33,7 @@ if (( DIM % 2 != 0 )); then
 fi
 
 OBS_DIM=$((DIM / 2))
-echo "Configuration: DIM=$DIM, OBS_DIM=$OBS_DIM, HIDDEN_DIM=$HIDDEN_DIM"
+echo "Configuration: DIM=$DIM, OBS_DIM=$OBS_DIM, HIDDEN_DIM=$HIDDEN_DIM, SUFFIX=$SUFFIX"
 
 # Load modules
 module load cuda/12.2
@@ -56,4 +57,4 @@ python train_v2.py \
     --obs_dim $OBS_DIM \
     --hidden_dim $HIDDEN_DIM \
     --learning_rate $LR \
-    --suffix $DIM
+    --suffix $SUFFIX
