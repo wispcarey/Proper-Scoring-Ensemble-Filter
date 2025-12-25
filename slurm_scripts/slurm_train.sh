@@ -7,7 +7,6 @@
 #SBATCH --gres=gpu:1            # 1 GPU
 #SBATCH --partition=gpu         # use GPU partition
 #SBATCH --ntasks=1              # 1 task
-#SBATCH -J "L63-Train"          # job name
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH -o output_record/slurm.%N.%j.out      # STDOUT (saved to output_record)
@@ -43,6 +42,7 @@ cd ..
 # 3. Execution
 python train.py \
     --dataset $DATASET \
+    --num_loader_workers 1 \
     --epochs $EPOCHS \
     --N $N \
     --sigma_y $SIGMA_Y \

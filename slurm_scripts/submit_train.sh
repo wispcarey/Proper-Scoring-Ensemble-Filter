@@ -18,7 +18,6 @@ DEF_USE_PF="true"
 
 # List of specific experiments to run
 # Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE USE_PF"
-# You can leave trailing parameters empty to use defaults.
 EXPERIMENTS=(
     "lorenz63 1000 10 1 EtE-LRes es true"
     "lorenz63 1000 10 1 EtE-LRes nes true"
@@ -40,8 +39,14 @@ for exp in "${EXPERIMENTS[@]}"; do
     loss_type=${loss_type:-$DEF_LOSS}
     use_pf=${use_pf:-$DEF_USE_PF}
 
-    echo "Submitting job: D=$dataset, Ep=$epochs, N=$n, Sig=$sigma_y, V=$version, Loss=$loss_type, PF=$use_pf"
+    # --- Job Name Construction ---
+    # Example Name: lorenz63-es-N10
+    JOB_NAME="${dataset}-${loss_type}-N${n}"
 
-    # Submit using --export to pass variables to the Slurm script
-    sbatch --export=ALL,DATASET=$dataset,EPOCHS=$epochs,N=$n,SIGMA_Y=$sigma_y,VERSION=$version,LOSS_TYPE=$loss_type,USE_PF=$use_pf $SLURM_SCRIPT
+    echo "Submitting job: $JOB_NAME (Sig=$sigma_y, V=$version, PF=$use_pf)"
+
+    # Submit using --export to pass variables AND -J for the job name
+    sbatch -J "$JOB_NAME" \
+           --export=ALL,DATASET=$dataset,EPOCHS=$epochs,N=$n,SIGMA_Y=$sigma_y,VERSION=$version,LOSS_TYPE=$loss_type,USE_PF=$use_pf \
+           $SLURM_SCRIPT
 done
