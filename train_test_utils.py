@@ -4,6 +4,7 @@ import os
 
 import torch
 import torch.nn as nn
+import math
 
 from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
 from utils import AverageMeter, mystery_operator, get_mean_std
@@ -143,10 +144,26 @@ def _get_model_inputs(args, st_model1, st_model2, ens_v_f, hv, obs_y):
     else:
         raise NotImplementedError(f"args.v = {args.v} is not implemented.")
 
-def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=None):
+def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=None, infl=1.0, loc_radius=None):
     """
-    Process the analysis ensemble step using neural networks.
-    Returns the analyzed ensemble and the localization neural network output.
+    Process the analysis ensemble step.
+    
+    Inputs:
+        args: Argument parser with config (must contain Lvy/Lyy for EnKF/LETKF loc).
+        model_list: List of neural networks.
+        ens_v_f: Forecast ensemble (B, N_ens, D_state).
+        hv: Observation of forecast ensemble (B, N_ens, d_obs).
+        obs_y: Observations (B, d_obs).
+        ens_i_innov: Innovation (obs_y - hv) + noise (B, N_ens, d_obs). [Used for EnKF]
+        mean_ens_v_f: Mean of forecast ensemble (B, 1, D_state).
+        mean_hv: Mean of observation forecast (B, 1, d_obs).
+        sigma_y: Observation noise std.
+        infl: Multiplicative inflation factor (applied post-analysis).
+        loc_radius: Localization radius.
+
+    Outputs:
+        ens_v_a: Analyzed ensemble (B, N_ens, D_state).
+        loc_nn_output: Localization mask from NN (if applicable, else None).
     """
     if sigma_y is None:
         sigma_y = args.sigma_y
@@ -160,15 +177,12 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
     B, N_ens, D_state = ens_v_f.shape
     d_obs = hv.shape[2]
     
-    # Check if sigma_y is a scalar (0-dimensional tensor)
+    # Handle sigma_y shape
     if sigma_y.ndim == 0:
-        # If it's a scalar, expand it to match the batch size before reshaping
         sigma_y = sigma_y.expand(B).view(B, 1, 1)
     else:
-        # If it's already a 1D tensor of size B, just reshape it
         sigma_y = sigma_y.view(B, 1, 1)
     
-    # Initialize loc_nn_output to None to prevent UnboundLocalError
     loc_nn_output = None 
 
     if args.v == 'CorrTerms':
@@ -214,7 +228,6 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
             args, st_model1, st_model2, ens_v_f, hv, obs_y
         )
         nn_output = model(nn_input).view(B, N_ens, -1)
-        # modified to learning the residual 
         current_analyzed_ens_v_a = ens_v_f + nn_output
         
     elif args.v == 'EtE2':
@@ -232,9 +245,131 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
         R_cov = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(d_obs, device=args.device).unsqueeze(0).repeat(B, 1, 1)
         
         K1 = torch.bmm(Vnn2.transpose(1, 2), Ynn) 
-        K2 = torch.bmm(Ynn.transpose(1, 2), Ynn) + R_cov * (N_ens - 1)
+        K2_ens = torch.bmm(Ynn.transpose(1, 2), Ynn)
+        
+        # Apply Covariance Localization
+        if loc_radius is not None and loc_radius > 0:
+            if args.Lvy is None or args.Lyy is None:
+                raise ValueError("EnKF localization requires pre-computed args.Lvy and args.Lyy")
+
+            rho_vy = dist2coeff(args.Lvy, loc_radius, tag='GC')
+            rho_yy = dist2coeff(args.Lyy, loc_radius, tag='GC')
+            
+            K1 = K1 * rho_vy.unsqueeze(0)
+            K2_ens = K2_ens * rho_yy.unsqueeze(0)
+
+        K2 = K2_ens + R_cov * (N_ens - 1)
         K = torch.bmm(K1, torch.inverse(K2))
         current_analyzed_ens_v_a = Vnn1 + torch.bmm(ens_i_innov, K.transpose(1, 2))
+        
+        # Apply Post-Analysis Inflation
+        if infl != 1.0:
+            ens_mean = current_analyzed_ens_v_a.mean(dim=1, keepdim=True)
+            current_analyzed_ens_v_a = ens_mean + infl * (current_analyzed_ens_v_a - ens_mean)
+
+    elif args.v == 'LETKF':
+        if args.Lvy is None:
+            raise ValueError("LETKF requires args.Lvy for localization distances.")
+
+        # Prepare Anomalies (B, N_ens, D)
+        X_b = ens_v_f - mean_ens_v_f
+        Y_b = hv - mean_hv
+        
+        # Innovation (Mean only, no perturbations for LETKF usually)
+        # d_mean: (B, 1, D_obs)
+        if mean_hv.shape[1] != 1:
+            mean_hv_for_innov = mean_hv.mean(dim=1, keepdim=True)
+        else:
+            mean_hv_for_innov = mean_hv
+        d_mean = obs_y.view(B, 1, d_obs) - mean_hv_for_innov
+
+        # To store the analyzed state for each grid point
+        analyzed_cols = []
+        
+        # Pre-compute Identity matrix
+        eye_N = torch.eye(N_ens, device=args.device).unsqueeze(0) # (1, N, N)
+
+        # Iterate over each state dimension (Grid Point)
+        # Using args.ori_dim or D_state (they should be consistent here)
+        for k in range(D_state):
+            # 1. Identify Local Observations
+            # args.Lvy[k] is distance from state k to all obs
+            dists = args.Lvy[k] # Shape (d_obs,)
+            local_obs_idx = torch.where(dists <= loc_radius)[0]
+            
+            # If no local observations, analysis = forecast
+            if len(local_obs_idx) == 0:
+                analyzed_cols.append(ens_v_f[:, :, k:k+1])
+                continue
+            
+            # 2. Extract Local Quantities
+            # Y_loc: (B, N_ens, n_loc)
+            Y_loc = Y_b[:, :, local_obs_idx]
+            
+            # d_loc: (B, 1, n_loc)
+            d_loc = d_mean[:, :, local_obs_idx]
+            
+            # Normalize by R (assuming diagonal sigma)
+            # sigma_y is (B, 1, 1), broadcast to (B, 1, n_loc)
+            sigma_loc = sigma_y.view(B, 1, 1)
+            Y_loc_norm = Y_loc / sigma_loc
+            d_loc_norm = d_loc / sigma_loc
+            
+            # 3. Compute Transform Matrix T
+            # Hessian H = (N-1)I + Y_loc_norm @ Y_loc_norm.T
+            # Shape: (B, N_ens, N_ens)
+            YRY = torch.bmm(Y_loc_norm, Y_loc_norm.transpose(1, 2))
+            H = (N_ens - 1) * eye_N + YRY
+            
+            # Pa = H^-1 (Analysis Covariance in Ensemble Space)
+            # Use cholesky or standard inverse. Inverse is safer for general batch.
+            Pa = torch.inverse(H)
+            
+            # 4. Compute Weights
+            # Mean weights w_bar: (B, N_ens, 1)
+            # w_bar = Pa @ Y_loc_norm @ d_loc_norm.T
+            w_bar = torch.bmm(torch.bmm(Pa, Y_loc_norm), d_loc_norm.transpose(1, 2))
+            
+            # Perturbation weights W_a: (B, N_ens, N_ens)
+            # W_a = sqrt(N-1) * Pa^(1/2)
+            # Using Eigendecomposition for square root: Pa = V L V^T -> Pa^0.5 = V L^0.5 V^T
+            L, V = torch.linalg.eigh(Pa)
+            L = torch.clamp(L, min=1e-10) # Numerical stability
+            Pa_sqrt = torch.bmm(V, torch.diag_embed(torch.sqrt(L)))
+            Pa_sqrt = torch.bmm(Pa_sqrt, V.transpose(1, 2))
+            
+            W_a = math.sqrt(N_ens - 1) * Pa_sqrt
+            
+            # 5. Update State
+            # T = w_bar + W_a (Broadcasting w_bar to all columns)
+            # x_a = x_f_mean + X_b @ T
+            # Note: X_b is (B, N_ens, D_state). We need local X_b_k: (B, N_ens, 1)
+            # In ensemble space logic:
+            # X_a_k = X_b_k.T @ (w_bar + W_a) -> Result (B, 1, N_ens) then transpose back?
+            # Let's write explicitly:
+            #   Analyzed Ensemble = Mean + Perturbation
+            #   Ens_A = (mean_f + X_b^T w_bar) + (X_b^T W_a)
+            #   X_b_k: (B, N_ens, 1) -> X_b_k^T: (B, 1, N_ens)
+            
+            X_b_k_T = X_b[:, :, k:k+1].transpose(1, 2) # (B, 1, N_ens)
+            
+            # Transform matrix T_total: (B, N_ens, N_ens)
+            # Adding w_bar to every column of W_a effectively adds the mean update to every member
+            T_total = W_a + w_bar 
+            
+            # Apply transform
+            # (B, 1, N_ens) @ (B, N_ens, N_ens) -> (B, 1, N_ens) -> transpose -> (B, N_ens, 1)
+            update_k = torch.bmm(X_b_k_T, T_total).transpose(1, 2)
+            
+            analyzed_cols.append(mean_ens_v_f[:, :, k:k+1] + update_k)
+            
+        current_analyzed_ens_v_a = torch.cat(analyzed_cols, dim=2)
+        
+        # Apply Post-Analysis Inflation (Consistent with EnKF branch)
+        if infl != 1.0:
+            ens_mean = current_analyzed_ens_v_a.mean(dim=1, keepdim=True)
+            current_analyzed_ens_v_a = ens_mean + infl * (current_analyzed_ens_v_a - ens_mean)
+
     else:
         raise NotImplementedError(f"args.v = {args.v} is not implemented.")
 
@@ -243,7 +378,6 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
     else:
         ens_v_a = current_analyzed_ens_v_a
     
-    # Return both the analyzed ensemble and the localization output
     return ens_v_a, loc_nn_output
 
 def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
@@ -1747,7 +1881,7 @@ def get_ens_cov(ens_v):
     cov = torch.bmm(ens_v_minus_mean.transpose(1, 2), ens_v_minus_mean) / (ens_v.shape[1] - 1)
     return cov
 
-def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example_fig_v2', save_pdf=False):
+def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example_fig_v2', save_pdf=False, infl=1, loc_radius=None):
     """
     Tests the data assimilation models on a linear dataset.
     This version computes and compares against the ground truth error covariance
@@ -1844,7 +1978,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 
                 # --- Analysis Step (Refactored) ---
                 ens_v_a, loc_nn_output = _process_analysis_step(
-                    args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=sigma_y
+                    args, model_list, ens_v_f, hv, obs_y, ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=sigma_y,
+                    infl=infl, loc_radius=loc_radius, 
                 )
 
                 # --- Calculate and Store Covariance Difference ---
@@ -2044,7 +2179,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
 
             # --- Main Assimilation Loop ---
             for i in range(args.test_steps - 1):
-                # print(i, args.test_steps-1)
+                print(i, args.test_steps-1)
                 # --- Ground Truth Evolution (Kalman Filter) ---
                 Q = (sigma_v.view(B, 1, 1) ** 2) * torch.eye(D, device=args.device)
                 R = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(D_obs, device=args.device)

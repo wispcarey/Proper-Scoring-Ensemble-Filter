@@ -82,7 +82,7 @@ DATASET_INFO = {
         'test_steps': 100,
         'test_traj_num': 64,
         'hidden_dim': 16,
-        'learning_rate': 3e-3, 
+        'learning_rate': 1e-2, 
         'batch_size': 1024,
         'train_steps': 60,
         'train_traj_num': 8192,

@@ -15,7 +15,7 @@ from train_test_utils import test_model_v2, set_models, print_test_results_v2
 if __name__ == "__main__":
     args = get_parameters()
     
-    if args.v == "EnKF":
+    if args.v == "EnKF" or args.v == "LETKF":
         folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
         if not os.path.isdir(folder_name):
             os.makedirs(folder_name)
@@ -48,7 +48,7 @@ if __name__ == "__main__":
         # test
         print("Test NN Results")
         t_start = time.time()
-        test_results = test_model_v2(test_loader, model_list, args, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False)
+        test_results = test_model_v2(test_loader, model_list, args, plot_figures=False, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False, infl=1, loc_radius=5)
         print_test_results_v2(test_results)
         t_inference = time.time() - t_start
         print(f"Inference finished with time {t_inference: .2f}s.")
@@ -56,29 +56,45 @@ if __name__ == "__main__":
         # save results
         tensor_dict = {
             'nn': {
+                # RMSE
                 'mean_rmse': test_results.get('mean_rmse', float('nan')),
                 'std_rmse': test_results.get('std_rmse', float('nan')),
+                # RRMSE
                 'mean_rrmse': test_results.get('mean_rrmse', float('nan')),
                 'std_rrmse': test_results.get('std_rrmse', float('nan')),
+                # RMV (added)
                 'mean_rmv': test_results.get('mean_rmv', float('nan')),
-                'std_rmv': test_results.get('std_rmv', float('nan')),  
+                'std_rmv': test_results.get('std_rmv', float('nan')),
+                # CRPS
                 'mean_crps': test_results.get('mean_crps', float('nan')),
                 'std_crps': test_results.get('std_crps', float('nan')),
+                # RCRPS
                 'mean_rcrps': test_results.get('mean_rcrps', float('nan')),
                 'std_rcrps': test_results.get('std_rcrps', float('nan')),
+                # W2 (added)
+                'mean_w2_diff': test_results.get('mean_w2_diff', float('nan')),
+                'std_w2_diff': test_results.get('std_w2_diff', float('nan')),
+                
+                # Stats & Norms
                 'valid_percent': test_results.get('no_nan_percent', 0.0),
-                'cov_diff': test_results.get('mean_cov_diff', float('nan')),
-                'rcov_diff': test_results.get('mean_rcov_diff', float('nan')),
-                'w2_diff': test_results.get('mean_w2_diff', float('nan')),
+                'min_m_norm': test_results.get('min_m_norm', float('nan')),
+                'max_m_norm': test_results.get('max_m_norm', float('nan')),
+
+                # Args & Timing
+                'loc_diff_dist': getattr(args, 'diff_dist', None),
+                'mean_assim_time_w': test_results.get('assim_step_time_mean_weighted', float('nan')),
+                'std_assim_time_w': test_results.get('assim_step_time_std_weighted', float('nan')),
+                'mean_assim_time': test_results.get('assim_step_time_mean', float('nan')),
+                'std_assim_time': test_results.get('assim_step_time_std', float('nan')),
             },
             'cp_load_path': getattr(args, 'cp_load_path', None),
             'sigma_y': getattr(args, 'sigma_y', None),
             'time': t_inference,
+            'test_results': test_results,
         }
-
-        if args.zero_infl:
-            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}.pt"))
-        else:
-            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
+        
+        # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
+        
+        torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
 
 

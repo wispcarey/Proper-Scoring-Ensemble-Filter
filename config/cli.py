@@ -296,7 +296,10 @@ def get_parameters():
         args.obs_dim = dataset_config.get('obs_dim')
         
     if isinstance(args.obs_inds, str) and args.obs_inds == 'default':
-        args.obs_inds = dataset_config.get('obs_inds')
+        if args.dataset == 'linear':
+            args.obs_inds = torch.arange(0, args.ori_dim, 2)
+        else:
+            args.obs_inds = dataset_config.get('obs_inds')
         
     args.clamp = dataset_config.get('clamp')
 
@@ -350,7 +353,7 @@ def get_parameters():
         args.local_input_dim += args.obs_dim
 
     # localization
-    if args.ori_dim and args.obs_inds is not None:
+    if args.ori_dim is not None and args.obs_inds is not None:
         full_inds = torch.arange(0, args.ori_dim)
         Lvy = pairwise_distances(full_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
         Lyy = pairwise_distances(args.obs_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
