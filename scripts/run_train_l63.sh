@@ -10,6 +10,7 @@ python train.py \
    --seed 42 \
    --v EtE-LRes \
    --no_localization \
+   --no_running_loss \
    --loss_type es \
    --es_p 1 \
    --test_steps 500 \
