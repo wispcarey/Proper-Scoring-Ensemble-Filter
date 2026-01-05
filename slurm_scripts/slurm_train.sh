@@ -13,7 +13,7 @@
 #SBATCH -e output_record/slurm.%N.%j.err      # STDERR (saved to output_record)
 
 # Description: Slurm script for train.py with configurable parameters for Lorenz63.
-# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, USE_PF.
+# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, USE_PF, LEARNING_RATE, SUFFIX.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -24,6 +24,8 @@ SIGMA_Y=${SIGMA_Y:-1}                # Default sigma_y
 VERSION=${VERSION:-"EtE-LRes"}       # Default version (--v)
 LOSS_TYPE=${LOSS_TYPE:-"es"}         # Default loss type
 USE_PF=${USE_PF:-"true"}             # Set to "false" to disable --pf_verification
+LEARNING_RATE=${LEARNING_RATE:-"default"} # Default learning rate
+SUFFIX=${SUFFIX:-""}                 # Default suffix (empty string)
 
 # 2. Logic for Boolean Flags
 PF_FLAG=""
@@ -31,7 +33,7 @@ if [ "$USE_PF" = "true" ]; then
     PF_FLAG="--pf_verification"
 fi
 
-echo "Configuration: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, PF=$USE_PF"
+echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, PF=$USE_PF, LR=$LEARNING_RATE, SUFFIX='$SUFFIX'"
 
 # Load modules
 module load cuda/12.2
@@ -48,6 +50,8 @@ python train.py \
     --sigma_y $SIGMA_Y \
     --seed 42 \
     --v $VERSION \
+    --learning_rate $LEARNING_RATE \
+    --suffix "$SUFFIX" \
     --no_localization \
     --no_running_loss \
     --loss_type $LOSS_TYPE \

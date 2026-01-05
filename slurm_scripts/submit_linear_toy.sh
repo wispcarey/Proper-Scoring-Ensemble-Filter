@@ -15,14 +15,14 @@ DEFAULT_SUFFIX="default"
 # Format: "EPOCHS LOSS_TYPE LEARNING_RATE DIM HIDDEN_DIM SUFFIX"
 # Note: To use a SUFFIX, HIDDEN_DIM must be specified (cannot be omitted).
 EXPERIMENTS=(
-    "300 nes 1e-2 20 16 _20_1e-2"
-    "300 es 1e-2 20 16 _20_1e-2"
-    "300 nl2 1e-2 20 16 _20_1e-2"
-    "300 l2 1e-2 20 16 _20_1e-2"
-    "300 nes 5e-3 20 16 _20_5e-3"
-    "300 es 5e-3 20 16 _20_5e-3"
-    "300 nl2 5e-3 20 16 _20_5e-3"
-    "300 l2 5e-3 20 16 _20_5e-3"
+    "300 nes 1e-2 20 16 _20_1e-3"
+    "300 es 1e-2 20 16 _20_1e-3"
+    "300 nl2 1e-2 20 16 _20_1e-3"
+    "300 l2 1e-2 20 16 _20_1e-3"
+    "300 nes 5e-3 20 16 _20_5e-4"
+    "300 es 5e-3 20 16 _20_5e-4"
+    "300 nl2 5e-3 20 16 _20_5e-4"
+    "300 l2 5e-3 20 16 _20_5e-4"
 )
 
 # Iterate through the list and submit jobs
