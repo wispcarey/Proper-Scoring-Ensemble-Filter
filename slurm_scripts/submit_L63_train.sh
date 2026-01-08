@@ -5,7 +5,7 @@
 # Output: Submits jobs via sbatch with specific environment variables.
 
 # Target Slurm script
-SLURM_SCRIPT="slurm_train.sh"
+SLURM_SCRIPT="slurm_L63_train.sh"
 
 # Default values
 DEF_DATASET="lorenz63"
@@ -22,18 +22,11 @@ DEF_SUFFIX=""
 # Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE USE_PF LEARNING_RATE SUFFIX"
 # Note: If a value is missing (end of string), it defaults to the DEF variables above.
 EXPERIMENTS=(
-    "lorenz63 500 10 1 EtE-LRes es true 5e-3 _5e-3"
-    "lorenz63 500 10 1 EtE-LRes nes true 5e-3 _5e-3"
-    "lorenz63 500 10 1 EtE-LRes nl2 true 5e-3 _5e-3"
-    "lorenz63 500 10 1 EtE-LRes l2 true 5e-3 _5e-3"
-    "lorenz63 500 10 1 EtE-LRes es true 1e-2 _1e-2"
-    "lorenz63 500 10 1 EtE-LRes nes true 1e-2 _1e-2"
-    "lorenz63 500 10 1 EtE-LRes nl2 true 1e-2 _1e-2"
-    "lorenz63 500 10 1 EtE-LRes l2 true 1e-2 _1e-2"
-    "lorenz63 500 10 1 EtE-LRes es true 5e-4 _5e-4"
-    "lorenz63 500 10 1 EtE-LRes nes true 5e-4 _5e-4"
-    "lorenz63 500 10 1 EtE-LRes nl2 true 5e-4 _5e-4"
-    "lorenz63 500 10 1 EtE-LRes l2 true 5e-4 _5e-4"
+    "lorenz63 1000 10 1 EtE-LRes es true 1e-3 _1e-3"
+    "lorenz63 1000 10 1 EtE-LRes nl2 true 1e-3 _1e-3"
+    "lorenz63 1000 10 1 EtE-LRes l2 true 1e-3 _1e-3"
+    "lorenz96 1000 10 1 EtE-LRes es False 1e-3 _1e-3"
+    "ks 1000 10 1 EtE-LRes es False 5e-4 _5e-4"
 )
 
 # Iterate and submit
