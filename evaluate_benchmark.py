@@ -1,5 +1,4 @@
 import os
-
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -7,67 +6,71 @@ import numpy as np
 import time
 
 from config.cli import get_parameters
-
 from utils import setup_optimizer_and_scheduler, load_checkpoint
 from utils import partial_obs_operator, get_dataloader, redirect_output
-
 from train_test_utils import test_ClassicFilter, print_test_results
 
-def get_benchmarks(args):
+def get_benchmarks(args, source='dapper'):
     """
-    This function processes benchmark data from a CSV file, splitting it by `sigma_y` values 1 and 0.7,
-    and extracting specific columns for each `method`, then combining them into a 2*N*5 numpy array.
+    Retrieve benchmark parameters and metrics.
     
     Args:
-        args: An object or namespace with a `dataset` attribute specifying the dataset name.
+        args: Argument namespace.
+        source (str): 'dapper' to read from CSV, 'torch' to read from grid search .pt file.
         
     Returns:
-        result arrays for sigma_y=1 and sigma_y=0.7 (each as numpy arrays of selected columns).
+        If source is 'dapper': Returns (sigma_y_1_array, sigma_y_0_7_array)
+        If source is 'torch': Returns (infl, loc_radius)
     """
-    file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
-    df = pd.read_csv(file_path, usecols=['method', 'N', 'sigma_y', 'best_loc_rad','best_infl','rmse', 'rrmse_mean'])
+    if source == 'dapper':
+        # --- Original CSV Reading Logic ---
+        file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
+        df = pd.read_csv(file_path, usecols=['method', 'N', 'sigma_y', 'best_loc_rad','best_infl','rmse', 'rrmse_mean'])
 
-    # if args.v == "LETKF" or (args.v.startswith('iEnKS') and args.dataset != 'lorenz63'):
-    #     method = "LETKF"
-    # elif args.v == "EnKF" or args.v.startswith('iEnKS'):
-    #     method = "EnKF_PertObs"
-    # elif args.v == "ESRF":
-    #     method = "EnKF_Sqrt"
-    # else:
-    #     raise NotImplementedError
-    method = "LETKF"
-    method_data = df[(df['method'] == method) & (df['N'] == args.N)]
-    
-    # Filter rows where sigma_y == 1 and 0.7
-    sigma_y_1 = method_data[method_data['sigma_y'] == 1][['best_loc_rad','best_infl','rmse', 'rrmse_mean']]
-    sigma_y_0_7 = method_data[method_data['sigma_y'] == 0.7][['best_loc_rad','best_infl','rmse', 'rrmse_mean']]
-    
-    # Convert to numpy arrays
-    sigma_y_1_array = sigma_y_1.to_numpy()
-    sigma_y_0_7_array = sigma_y_0_7.to_numpy()
+        # Hardcoded method selection from original snippet (can be adjusted if needed)
+        method = "LETKF" 
+        method_data = df[(df['method'] == method) & (df['N'] == args.N)]
+        
+        # Filter rows for specific sigma_y
+        sigma_y_1 = method_data[method_data['sigma_y'] == 1][['best_loc_rad','best_infl','rmse', 'rrmse_mean']]
+        sigma_y_0_7 = method_data[method_data['sigma_y'] == 0.7][['best_loc_rad','best_infl','rmse', 'rrmse_mean']]
+        
+        return sigma_y_1.to_numpy(), sigma_y_0_7.to_numpy()
 
-    return sigma_y_1_array, sigma_y_0_7_array
+    elif source == 'torch':
+        # --- New Torch Grid Search Reading Logic ---
+        # Construct path: save/{dataset}_benchmarks/benchmark_{dataset}_{sigma}_{method}/grid_search_results_{N}.pt
+        folder_name = os.path.join(
+            "save", 
+            f"{args.dataset}_benchmarks", 
+            f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}"
+        )
+        data_path = os.path.join(folder_name, f"grid_search_results_{args.N}.pt")
+        
+        print(f"Loading benchmarks from: {data_path}")
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Benchmark file not found: {data_path}")
 
-# def get_benchmarks(args):
-#     folder_name = os.path.join("save", f"{args.dataset}_benchmarks", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
-#     data_name = os.path.join(folder_name, f"grid_search_results_{args.N}.pt")
-#     data = torch.load(data_name, weights_only=False)
-#     # data['best_params']: 'infl': 1.0, 'loc_radius': None, 'mean_crps': 0.7652797698974609
-#     return data['best_params']['infl'], data['best_params']['loc_radius'], data['best_params']['mean_crps']
+        benchmark_data = torch.load(data_path, weights_only=False)
+        
+        # Extract optimal parameters
+        best_params = benchmark_data['best_params']
+        infl = best_params['infl']
+        loc_radius = best_params['loc_radius']
+        
+        return infl, loc_radius
+
+    else:
+        raise ValueError(f"Unknown benchmark source: {source}")
 
 
 def write_benchmark_row(args, loc_radius, infl, rmse, rrmse, rmse_std=None, rrmse_std=None):
     """
-    Append or upsert a row into the benchmark CSV with method name f"{args.v}_loc".
-    If a row with the same (method, N, sigma_y) exists, print a message and overwrite
-    that row in place (and deduplicate if multiple exist). Otherwise, append a new row.
+    Append or upsert a row into the benchmark CSV.
     """
-    # Build file path consistently with get_benchmarks
     file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
 
-    # Create a base dataframe if the file does not exist
     if not os.path.isfile(file_path):
-        # Define a minimal schema so all later writes have aligned columns
         base_cols = [
             'method', 'N', 'sigma_y',
             'best_loc_rad', 'best_infl',
@@ -80,7 +83,6 @@ def write_benchmark_row(args, loc_radius, infl, rmse, rrmse, rmse_std=None, rrms
     else:
         df_full = pd.read_csv(file_path)
 
-    # Prepare the candidate row using the fields we can supply
     candidate = {
         'method': f'{args.v}_loc',
         'N': int(args.N),
@@ -93,62 +95,51 @@ def write_benchmark_row(args, loc_radius, infl, rmse, rrmse, rmse_std=None, rrms
         'rrmse_std': float(rrmse_std) if rrmse_std is not None else np.nan,
     }
 
-    # Ensure every existing CSV column exists in candidate; fill missing with NaN
     for col in df_full.columns:
         if col not in candidate:
             candidate[col] = np.nan
 
-    # If candidate has new columns, add them into df_full
     extra_cols = [k for k in candidate.keys() if k not in df_full.columns]
     if extra_cols:
         for c in extra_cols:
             df_full[c] = np.nan
 
-    # Upsert by (method, N, sigma_y)
     has_keys = all(k in df_full.columns for k in ['method', 'N', 'sigma_y'])
     if has_keys and len(df_full) > 0:
-        # Build a boolean mask for the key
         mask = (
             (df_full['method'] == candidate['method']) &
             (df_full['N'] == candidate['N']) &
             (df_full['sigma_y'] == candidate['sigma_y'])
         )
         if mask.any():
-            # Print a clear message and overwrite the first matching row
             idxs = np.flatnonzero(mask)
             idx = idxs[0]
-            print(f"[write_benchmark_row] Existing row found for "
-                  f"(method={candidate['method']}, N={candidate['N']}, sigma_y={candidate['sigma_y']}). Overwriting.")
-
-            # Overwrite in place
+            print(f"[write_benchmark_row] Overwriting existing row for {candidate['method']}, N={candidate['N']}.")
             for k, v in candidate.items():
                 df_full.at[idx, k] = v
-
-            # If multiple duplicates exist, drop extras and keep only the first
             if len(idxs) > 1:
-                dup_idx = idxs[1:]
-                df_full = df_full.drop(index=dup_idx).reset_index(drop=True)
+                df_full = df_full.drop(index=idxs[1:]).reset_index(drop=True)
         else:
-            # No existing row => append
             df_full = pd.concat([df_full, pd.DataFrame([candidate])], ignore_index=True)
     else:
-        # No key columns or empty dataframe => append
         df_full = pd.concat([df_full, pd.DataFrame([candidate])], ignore_index=True)
 
-    # Sort for readability (ignore errors if columns missing)
     try:
         df_full = df_full.sort_values(by=['method', 'N', 'sigma_y']).reset_index(drop=True)
     except Exception:
         pass
 
-    # Persist to disk
     df_full.to_csv(file_path, index=False)
-
 
 
 if __name__ == "__main__":
     args = get_parameters()
     
+    # === Configuration ===
+    # Set the benchmark source here: 'dapper' (CSV) or 'torch' (Grid Search .pt)
+    BENCHMARK_SOURCE = 'torch' 
+    # =====================
+
     folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
     if not os.path.isdir(folder_name):
         os.makedirs(folder_name)
@@ -166,23 +157,38 @@ if __name__ == "__main__":
             args.test_batch_size = args.test_batch_size // 2
         test_loader = get_dataloader(args, test_only=True)
         
-        # print test information
         print(f"Test on {args.test_traj_num} trajectories with the length {args.test_steps} and ensemble size {args.N}. Observation noise sigma_y={args.sigma_y}.\n"
-            f"Method: {args.v}")
+              f"Method: {args.v}")
     
-        # get optimal parameters
-        sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args)
-        if args.sigma_y == 1:
-            dapper_array = sigma_y_1_array
-        elif args.sigma_y == 0.7:
-            dapper_array = sigma_y_0_7_array
-        else:
-            raise NotImplementedError
-        print(dapper_array.shape)
-        loc_radius, infl, rmse_dapper, rrmse_dapper = dapper_array[0,0], dapper_array[0,1], dapper_array[0,2], dapper_array[0,3]
-        print(f"RMSE from DAPPER: {rmse_dapper:.3f}.")
-        print(f"RRMSE from DAPPER: {rrmse_dapper:.3f}.")
-        print(f"Inflation: {infl}; Localization Radius: {loc_radius}")
+        # --- Retrieve Optimal Parameters ---
+        if BENCHMARK_SOURCE == 'dapper':
+            sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args, source='dapper')
+            
+            # Select appropriate array based on sigma_y
+            if args.sigma_y == 1:
+                dapper_array = sigma_y_1_array
+            elif args.sigma_y == 0.7:
+                dapper_array = sigma_y_0_7_array
+            else:
+                raise NotImplementedError(f"Dapper benchmark not configured for sigma_y={args.sigma_y}")
+            
+            # Unpack array [best_loc_rad, best_infl, rmse, rrmse_mean]
+            if dapper_array.shape[0] > 0:
+                loc_radius = dapper_array[0, 0]
+                infl = dapper_array[0, 1]
+                rmse_baseline = dapper_array[0, 2]
+                rrmse_baseline = dapper_array[0, 3]
+                print(f"RMSE from DAPPER: {rmse_baseline:.3f}.")
+                print(f"RRMSE from DAPPER: {rrmse_baseline:.3f}.")
+            else:
+                print("Warning: No DAPPER benchmark found for this configuration.")
+                loc_radius, infl = None, None
+
+        elif BENCHMARK_SOURCE == 'torch':
+            infl, loc_radius = get_benchmarks(args, source='torch')
+            print(f"Loaded from Torch Grid Search -> Inflation: {infl}; Localization Radius: {loc_radius}")
+
+        print(f"Using Inflation: {infl}; Localization Radius: {loc_radius}")
         
         # test
         t_start = time.time()
@@ -201,18 +207,6 @@ if __name__ == "__main__":
         t_inference = time.time() - t_start
         print(f"Inference finished with time {t_inference: .2f}s.")
 
-        # >>> New: write/update a row back into the benchmark CSV for method "{args.v}_loc"
-        # Use test_results for mean and std metrics, and use infl/loc_radius from the selected benchmark.
-        # write_benchmark_row(
-        #     args,
-        #     loc_radius=loc_radius,
-        #     infl=infl,
-        #     rmse=test_results.get('mean_rmse', float('nan')),
-        #     rrmse=test_results.get('mean_rrmse', float('nan')),
-        #     rmse_std=test_results.get('std_rmse', float('nan')),
-        #     rrmse_std=test_results.get('std_rrmse', float('nan')),
-        # )
-            
         # save results
         tensor_dict = {
             'nn': {
@@ -240,7 +234,5 @@ if __name__ == "__main__":
             'time': t_inference,
             'test_results': test_results,
         }
-        
-        # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
         torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
