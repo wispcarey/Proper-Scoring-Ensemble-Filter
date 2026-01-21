@@ -37,15 +37,15 @@ if __name__ == "__main__":
 
 
         ##################### fine-tuning on different N
-        N_list = [5,10,15,20,40,60,100]
-        # N_list = [20, 40]
+        N_list = [5,10,15,20]
+        # N_list = [40, 60, 100]
         ori_batch_size = args.batch_size
 
         for N in N_list:
             if N == 40 or N == 60:
-                args.batch_size = ori_batch_size // 2
-            elif N == 100:
                 args.batch_size = ori_batch_size // 4
+            elif N == 100:
+                args.batch_size = ori_batch_size // 8
             else:
                 args.batch_size = ori_batch_size 
             args.print_batch = math.ceil(args.train_traj_num / args.batch_size)
@@ -54,19 +54,21 @@ if __name__ == "__main__":
             optimizer, scheduler = setup_optimizer_and_scheduler(model_list, args)
             train_loader, test_loader = get_dataloader(args)
 
-            # load checkpoint
             if args.cp_load_path != "no":
                 load_checkpoint(model_list, None, None, filename=args.cp_load_path, use_data_parallel=args.use_data_parallel)
+                
+                # Freeze parameters for static models
                 for param in st_model1.parameters():
                     param.requires_grad = False
                 for param in st_model2.parameters():
                     param.requires_grad = False
-                # for param in model.parameters():
-                #     param.requires_grad = False
-            # for name, param in model_list[0].named_parameters():
-            #     print(f"Model: model, Parameter: {name}, Requires gradient: {param.requires_grad}")
-            # for name, param in model_list[1].named_parameters():
-            #     print(f"Model: infl_model, Parameter: {name}, Requires gradient: {param.requires_grad}")
+
+                # Calculate and print parameter counts
+                total_params = sum(p.numel() for model in model_list for p in model.parameters())
+                trainable_params = sum(p.numel() for model in model_list for p in model.parameters() if p.requires_grad)
+                
+                print(f"Total parameters: {total_params}")
+                print(f"Trainable parameters: {trainable_params}")
 
             # Fine-tuning
             train_loss_list = []

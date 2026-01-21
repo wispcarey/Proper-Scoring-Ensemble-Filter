@@ -380,21 +380,40 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
     
     return ens_v_a, loc_nn_output
 
+### compute likelihoods for weight particle filter training
+def compute_likelihood_weights(hv, obs_y, sigma_y):
+    """
+    Computes normalized importance weights w ~ p(y|x) for the forecast ensemble.
+    
+    Args:
+        hv (torch.Tensor): H(x_forecast). Shape: [B, N, D_obs]
+        obs_y (torch.Tensor): Observation y. Shape: [B, D_obs]
+        sigma_y (float): Observation noise standard deviation.
+        
+    Returns:
+        torch.Tensor: Normalized weights. Shape: [B, N]
+    """
+    # Ensure obs_y matches particle dimension for broadcasting: [B, 1, D_obs]
+    # obs_y_expanded = obs_y.unsqueeze(1)
+    
+    # Compute squared error summed over observation dimensions: ||y - H(x)||^2
+    # Shape: [B, N]
+    sq_error = torch.sum((hv - obs_y)**2, dim=2)
+    
+    # Calculate Log-Weights: -0.5 * error / sigma^2
+    # Adding a small epsilon to sigma is good practice but args.sigma_y implies valid std.
+    log_w = -0.5 * sq_error / (sigma_y ** 2)
+    
+    # Stable Softmax over the particle dimension (dim=1) to get normalized weights
+    w = torch.softmax(log_w, dim=1)
+    
+    return w
+
+###############################################################
+
 def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=None):
     """
     Function to train the model for one epoch.
-
-    Args:
-        epoch (int): The current epoch number.
-        loader (DataLoader): The data loader for training data.
-        model_list (list): A list of models to be trained.
-        optimizer (Optimizer): The optimizer for updating model weights.
-        scheduler (Scheduler): The learning rate scheduler.
-        args (Namespace): A namespace containing all arguments/hyperparameters.
-        H_info (tuple, optional): A tuple containing the observation operator and its matrix form. Defaults to None.
-
-    Returns:
-        float: The average loss for the epoch.
     """
     model, infl_model, local_model, st_model1, st_model2 = model_list
     m = args.N
@@ -438,6 +457,10 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
             all_trainable_params.extend(list(filter(lambda p: p.requires_grad, m_.parameters())))
 
     num_batches_all_nan = 0
+    
+    # Check if we need to compute WPF losses (Requires extra inputs)
+    wpf_loss_names = ['wpf_ed', 'wpf_fmmd', 'wpf_ammd']
+    is_wpf_mode = any(lt in args.loss_type for lt in wpf_loss_names)
 
     # --- Batch Loop ---
     for batch_ind, batch_v_trajectory in enumerate(loader):
@@ -460,7 +483,10 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
         # --- Initialize variables for loss calculation ---
         accumulated_loss_for_batch_load = 0.0
         num_valid_loss_contributions = 0
+        
+        # Storage for Trajectory Loss (running_loss = False)
         collected_ens_v_a = [] if not args.running_loss else None
+        collected_wpf_data = {'target_ens': [], 'target_weights': []} if (not args.running_loss and is_wpf_mode) else None
 
         # ======================= [REFACTORED UNIFIED TIME-STEP LOOP] =======================
         for i in range(end_ind_t):
@@ -478,7 +504,15 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
             
             ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
             ens_v_f = ens_v_f + torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+            
+            # Forecast in Observation Space
             hv = H_fun(ens_v_f)
+            
+            # We do this here because hv is readily available
+            current_lik_weights = None
+            if is_wpf_mode:
+                current_lik_weights = compute_likelihood_weights(hv, obs_y, args.sigma_y)
+
             r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
             ens_i_innov = obs_y - hv - r_noise
             mean_hv = torch.mean(hv, dim=1, keepdim=True)
@@ -492,8 +526,19 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
             # --- Strategy-Dependent Action inside the loop ---
             if args.running_loss:
                 if (i + 1) > args.ignore_first:
-                    ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
-                    batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)
+                    ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0) # [1, B, N, D]
+                    batch_v_step = batch_v_trajectory[i + 1].unsqueeze(0)   # [1, B, D]
+                    
+                    wpf_input_step = None
+                    if is_wpf_mode:
+                        wpf_input_step = {
+                            # Target is the weighted Forecast Ensemble (Prior)
+                            'target_ens': ens_v_f.unsqueeze(0),       # [1, B, M, D]
+                            'target_weights': current_lik_weights.unsqueeze(0), # [1, B, M]
+                            'ens_weights': None, # Analysis ensemble is usually unweighted
+                            'sigma': getattr(args, 'kes_sigma', 1.0)
+                        }
+
                     nan_mask_this_step = torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0) 
                     valid_B_mask_this_step = ~nan_mask_this_step
 
@@ -504,7 +549,8 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                                 ens_tensor=ens_tensor_step, batch_v=batch_v_step,
                                 loss_type=loss_type_val, ignore_first=0, end_ind=None,
                                 valid_B_mask=valid_B_mask_this_step.unsqueeze(0),
-                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True 
+                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,
+                                wpf_input=wpf_input_step # Pass the prepared input
                             )
                         
                         accumulated_loss_for_batch_load += step_loss_sum_over_valid_batch_items
@@ -516,6 +562,9 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                                           num_valid_in_step.item())
             else: # Trajectory loss: collect tensors
                 collected_ens_v_a.append(current_analyzed_ens_v_a)
+                if is_wpf_mode:
+                    collected_wpf_data['target_ens'].append(ens_v_f)
+                    collected_wpf_data['target_weights'].append(current_lik_weights)
             
             # --- Common State Update and Detach Logic ---
             ens_v_a = current_analyzed_ens_v_a
@@ -534,8 +583,20 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                 num_batches_all_nan += 1
         else: # Trajectory loss
             if len(collected_ens_v_a) > args.ignore_first:
-                ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:]
+                # Stack Analysis Ensemble
+                ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:] # [T, B, N, D]
                 batch_v = batch_v_trajectory[1:end_ind_t + 1][args.ignore_first:]
+                
+                wpf_input_traj = None
+                if is_wpf_mode:
+                    target_ens_stack = torch.stack(collected_wpf_data['target_ens'], dim=0)[args.ignore_first:] # [T, B, N, D]
+                    target_weights_stack = torch.stack(collected_wpf_data['target_weights'], dim=0)[args.ignore_first:] # [T, B, N]
+                    wpf_input_traj = {
+                        'target_ens': target_ens_stack,
+                        'target_weights': target_weights_stack,
+                        'ens_weights': None,
+                        'sigma': getattr(args, 'kes_sigma', 1.0)
+                    }
                 
                 if ens_tensor.shape[0] > 0:
                     valid_B_mask = ~torch.isnan(ens_tensor).any(dim=(2, 3))
@@ -545,7 +606,8 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                         total_loss = sum(compute_loss(
                                 ens_tensor=ens_tensor, batch_v=batch_v, loss_type=loss_type_val,
                                 ignore_first=0, end_ind=None, valid_B_mask=valid_B_mask,
-                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True
+                                norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,
+                                wpf_input=wpf_input_traj # Pass the stacked input
                             ) for loss_type_val in args.loss_type)
                         
                         average_loss = total_loss / num_valid_loss_contributions
@@ -1825,8 +1887,8 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
                     num_valid_loss_contributions = torch.sum(valid_B_mask).item()
 
                     if num_valid_loss_contributions > 0:
-                        normalize_val = torch.std(batch_v, dim=0)
-                        # normalize_val = None
+                        # normalize_val = torch.std(batch_v, dim=0)
+                        normalize_val = None
                         total_loss = sum(compute_loss(
                             ens_tensor=ens_tensor, batch_v=batch_v, loss_type=lt, ignore_first=0, end_ind=None,
                             valid_B_mask=valid_B_mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,

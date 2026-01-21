@@ -137,7 +137,7 @@ if __name__ == "__main__":
     
     # === Configuration ===
     # Set the benchmark source here: 'dapper' (CSV) or 'torch' (Grid Search .pt)
-    BENCHMARK_SOURCE = 'torch' 
+    BENCHMARK_SOURCE = 'dapper' 
     # =====================
 
     folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")

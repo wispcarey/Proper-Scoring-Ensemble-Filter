@@ -120,34 +120,138 @@ def compute_kernel_es(ens_states, true_states, sigma=None):
     kernel_es_val = -term1_ef_k_xy + 0.5 * term2_ef_k_xx_prime_avg
     return kernel_es_val
 
+#######################################################
+# related to the weighted particle filter loss functions
+import torch
+
+import torch
+
+def _get_batched_weights(w, shape_constraints):
+    """
+    Internal helper: Normalize weights for batched computation.
+    
+    Inputs:
+        w: (Tensor or None) Weights of shape [K, N]
+        shape_constraints: (tuple) (K, N) to generate uniform weights if w is None
+        
+    Output:
+        w_norm: (Tensor) Normalized weights of shape [K, N], sum=1 per batch
+    """
+    K, N = shape_constraints
+    if w is None:
+        return torch.full((K, N), 1.0 / N, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    
+    # Ensure shape is [K, N]
+    w = w.view(K, N)
+    # Normalize: [K, N] / [K, 1]
+    return w / (w.sum(dim=1, keepdim=True) + 1e-8)
+
+def _compute_batched_loss(x, y, w_x, w_y, loss_type, sigma_val=None):
+    """
+    Internal helper: Computes weighted energy distance or MMD using fully vectorized operations.
+    
+    Inputs:
+        x: (Tensor) Shape [K, N, D]
+        y: (Tensor) Shape [K, M, D]
+        w_x: (Tensor) Shape [K, N]
+        w_y: (Tensor) Shape [K, M]
+        loss_type: (str) 'wpf_ed', 'wpf_fmmd', 'wpf_ammd'
+        sigma_val: (float, optional) Fixed sigma for fmmd
+        
+    Output:
+        loss: (Tensor) Shape [K], loss per batch element
+    """
+    # 1. Compute Pairwise Distances [K, N, M] / [K, N, N] / [K, M, M]
+    # torch.cdist handles batches automatically
+    d_xy = torch.cdist(x, y, p=2) 
+    d_xx = torch.cdist(x, x, p=2)
+    d_yy = torch.cdist(y, y, p=2)
+
+    # 2. Define Kernel Function
+    if loss_type == 'wpf_ed':
+        # Identity kernel for Energy Distance
+        k_xy, k_xx, k_yy = d_xy, d_xx, d_yy
+        
+    elif loss_type in ['wpf_fmmd', 'wpf_ammd']:
+        if loss_type == 'wpf_ammd':
+            # Adaptive: Estimate sigma per batch element using Median Heuristic
+            # We use d_xy for estimation, detached from graph
+            with torch.no_grad():
+                # Flatten last two dims: [K, N*M]
+                flat_d = d_xy.view(d_xy.shape[0], -1)
+                # Compute median per batch: [K, 1, 1] for broadcasting
+                median_d = torch.median(flat_d, dim=1).values.view(-1, 1, 1)
+                sigma = median_d.detach()
+                sigma[sigma < 1e-5] = 1.0 # Avoid division by zero
+        else:
+            # Fixed Sigma
+            sigma = float(sigma_val)
+
+        gamma = 1.0 / (2 * sigma**2)
+        k_xy = torch.exp(- (d_xy**2) * gamma)
+        k_xx = torch.exp(- (d_xx**2) * gamma)
+        k_yy = torch.exp(- (d_yy**2) * gamma)
+
+    # 3. Compute Expectations via Batch Matrix Multiplication
+    # w_x: [K, N] -> [K, 1, N]
+    # K_matrix: [K, N, M]
+    # w_y: [K, M] -> [K, M, 1]
+    # Result: [K, 1, 1] -> squeeze to [K]
+    
+    wx_unsq = w_x.unsqueeze(1)
+    wy_unsq = w_y.unsqueeze(2)
+    wx_unsq_T = w_x.unsqueeze(2) # [K, N, 1] used for xx
+    wy_unsq_T = w_y.unsqueeze(2) # [K, M, 1] used for yy (same as above)
+
+    # E[X, Y] = w_x^T * K_xy * w_y
+    e_xy = torch.bmm(torch.bmm(wx_unsq, k_xy), wy_unsq).view(-1)
+    
+    # E[X, X] = w_x^T * K_xx * w_x
+    e_xx = torch.bmm(torch.bmm(wx_unsq, k_xx), wx_unsq_T).view(-1)
+    
+    # E[Y, Y] = w_y^T * K_yy * w_y
+    e_yy = torch.bmm(torch.bmm(w_y.unsqueeze(1), k_yy), wy_unsq_T).view(-1)
+
+    if loss_type == 'wpf_ed':
+        return 2 * e_xy - e_xx - e_yy
+    else:
+        # MMD Squared
+        return e_xx - 2 * e_xy + e_yy
 
 def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None, 
-                 valid_B_mask=None, norm_p=1, kes_sigma=1, return_sum=False, normalize_val=None):
+                 valid_B_mask=None, norm_p=1, kes_sigma=1, return_sum=False, 
+                 normalize_val=None, wpf_input=None):
     """
-    Computes loss. Supports various types including L2, ES, and kernel ES.
+    Computes loss. Supports various types including L2, ES, kernel ES, and WPF-based distances.
 
-    Args:
-        ens_tensor (torch.Tensor): Ensemble predictions. Shape: [T, B, N, D].
-        batch_v (torch.Tensor): Ground truth. Shape: [T, B, D].
-        loss_type (str): Type of loss: 'l2', 'nl2' (normalized L2), 'rmse', 
-                        'es', 'nes' (normalized ES), 'tnes' (trajectory normalized ES),
-                        'kes' (kernel ES), 'nkes' (normalized kES), 'tnkes' (trajectory normalized kES).
-        ignore_first (int): Number of initial time steps to ignore.
-        end_ind (int, optional): Last time step index to consider. Defaults to end of trajectory.
-        valid_B_mask (torch.Tensor, optional): Boolean mask for valid batch items.
-                                            Shape: [B] or [T, B]. Defaults to all valid.
-        norm_p (int, float): Exponent for distances in ES (classical ES uses 1 for this exponent,
-                            meaning the L2 norm itself, not L2 norm squared).
-                            Also used as p for torch.norm in normalization terms for NES, NKES.
-        kes_sigma (float): Bandwidth sigma for kernel ES.
-        return_sum (bool): If True, returns sum of losses over valid elements. Else, returns mean.
+    Inputs:
+        ens_tensor: (torch.Tensor) Ensemble predictions. Shape: [T, B, N, D].
+        batch_v: (torch.Tensor) Ground truth. Shape: [T, B, D].
+        loss_type: (str) Type of loss: 
+                          Standard: 'l2', 'nl2', 'rmse', 'es', 'nes', 'tnes', 'kes', 'nkes', 'tnkes'.
+                          WPF (require wpf_input): 'wpf_ed', 'wpf_fmmd', 'wpf_ammd'.
+        ignore_first: (int) Number of initial time steps to ignore.
+        end_ind: (int, optional) Last time step index to consider. Defaults to end of trajectory.
+        valid_B_mask: (torch.Tensor, optional) Boolean mask for valid batch items.
+                                               Shape: [B] or [T, B]. Defaults to all valid.
+        norm_p: (int, float) Exponent for distances in ES/normalization.
+        kes_sigma: (float) Bandwidth sigma for kernel ES and wpf_fmmd (default).
+        return_sum: (bool) If True, returns sum of losses over valid elements. Else, returns mean.
+        normalize_val: (torch.Tensor, optional) Normalization stats [B, D].
+        wpf_input: (dict, optional) Extra input for WPF losses. Contains:
+                                    - 'target_ens': [T, B, M, D] (Target ensemble)
+                                    - 'ens_weights': [T, B, N] (Optional weights for ens_tensor)
+                                    - 'target_weights': [T, B, M] (Optional weights for target_ens)
+                                    - 'sigma': float (Optional override for kes_sigma in wpf_fmmd)
 
-    Returns:
+    Output:
         torch.Tensor: Computed loss (scalar).
     """
     _, B, D = batch_v.shape
+    
+    # 1. Normalization
     if normalize_val is not None:
-        assert normalize_val.shape == (B, D), f"and normalize_val should have the shape ({B}, {D}), but found: {batch_v.shape}"
+        assert normalize_val.shape == (B, D), f"normalize_val shape mismatch: {normalize_val.shape} vs ({B}, {D})"
         batch_v = batch_v / normalize_val.unsqueeze(0)
         ens_tensor = ens_tensor / normalize_val.unsqueeze(1).unsqueeze(0)
     
@@ -160,6 +264,7 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
     if ignore_first > end_ind:
         return torch.tensor(0.0, device=batch_v.device, requires_grad=True)
 
+    # 2. Construct Masks
     if valid_B_mask is None:
         valid_B_mask = torch.ones(full_time_steps, batch_v.size(1), dtype=torch.bool, device=batch_v.device)
     elif valid_B_mask.ndim == 1: # Batch dimension only
@@ -167,6 +272,7 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
 
     valid_B_mask_sliced = valid_B_mask[ignore_first:end_ind + 1, :]
 
+    # 3. Time Slicing
     ens_states_timed = ens_tensor[ignore_first:end_ind + 1, :, :, :] 
     true_states_timed = batch_v[ignore_first:end_ind + 1, :, :]   
     
@@ -177,20 +283,29 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
     
     loss_values_per_element = None # Will store [selected_time, B] shaped losses
 
+    # =========================================================================
+    # Existing Loss Types
+    # =========================================================================
     if loss_type == "l2":
         loss_values_per_element = torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2)
+    
     elif loss_type == 'nl2':
         error_norm_2 = torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2)
         true_norm_2 = torch.sum(true_states_timed ** 2, dim=2)
         loss_values_per_element = error_norm_2 / (true_norm_2 + 1e-8)
+    
     elif loss_type == 'rmse':
         mse_features = (ens_mean_timed - true_states_timed) ** 2
         loss_values_per_element = torch.sqrt(torch.sum(mse_features, dim=2) + 1e-8)
+    
     elif loss_type == 'es':
+        # Assuming compute_es is available in scope
         loss_values_per_element = compute_es(ens_states_timed, true_states_timed, norm_p=norm_p)
+    
     elif loss_type == 'nes' or loss_type == 'tnes':
-        es_vals = compute_es(ens_states_timed, true_states_timed, norm_p=norm_p) # Shape [T_slice, B]
-        true_norm_vals = torch.norm(true_states_timed, p=2, dim=2) ** norm_p # Shape [T_slice, B]
+        es_vals = compute_es(ens_states_timed, true_states_timed, norm_p=norm_p)
+        true_norm_vals = torch.norm(true_states_timed, p=2, dim=2) ** norm_p
+        
         if loss_type == 'nes':
             loss_values_per_element = es_vals / (true_norm_vals + 1e-8)
         else: # tnes
@@ -202,7 +317,7 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
                     sum_es_per_batch[b_idx] = torch.sum(es_vals[valid_time_for_b, b_idx])
                     sum_norm_per_batch[b_idx] = torch.sum(true_norm_vals[valid_time_for_b, b_idx])
             
-            final_batch_mask = valid_B_mask_sliced.any(dim=0) # Batches with at least one valid time step
+            final_batch_mask = valid_B_mask_sliced.any(dim=0)
             if not final_batch_mask.any(): return torch.tensor(0.0, device=batch_v.device, requires_grad=True)
             
             ratios = sum_es_per_batch[final_batch_mask] / (sum_norm_per_batch[final_batch_mask] + 1e-8)
@@ -210,10 +325,13 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
             return torch.mean(ratios)
             
     elif loss_type == 'kes':
+        # Assuming compute_kernel_es is available in scope
         loss_values_per_element = compute_kernel_es(ens_states_timed, true_states_timed, sigma=kes_sigma)
+    
     elif loss_type == 'nkes' or loss_type == 'tnkes':
-        kes_vals = compute_kernel_es(ens_states_timed, true_states_timed, sigma=kes_sigma) # Shape [T_slice, B]
-        true_norm_vals = torch.norm(true_states_timed, p=norm_p, dim=2) # Shape [T_slice, B]
+        kes_vals = compute_kernel_es(ens_states_timed, true_states_timed, sigma=kes_sigma)
+        true_norm_vals = torch.norm(true_states_timed, p=norm_p, dim=2)
+        
         if loss_type == 'nkes':
             loss_values_per_element = kes_vals / (true_norm_vals + 1e-8)
         else: # tnkes
@@ -231,9 +349,65 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
             ratios = sum_kes_per_batch[final_batch_mask] / (sum_norm_per_batch[final_batch_mask] + 1e-8)
             if return_sum: return torch.sum(ratios)
             return torch.mean(ratios)
+
+    # =========================================================================
+    # OPTIMIZED: WPF Loss Types (Ensemble vs Ensemble)
+    # =========================================================================
+    elif loss_type in ['wpf_ed', 'wpf_fmmd', 'wpf_ammd']:
+        if wpf_input is None:
+            raise ValueError(f"Loss type {loss_type} requires 'wpf_input' dictionary.")
+        
+        target_ens = wpf_input['target_ens'] # [T, B, M, D]
+        w_ens = wpf_input.get('ens_weights', None) # [T, B, N]
+        w_target = wpf_input.get('target_weights', None) # [T, B, M]
+        
+        # 1. Normalize target ensemble if needed
+        if normalize_val is not None:
+            target_ens = target_ens / normalize_val.unsqueeze(0).unsqueeze(2)
+        
+        # 2. Slice time for WPF inputs
+        target_ens_timed = target_ens[ignore_first:end_ind + 1, :, :, :]
+        
+        w_ens_timed = None
+        if w_ens is not None:
+            w_ens_timed = w_ens[ignore_first:end_ind + 1, :, :]
+            
+        w_target_timed = None
+        if w_target is not None:
+            w_target_timed = w_target[ignore_first:end_ind + 1, :, :]
+            
+        # 3. Vectorization Preparation
+        T_slice, B_slice, N, _ = ens_states_timed.shape
+        M = target_ens_timed.shape[2]
+        
+        # Flatten T and B into K = T * B
+        x_flat = ens_states_timed.reshape(-1, N, D)       # [K, N, D]
+        y_flat = target_ens_timed.reshape(-1, M, D)       # [K, M, D]
+        
+        w_x_flat = w_ens_timed.reshape(-1, N) if w_ens_timed is not None else None
+        w_y_flat = w_target_timed.reshape(-1, M) if w_target_timed is not None else None
+        
+        # Normalize weights using helper
+        K = x_flat.shape[0]
+        w_x_norm = _get_batched_weights(w_x_flat, (K, N))
+        w_y_norm = _get_batched_weights(w_y_flat, (K, M))
+        
+        # Get Sigma for Fixed MMD
+        sigma_val = wpf_input.get('sigma', kes_sigma)
+        
+        # Compute Loss (Vectorized)
+        # Returns [K] tensor
+        flat_loss_values = _compute_batched_loss(
+            x_flat, y_flat, w_x_norm, w_y_norm, loss_type, sigma_val
+        )
+        
+        # Reshape back to [T, B]
+        loss_values_per_element = flat_loss_values.view(T_slice, B_slice)
+
     else:
         raise NotImplementedError(f"Loss type '{loss_type}' is not implemented")
     
+    # Final Aggregation
     masked_loss_values = loss_values_per_element[valid_B_mask_sliced]
     if masked_loss_values.numel() == 0:
         return torch.tensor(0.0, device=batch_v.device, requires_grad=True)
