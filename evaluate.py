@@ -96,6 +96,11 @@ if __name__ == "__main__":
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
+        # Remove '_tuned' suffix if present
+        if args.suffix.endswith('_tuned'):
+            save_suffix = args.suffix[:-6]
+        else:
+            save_suffix = args.suffix
         if args.zero_infl:
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}.pt"))
         else:

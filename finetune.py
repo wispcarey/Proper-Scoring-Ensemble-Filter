@@ -45,7 +45,10 @@ if __name__ == "__main__":
             if N == 40 or N == 60:
                 args.batch_size = ori_batch_size // 4
             elif N == 100:
-                args.batch_size = ori_batch_size // 8
+                if args.dataset == 'ks':
+                    args.batch_size = ori_batch_size // 16
+                else:
+                    args.batch_size = ori_batch_size // 8
             else:
                 args.batch_size = ori_batch_size 
             args.print_batch = math.ceil(args.train_traj_num / args.batch_size)

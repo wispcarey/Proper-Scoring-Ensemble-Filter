@@ -227,135 +227,160 @@ class Rossler(nn.Module):
         dxdt[:, 2] =  b + x[:, 2] * (x[:, 0] - c) # dz/dt
 
         return dxdt
-    
-def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
-             check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
+
+
+def etd_rk4_ns_wrapper(device=None, dt=0.01, N=32, nu=1e-3, forcing_scale=-4.0):
     """
-    Generate training, validation, and test data for a given model.
+    ETD-RK4 solver for 2D incompressible Navier–Stokes in vorticity form on [0, 2pi]^2 (torus).
 
-    Parameters
-    ----------
-    dataset : str
-        The name of the dataset, determines which model to use.
-    t : array-like
-        Time steps for integration.
-    steps_test : int
-        Number of steps in the test dataset.
-    steps_valid : int
-        Number of steps in the validation dataset.
-    v0 : torch.Tensor, optional
-        Initial state vector.
-    sigma_v : float, default=0
-        Standard deviation of Gaussian noise to add at each step.
-    check_disk : bool, default=True
-        If True, check if saved data exists on disk before generating.
-    steps_burn : int, default=1000
-        Number of initial steps to discard (burn-in).
-    dt_iter : int, default=2
-        Number of sub-iterations within each time step.
-    prefix : str, default=""
-        Prefix for saved file names.
-    test_only : bool, default=False
-        If True, generate only test data.
+    PDE:
+        w_t + (u · ∇) w = nu * Δ w + f
+        u = (psi_y, -psi_x)
+        Δ psi = -w
+        f(y) = forcing_scale * cos(4y)
 
-    Returns
-    -------
-    torch.Tensor
-        Training sequence.
-    torch.Tensor
-        Validation sequence.
-    torch.Tensor
-        Test sequence.
+    Notes:
+        - Uses 2/3 de-aliasing.
+        - Uses Kassam–Trefethen contour integral to compute ETD coefficients.
+        - IMPORTANT FIX: Wavenumbers must be integers for a 2pi-periodic domain. Do NOT multiply by N
+          if you already set d=1/N in fftfreq/rfftfreq.
+
+    Args:
+        device: torch.device or None
+        dt: timestep
+        N: grid size (NxN)
+        nu: viscosity
+        forcing_scale: forcing amplitude (default -4.0)
+
+    Returns:
+        step(w_phys, t=None, dt_step=None): one-step integrator mapping (N,N) -> (N,N)
     """
+    import numpy as np
+    import torch
 
-    dt = t[1] - t[0]  # Time step size for integration
-    directory = f'data/{dataset}/'
-    os.makedirs(directory, exist_ok=True)
+    if device is None:
+        device = torch.device("cpu")
 
-    # Internal function for saving or loading data
-    def __save_or_load_data(file_path, data=None):
-        """Save data if provided, otherwise load data from the file path."""
-        if data is not None:
-            np.save(file_path, data.astype(np.float32))  # Save as float32
-        else:
-            return torch.tensor(np.load(file_path), dtype=torch.float32)  # Load as float32
+    # -------------------------------------------------------------------------
+    # 1) Spectral grid (CORRECT)
+    # -------------------------------------------------------------------------
+    # For domain [0, 2pi], Fourier modes are integers k = 0,1,...,N/2,-N/2+1,...,-1.
+    # Using d=1/N already yields integer mode indices.
+    kx = torch.fft.fftfreq(N, d=1.0 / N).to(device)         # (N,)
+    ky = torch.fft.rfftfreq(N, d=1.0 / N).to(device)       # (N//2+1,)
 
-    # Internal function to generate trajectory
-    def __generate_trajectory(vf, steps, model, dt, dt_iter, sigma_v, burn_in=0):
-        """Generate a trajectory for a given initial state, steps, model, and noise level."""
-        trajectory = []
-        for step in range(burn_in + steps):
-            for _ in range(dt_iter):
-                vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
-            vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)  
-            trajectory.append(vf.unsqueeze(0))
-        return torch.cat(trajectory).to(dtype=torch.float32)  # Ensure the output is float32
+    KX, KY = torch.meshgrid(kx, ky, indexing="ij")           # (N, N//2+1)
 
-    # Define model and dimensions based on dataset type
-    if dataset == "lorenz63":
-        model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  
-    elif dataset == "rossler":
-        model, dim, default_v0 = Rossler, 3, torch.randn(1, 3, dtype=torch.float32)  
-    elif dataset == "lorenz96":
-        model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim, dtype=torch.float32) + 5  
-    elif dataset == "circle":
-        model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
-    elif dataset == "Hdoublewell":
-        model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
-    elif dataset == "ks":
-        # Kuramoto-Sivashinsky model specifics
-        model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
-        # grid = 32 * np.pi * torch.linspace(0, 1, 128 + 1, dtype=torch.float32)[1:]  
-        # x0_Kassam = torch.cos(grid / 16) * (1 + torch.sin(grid / 16))
-        # x0 = x0_Kassam.clone().unsqueeze(0)
-        # # Single 150-step integration to stabilize x0
-        # x0 = custom_int(x0, model, 150, dt, dt_iter)[-1:].to(dtype=torch.float32)  # Ensure float32
-        # default_v0 = custom_int(x0, model, 10 ** 3, dt, dt_iter)[-1:].to(dtype=torch.float32)  # Ensure float32
-        dapper_x0 = DapperKS(dt=dt.numpy() / dt_iter).x0
-        default_v0 = torch.randn(1, 128, dtype=torch.float32) + dapper_x0
-    else:
-        raise ValueError('Dataset not implemented')
+    K_sq = KX**2 + KY**2                                     # |k|^2
+    K_sq_inv = torch.zeros_like(K_sq)
+    K_sq_inv[K_sq != 0] = 1.0 / K_sq[K_sq != 0]              # safe inverse
 
-    v0 = v0 if v0 is not None else default_v0
-    prefix_path = f'{directory}/{prefix}true_v_withnoise_{dt:.3f}step.npy'
-    test_file_path = f'{directory}/{prefix}test_{steps_valid}_{steps_test}_v_{dt:.3f}step.npy'
-    
-    # Training data generation
-    with torch.no_grad():
-        if not test_only:
-            if check_disk and os.path.exists(prefix_path):
-                v_traj = __save_or_load_data(prefix_path)
-            else:
-                if dataset == "ks":
-                    # Custom integration for KS model with modified dt_iter
-                    v_traj = custom_int(v0, model, len(t), dt, dt_iter).unsqueeze(1).to(dtype=torch.float32)  # Ensure float32
-                else:
-                    # General case for Lorenz models
-                    v_traj = __generate_trajectory(v0, len(t), model, dt, dt_iter, sigma_v)
-                if check_disk:
-                    __save_or_load_data(prefix_path, v_traj.numpy())
+    # 2/3 de-aliasing mask
+    k_max = N // 2
+    cutoff = (2.0 / 3.0) * k_max
+    dealias_mask = (torch.abs(KX) < cutoff) & (torch.abs(KY) < cutoff)
+    dealias_mask = dealias_mask.to(dtype=torch.float32)
 
-        # Determine final state for testing
-        vf = v_traj[-1].view(1, -1) if not test_only else v0
+    # -------------------------------------------------------------------------
+    # 2) Linear operator and ETD coefficients
+    # -------------------------------------------------------------------------
+    # Laplacian in Fourier on [0,2pi]^2 with integer modes: Δ -> -|k|^2
+    # So viscous term nu*Δ -> -nu*|k|^2
+    L_op = -nu * K_sq                                         # (N, N//2+1)
 
-        # Testing data generation
-        if check_disk and os.path.exists(test_file_path):
-            v_traj_test = __save_or_load_data(test_file_path)
-        else:
-            if dataset == "ks":
-                # Custom integration for KS model's testing data with modified dt_iter
-                v_traj_test = custom_int(vf, model, steps_burn + steps_test + steps_valid, dt, dt_iter).unsqueeze(1).to(dtype=torch.float32)  # Ensure float32
-            else:
-                v_traj_test = __generate_trajectory(vf, steps_burn + steps_test + steps_valid, model, dt, dt_iter, sigma_v)
-            if check_disk:
-                __save_or_load_data(test_file_path, v_traj_test.numpy())
+    h = dt
+    E = torch.exp(h * L_op)
+    E2 = torch.exp(0.5 * h * L_op)
 
-    if test_only:
-        return v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
-    
-    return v_traj, v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
+    # Kassam–Trefethen contour integral for phi-functions / ETD-RK4 coeffs
+    M = 16
+    r = torch.exp(1j * np.pi * (torch.arange(M, device=device) + 0.5) / M)   # (M,)
+
+    LR = h * L_op.unsqueeze(0) + r.reshape(M, 1, 1)           # (M, N, N//2+1)
+
+    def contour_mean(z):
+        return z.mean(dim=0).real
+
+    Q  = h * contour_mean((torch.exp(LR / 2) - 1) / LR)
+    f1 = h * contour_mean((-4 - LR + torch.exp(LR) * (4 - 3 * LR + LR**2)) / (LR**3))
+    f2 = h * contour_mean((2 + LR + torch.exp(LR) * (-2 + LR)) / (LR**3))
+    f3 = h * contour_mean((-4 - 3 * LR - LR**2 + torch.exp(LR) * (4 - LR)) / (LR**3))
+
+    # -------------------------------------------------------------------------
+    # 3) Forcing term in spectral space
+    # -------------------------------------------------------------------------
+    # f(y) = forcing_scale * cos(4y)
+    y = torch.linspace(0, 2 * np.pi, N + 1, device=device)[:-1]     # (N,)
+    forcing_phys = forcing_scale * torch.cos(4.0 * y).unsqueeze(0).expand(N, N)  # varies in y (dim=1)
+    forcing_spec = torch.fft.rfft2(forcing_phys)
+
+    # -------------------------------------------------------------------------
+    # 4) Nonlinearity and one-step ETD-RK4
+    # -------------------------------------------------------------------------
+    def NL(w_hat):
+        # Solve Poisson: Δ psi = -w  => psi_hat = w_hat / |k|^2 (for k != 0)
+        psi_hat = w_hat * K_sq_inv
+
+        # Velocity: u = (psi_y, -psi_x)
+        u_hat = (1j * KY) * psi_hat
+        v_hat = (-1j * KX) * psi_hat
+
+        # Vorticity gradients
+        wx_hat = (1j * KX) * w_hat
+        wy_hat = (1j * KY) * w_hat
+
+        # Back to physical space
+        u  = torch.fft.irfft2(u_hat, s=(N, N))
+        v  = torch.fft.irfft2(v_hat, s=(N, N))
+        wx = torch.fft.irfft2(wx_hat, s=(N, N))
+        wy = torch.fft.irfft2(wy_hat, s=(N, N))
+
+        # Advection term: -(u*wx + v*wy)
+        adv = -(u * wx + v * wy)
+        adv_hat = torch.fft.rfft2(adv)
+
+        # RHS in spectral: -(u·∇w) + forcing
+        return (adv_hat + forcing_spec) * dealias_mask
+
+    def step(w_phys, t=None, dt_step=None):
+        # dt_step ignored; this wrapper is precomputed for dt
+        v0 = torch.fft.rfft2(w_phys)
+
+        N1 = NL(v0)
+        a  = E2 * v0 + Q * N1
+
+        N2 = NL(a)
+        b  = E2 * v0 + Q * N2
+
+        N3 = NL(b)
+        c  = E2 * a  + Q * (2 * N3 - N1)
+
+        N4 = NL(c)
+
+        v_next = E * v0 + f1 * N1 + 2 * f2 * (N2 + N3) + f3 * N4
+        w_next = torch.fft.irfft2(v_next, s=(N, N))
+        return w_next
+
+    return step
 
 
+def generate_random_field(N, alpha=3.0, device=None):
+    """Generates a Gaussian Random Field (GRF) with power-law decay."""
+    if device is None:
+        device = torch.device('cpu')
+    k_max = N // 2
+    kx = torch.fft.fftfreq(N, d=1.0/N)
+    ky = torch.fft.rfftfreq(N, d=1.0/N)
+    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
+    K_sq = KX**2 + KY**2
+    K_sq[0, 0] = 1.0 
+    noise = torch.randn(N, N//2 + 1, dtype=torch.cfloat, device=device)
+    scale = K_sq ** (-alpha / 4.0)
+    scale[0, 0] = 0.0 
+    w_hat = noise * scale
+    w = torch.fft.irfft2(w_hat, s=(N, N))
+    w = (w - w.mean()) / w.std()
+    return w
 
 
 
@@ -425,6 +450,265 @@ def custom_int(x0, int_function, steps, dt=0.25, dt_iter=1):
             x = int_function(x, None, dt / dt_iter)
         out.append(x)
     return torch.cat(out, 0)
+
+
+# def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
+#              check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
+#     """
+#     Generate training, validation, and test data for a given model.
+
+#     Parameters
+#     ----------
+#     dataset : str
+#         The name of the dataset, determines which model to use.
+#     t : array-like
+#         Time steps for integration.
+#     steps_test : int
+#         Number of steps in the test dataset.
+#     steps_valid : int
+#         Number of steps in the validation dataset.
+#     v0 : torch.Tensor, optional
+#         Initial state vector.
+#     sigma_v : float, default=0
+#         Standard deviation of Gaussian noise to add at each step.
+#     check_disk : bool, default=True
+#         If True, check if saved data exists on disk before generating.
+#     steps_burn : int, default=1000
+#         Number of initial steps to discard (burn-in).
+#     dt_iter : int, default=2
+#         Number of sub-iterations within each time step.
+#     prefix : str, default=""
+#         Prefix for saved file names.
+#     test_only : bool, default=False
+#         If True, generate only test data.
+
+#     Returns
+#     -------
+#     torch.Tensor
+#         Training sequence.
+#     torch.Tensor
+#         Validation sequence.
+#     torch.Tensor
+#         Test sequence.
+#     """
+
+#     dt = t[1] - t[0]  # Time step size for integration
+#     directory = f'data/{dataset}/'
+#     os.makedirs(directory, exist_ok=True)
+
+#     # Internal function for saving or loading data
+#     def __save_or_load_data(file_path, data=None):
+#         """Save data if provided, otherwise load data from the file path."""
+#         if data is not None:
+#             np.save(file_path, data.astype(np.float32))  # Save as float32
+#         else:
+#             return torch.tensor(np.load(file_path), dtype=torch.float32)  # Load as float32
+
+#     # Internal function to generate trajectory
+#     def __generate_trajectory(vf, steps, model, dt, dt_iter, sigma_v, burn_in=0):
+#         """Generate a trajectory for a given initial state, steps, model, and noise level."""
+#         trajectory = []
+#         for step in range(burn_in + steps):
+#             for _ in range(dt_iter):
+#                 vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
+#             vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)  
+#             trajectory.append(vf.unsqueeze(0))
+#         return torch.cat(trajectory).to(dtype=torch.float32)  # Ensure the output is float32
+
+#     # Define model and dimensions based on dataset type
+#     if dataset == "lorenz63":
+#         model, dim, default_v0 = L63, 3, torch.randn(1, 3, dtype=torch.float32)  
+#     elif dataset == "rossler":
+#         model, dim, default_v0 = Rossler, 3, torch.randn(1, 3, dtype=torch.float32)  
+#     elif dataset == "lorenz96":
+#         model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim, dtype=torch.float32) + 5  
+#     elif dataset == "circle":
+#         model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
+#     elif dataset == "Hdoublewell":
+#         model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]], dtype=torch.float32)  
+#     elif dataset == "ks":
+#         # Kuramoto-Sivashinsky model specifics
+#         model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
+#         # grid = 32 * np.pi * torch.linspace(0, 1, 128 + 1, dtype=torch.float32)[1:]  
+#         # x0_Kassam = torch.cos(grid / 16) * (1 + torch.sin(grid / 16))
+#         # x0 = x0_Kassam.clone().unsqueeze(0)
+#         # # Single 150-step integration to stabilize x0
+#         # x0 = custom_int(x0, model, 150, dt, dt_iter)[-1:].to(dtype=torch.float32)  # Ensure float32
+#         # default_v0 = custom_int(x0, model, 10 ** 3, dt, dt_iter)[-1:].to(dtype=torch.float32)  # Ensure float32
+#         dapper_x0 = DapperKS(dt=dt.numpy() / dt_iter).x0
+#         default_v0 = torch.randn(1, 128, dtype=torch.float32) + dapper_x0
+#     else:
+#         raise ValueError('Dataset not implemented')
+
+#     v0 = v0 if v0 is not None else default_v0
+#     prefix_path = f'{directory}/{prefix}true_v_withnoise_{dt:.3f}step.npy'
+#     test_file_path = f'{directory}/{prefix}test_{steps_valid}_{steps_test}_v_{dt:.3f}step.npy'
+    
+#     # Training data generation
+#     with torch.no_grad():
+#         if not test_only:
+#             if check_disk and os.path.exists(prefix_path):
+#                 v_traj = __save_or_load_data(prefix_path)
+#             else:
+#                 if dataset == "ks":
+#                     # Custom integration for KS model with modified dt_iter
+#                     v_traj = custom_int(v0, model, len(t), dt, dt_iter).unsqueeze(1).to(dtype=torch.float32)  # Ensure float32
+#                 else:
+#                     # General case for Lorenz models
+#                     v_traj = __generate_trajectory(v0, len(t), model, dt, dt_iter, sigma_v)
+#                 if check_disk:
+#                     __save_or_load_data(prefix_path, v_traj.numpy())
+
+#         # Determine final state for testing
+#         vf = v_traj[-1].view(1, -1) if not test_only else v0
+
+#         # Testing data generation
+#         if check_disk and os.path.exists(test_file_path):
+#             v_traj_test = __save_or_load_data(test_file_path)
+#         else:
+#             if dataset == "ks":
+#                 # Custom integration for KS model's testing data with modified dt_iter
+#                 v_traj_test = custom_int(vf, model, steps_burn + steps_test + steps_valid, dt, dt_iter).unsqueeze(1).to(dtype=torch.float32)  # Ensure float32
+#             else:
+#                 v_traj_test = __generate_trajectory(vf, steps_burn + steps_test + steps_valid, model, dt, dt_iter, sigma_v)
+#             if check_disk:
+#                 __save_or_load_data(test_file_path, v_traj_test.numpy())
+
+#     if test_only:
+#         return v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
+    
+#     return v_traj, v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
+
+
+def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
+             check_disk=True, steps_burn=1000, dt_iter=2, prefix="", test_only=False):
+    
+    dt = t[1] - t[0]
+    directory = f'data/{dataset}/'
+    os.makedirs(directory, exist_ok=True)
+
+    def __save_or_load_data(file_path, data=None):
+        if data is not None:
+            np.save(file_path, data.astype(np.float32))
+        else:
+            return torch.tensor(np.load(file_path), dtype=torch.float32)
+
+    def __generate_trajectory(vf, steps, model, dt, dt_iter, sigma_v, burn_in=0):
+        trajectory = []
+        for step in range(burn_in + steps):
+            for _ in range(dt_iter):
+                vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
+            vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)
+            trajectory.append(vf.unsqueeze(0))
+        return torch.cat(trajectory).to(dtype=torch.float32)
+
+    is_2d_pde = False
+    
+    # --- Model Setup ---
+    if dataset == "lorenz63":
+        model, dim, default_v0 = L63, 3, torch.randn(1, 3)
+    elif dataset == "rossler":
+        model, dim, default_v0 = Rossler, 3, torch.randn(1, 3)
+    elif dataset == "lorenz96":
+        model, dim, default_v0 = L96, args.ori_dim, torch.randn(1, args.ori_dim) + 5
+    elif dataset == "circle":
+        model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]])
+    elif dataset == "Hdoublewell":
+        model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]])
+    elif dataset == "ks":
+        model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
+        try:
+            dapper_x0 = DapperKS(dt=dt.numpy() / dt_iter).x0
+            default_v0 = torch.randn(1, 128) + dapper_x0
+        except:
+            default_v0 = torch.randn(1, 128)
+            
+    elif dataset == "ns":
+        is_2d_pde = True
+        N_grid = 64
+        nu = 1e-3
+        model = etd_rk4_ns_wrapper(device=None, dt=dt / dt_iter, N=N_grid, nu=nu)
+        
+        # NS Initialization with GRF
+        if v0 is None:
+            batch_size = 1
+            v0_list = [generate_random_field(N_grid, alpha=3.0) * 5.0 for _ in range(batch_size)]
+            default_v0 = torch.stack(v0_list) # Shape: (1, 32, 32)
+        else:
+            batch_size = v0.shape[0]
+            default_v0 = None
+    else:
+        raise ValueError('Dataset not implemented')
+
+    v0 = v0 if v0 is not None else default_v0
+    v0 = v0.to(dtype=torch.float32)
+
+    # Capture batch size for reshaping later
+    if dataset == "ns":
+        batch_size = v0.shape[0]
+
+    prefix_path = f'{directory}/{prefix}true_v_withnoise_{dt:.3f}step.npy'
+    test_file_path = f'{directory}/{prefix}test_{steps_valid}_{steps_test}_v_{dt:.3f}step.npy'
+    
+    # --- Training Data Generation ---
+    with torch.no_grad():
+        if not test_only:
+            if check_disk and os.path.exists(prefix_path):
+                v_traj = __save_or_load_data(prefix_path)
+            else:
+                if dataset == "ks":
+                    v_traj = custom_int(v0, model, len(t), dt, dt_iter).unsqueeze(1)
+                elif dataset == "ns":
+                    v_traj = custom_int(v0, model, len(t), dt, dt_iter) # Output: (T, 32, 32) if B=1
+                    # FIX: Reshape to (Time, Batch, Flattened_Dim)
+                    v_traj = v_traj.view(v_traj.shape[0], batch_size, -1) 
+                else:
+                    v_traj = __generate_trajectory(v0, len(t), model, dt, dt_iter, sigma_v)
+                
+                v_traj = v_traj.to(dtype=torch.float32)
+                if check_disk:
+                    __save_or_load_data(prefix_path, v_traj.numpy())
+
+            vf = v_traj[-1] # (Batch, Dim)
+            if dataset == "ns":
+                # Reshape back to 2D for integrator: (Batch, N, N)
+                N_grid = int(np.sqrt(vf.shape[-1]))
+                vf = vf.view(batch_size, N_grid, N_grid)
+            elif not is_2d_pde and dataset != "ks": 
+                 vf = vf.view(1, -1)
+        else:
+            vf = v0
+
+        # --- Test Data Generation ---
+        if check_disk and os.path.exists(test_file_path):
+            v_traj_test = __save_or_load_data(test_file_path)
+        else:
+            total_steps = steps_burn + steps_test + steps_valid
+            
+            if dataset == "ks":
+                v_traj_test = custom_int(vf, model, total_steps, dt, dt_iter).unsqueeze(1)
+            elif dataset == "ns":
+                v_traj_test = custom_int(vf, model, total_steps, dt, dt_iter)
+                # FIX: Reshape to (Time, Batch, Flattened_Dim)
+                v_traj_test = v_traj_test.view(v_traj_test.shape[0], batch_size, -1)
+            else:
+                v_traj_test = __generate_trajectory(vf, total_steps, model, dt, dt_iter, sigma_v)
+            
+            v_traj_test = v_traj_test.to(dtype=torch.float32)
+            if check_disk:
+                __save_or_load_data(test_file_path, v_traj_test.numpy())
+
+    if test_only:
+        return v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
+    
+    return v_traj, v_traj_test[steps_burn:steps_valid + steps_burn], v_traj_test[steps_burn + steps_valid:]
+
+
+
+
+
+
+
 
 
 def makedirs(dirname):
