@@ -40,6 +40,7 @@ for exp in "${experiments[@]}"; do
         --test_steps 500 \
         --sigma_reg None \
         --cp_load_path "$cp_path" \
-        --suffix ""
+        --sigma_ens 5 \
+        --suffix "sigma_ens_5"
     done
 done

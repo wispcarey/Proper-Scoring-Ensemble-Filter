@@ -11,7 +11,7 @@ python train.py \
    --v EtE-LRes \
    --no_localization \
    --no_running_loss \
-   --loss_type es \
+   --loss_type wpf_ammd,nll \
    --es_p 1 \
    --test_steps 500 \
    --pf_verification \
