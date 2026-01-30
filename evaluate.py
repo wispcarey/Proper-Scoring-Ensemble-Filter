@@ -102,8 +102,8 @@ if __name__ == "__main__":
         else:
             save_suffix = args.suffix
         if args.zero_infl:
-            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}.pt"))
+            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}{save_suffix}.pt"))
         else:
-            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
+            torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}{save_suffix}.pt"))
 
 

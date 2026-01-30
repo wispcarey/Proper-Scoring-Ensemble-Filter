@@ -625,8 +625,8 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
             
     elif dataset == "ns":
         is_2d_pde = True
-        N_grid = 64
-        nu = 1e-3
+        N_grid = 32
+        nu = 10**(-2.5)
         model = etd_rk4_ns_wrapper(device=None, dt=dt / dt_iter, N=N_grid, nu=nu)
         
         # NS Initialization with GRF
