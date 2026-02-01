@@ -20,8 +20,10 @@ DEF_SUFFIX=""
 # Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE SUFFIX"
 # Note: Removed USE_PF and LEARNING_RATE columns.
 EXPERIMENTS=(
-    "lorenz96 1000 10 1 EtE-LRes es"
-    "ks 1000 10 1 EtE-LRes es"
+    "lorenz96 1000 10 1.0 CorrTerms nes"
+    "lorenz96 1000 10 1.0 EtE-LRes nes"
+    "ks 1000 10 1.0 CorrTerms nes"
+    "ks 1000 10 1.0 EtE-LRes nes"
 )
 
 # Iterate and submit
