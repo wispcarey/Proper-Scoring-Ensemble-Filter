@@ -116,6 +116,8 @@ def get_parameters():
                         help='warm-up the loss according to epochs')
     parser.add_argument('--loss_type', type=parse_list_type, default=["nl2"],
                         help='the type of loss function, split by comma, e.g., "l2,rmse,crps"')
+    parser.add_argument('--loss_weights', type=str, default=None,
+                        help='Weights for each loss type, comma separated e.g., "1.0,0.5"')
     parser.add_argument('--es_p', type=float, default=1,
                         help='the power of energy score')
     parser.add_argument('--kes_sigma', type=lambda x: float(x) if x.lower() != 'none' else None,
@@ -348,6 +350,21 @@ def get_parameters():
         args.local_input_dim = args.st_output_dim * 2
     else:
         raise ValueError("Please use a valid st_type.")
+
+    # for loss_weights
+    if args.loss_weights is None or args.loss_weights.lower() == 'none':
+        args.loss_weights = [1.0] * len(args.loss_type)
+    else:
+        try:
+            args.loss_weights = [float(x) for x in args.loss_weights.split(',')]
+        except ValueError:
+            raise ValueError(f"Invalid format for loss_weights: {args.loss_weights}. Must be comma-separated floats.")
+        
+        if len(args.loss_weights) != len(args.loss_type):
+            raise ValueError(
+                f"Length mismatch: loss_weights has {len(args.loss_weights)} elements, "
+                f"but loss_type has {len(args.loss_type)} elements."
+            )
 
     if args.obs_in_loc:
         args.local_input_dim += args.obs_dim

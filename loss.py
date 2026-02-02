@@ -276,6 +276,54 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
         ens_mean_timed = torch.mean(ens_states_timed, dim=2)
         loss_values_per_element = torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2)
     
+    elif loss_type == 'nl2':
+        ens_mean_timed = torch.mean(ens_states_timed, dim=2)
+        error_norm_2 = torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2)
+        true_norm_2 = torch.sum(true_states_timed ** 2, dim=2)
+        loss_values_per_element = error_norm_2 / (true_norm_2 + 1e-8)
+
+    elif loss_type == 'nes' or loss_type == 'tnes':
+        es_vals = compute_es(ens_states_timed, true_states_timed, norm_p=norm_p)
+        true_norm_vals = torch.norm(true_states_timed, p=2, dim=2) ** norm_p
+        if loss_type == 'nes':
+            loss_values_per_element = es_vals / (true_norm_vals + 1e-8)
+        else: # tnes
+            sum_es_per_batch = torch.zeros(B, device=batch_v.device, dtype=ens_tensor.dtype)
+            sum_norm_per_batch = torch.zeros(B, device=batch_v.device, dtype=ens_tensor.dtype)
+            for b_idx in range(B):
+                valid_time_for_b = valid_B_mask_sliced[:, b_idx]
+                if valid_time_for_b.any():
+                    sum_es_per_batch[b_idx] = torch.sum(es_vals[valid_time_for_b, b_idx])
+                    sum_norm_per_batch[b_idx] = torch.sum(true_norm_vals[valid_time_for_b, b_idx])
+            
+            final_batch_mask = valid_B_mask_sliced.any(dim=0)
+            if not final_batch_mask.any(): return torch.tensor(0.0, device=batch_v.device, requires_grad=True)
+            
+            ratios = sum_es_per_batch[final_batch_mask] / (sum_norm_per_batch[final_batch_mask] + 1e-8)
+            if return_sum: return torch.sum(ratios)
+            return torch.mean(ratios)
+
+    elif loss_type == 'nkes' or loss_type == 'tnkes':
+        kes_vals = compute_kernel_es(ens_states_timed, true_states_timed, sigma=kes_sigma)
+        true_norm_vals = torch.norm(true_states_timed, p=norm_p, dim=2)
+        if loss_type == 'nkes':
+            loss_values_per_element = kes_vals / (true_norm_vals + 1e-8)
+        else: # tnkes
+            sum_kes_per_batch = torch.zeros(B, device=batch_v.device, dtype=ens_tensor.dtype)
+            sum_norm_per_batch = torch.zeros(B, device=batch_v.device, dtype=ens_tensor.dtype)
+            for b_idx in range(B):
+                valid_time_for_b = valid_B_mask_sliced[:, b_idx]
+                if valid_time_for_b.any():
+                    sum_kes_per_batch[b_idx] = torch.sum(kes_vals[valid_time_for_b, b_idx])
+                    sum_norm_per_batch[b_idx] = torch.sum(true_norm_vals[valid_time_for_b, b_idx])
+
+            final_batch_mask = valid_B_mask_sliced.any(dim=0)
+            if not final_batch_mask.any(): return torch.tensor(0.0, device=batch_v.device, requires_grad=True)
+
+            ratios = sum_kes_per_batch[final_batch_mask] / (sum_norm_per_batch[final_batch_mask] + 1e-8)
+            if return_sum: return torch.sum(ratios)
+            return torch.mean(ratios)
+            
     elif loss_type == 'rmse':
         ens_mean_timed = torch.mean(ens_states_timed, dim=2)
         loss_values_per_element = torch.sqrt(torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2) + 1e-8)

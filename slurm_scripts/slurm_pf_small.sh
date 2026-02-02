@@ -41,7 +41,7 @@ for seed_val in "${SEEDS[@]}"; do
         
         python gen_pf_results.py \
             --dataset lorenz63 \
-            --sigma_y 1 \
+            --sigma_y 0.7 \
             --seed "$seed_val" \
             --normal_output \
             --test_steps 500 \
