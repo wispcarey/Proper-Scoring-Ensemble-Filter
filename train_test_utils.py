@@ -422,7 +422,7 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
 
     # --- Loss Pre-processing & WPF Guard ---
     pre_losses, post_losses = [], []
-    wpf_names = ['wpf_ed', 'wpf_fmmd', 'wpf_ammd']
+    wpf_names = ['wpf_ed', 'wpf_fmmd', 'wpf_ammd', 'wpf_st_ed', 'wpf_st_fmmd', 'wpf_st_ammd']
     for lt, lw in zip(args.loss_type, args.loss_weights):
         if lt.startswith('pre_'):
             base = lt[4:]

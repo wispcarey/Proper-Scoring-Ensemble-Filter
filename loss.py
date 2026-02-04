@@ -126,16 +126,17 @@ def compute_kernel_es(ens_states, true_states, sigma=None):
 
 import torch
 
-def _get_batched_weights(w, shape_constraints):
+def _get_batched_weights(w, shape_constraints, do_detach=True):
     """
-    Internal helper: Normalize and detach weights to stop gradient flow.
+    Internal helper: Normalize weights, optionally detaching them.
     
     Inputs:
         w: (Tensor or None) Weights of shape [K, N]
         shape_constraints: (tuple) (K, N)
+        do_detach: (bool) Whether to detach weights from the graph.
         
     Output:
-        w_norm: (Tensor) Normalized weights, detached from autograd graph.
+        w_norm: (Tensor) Normalized weights.
     """
     K, N = shape_constraints
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -143,21 +144,23 @@ def _get_batched_weights(w, shape_constraints):
     if w is None:
         return torch.full((K, N), 1.0 / N, device=device)
     
-    # Ensure shape is [K, N] and detach to stop gradients
-    w_detached = w.view(K, N).detach()
+    # Ensure shape is [K, N]
+    w_view = w.view(K, N)
+    
+    if do_detach:
+        w_view = w_view.detach()
     
     # Normalize: [K, N] / [K, 1]
-    w_norm = w_detached / (w_detached.sum(dim=1, keepdim=True) + 1e-8)
+    w_norm = w_view / (w_view.sum(dim=1, keepdim=True) + 1e-8)
     return w_norm
 
 def _compute_batched_wpf_loss(x, y, w_x, w_y, loss_type, sigma_val=None):
     """
     Internal helper: Computes weighted energy distance or MMD.
-    Note: w_x and w_y are assumed to be detached in _get_batched_weights.
     
     Inputs:
-        x, y: (Tensor) Data samples, gradients will flow through these.
-        w_x, w_y: (Tensor) Detached weights.
+        x, y: (Tensor) Data samples.
+        w_x, w_y: (Tensor) Normalized weights.
         loss_type: (str) 'wpf_ed', 'wpf_fmmd', 'wpf_ammd'
         sigma_val: (float)
         
@@ -334,7 +337,14 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
     elif loss_type == 'kes':
         loss_values_per_element = compute_kernel_es(ens_states_timed, true_states_timed, sigma=kes_sigma)
 
-    elif loss_type in ['wpf_ed', 'wpf_fmmd', 'wpf_ammd']:
+    elif loss_type.startswith('wpf_'):
+        # Parse loss type for ST (Stop Gradient) variants
+        is_st = loss_type.startswith('wpf_st_')
+        real_loss_type = loss_type.replace('wpf_st_', 'wpf_')
+        
+        if real_loss_type not in ['wpf_ed', 'wpf_fmmd', 'wpf_ammd']:
+             raise NotImplementedError(f"WPF Loss type '{loss_type}' is not implemented")
+
         if additional_inputs is None or 'target_ens' not in additional_inputs:
             raise ValueError(f"Loss {loss_type} requires 'target_ens' in additional_inputs.")
         
@@ -349,6 +359,13 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
         w_ens_timed = w_ens[ignore_first:end_ind + 1, :, :] if w_ens is not None else None
         w_target_timed = w_target[ignore_first:end_ind + 1, :, :] if w_target is not None else None
             
+        # Handle gradient stop logic based on 'st' flag
+        if is_st:
+            target_ens_timed = target_ens_timed.detach()
+            detach_target_weights = True # Detach BOTH ensemble and target weights
+        else:
+            detach_target_weights = False # Gradients flow through everything
+
         T_slice, B_slice, N, _ = ens_states_timed.shape
         M = target_ens_timed.shape[2]
         
@@ -358,11 +375,13 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
         w_y_flat = w_target_timed.reshape(-1, M) if w_target_timed is not None else None
         
         K_total = x_flat.shape[0]
-        w_x_norm = _get_batched_weights(w_x_flat, (K_total, N))
-        w_y_norm = _get_batched_weights(w_y_flat, (K_total, M))
+        
+        # Normalize and optionally detach weights
+        w_x_norm = _get_batched_weights(w_x_flat, (K_total, N), do_detach=False)
+        w_y_norm = _get_batched_weights(w_y_flat, (K_total, M), do_detach=detach_target_weights)
         
         sigma_val = additional_inputs.get('sigma', kes_sigma)
-        flat_loss_values = _compute_batched_wpf_loss(x_flat, y_flat, w_x_norm, w_y_norm, loss_type, sigma_val)
+        flat_loss_values = _compute_batched_wpf_loss(x_flat, y_flat, w_x_norm, w_y_norm, real_loss_type, sigma_val)
         loss_values_per_element = flat_loss_values.view(T_slice, B_slice)
 
     elif loss_type == 'nll':
@@ -383,6 +402,24 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
         loss_values_per_element = _compute_batched_nll(
             h_ens, y_obs, w_ens, additional_inputs['sigma_y']
         )
+    
+    elif loss_type == 'nnll':
+        if additional_inputs is None:
+            raise ValueError("NNLL requires additional_inputs.")
+        
+        h_ens = additional_inputs['obs_map'](ens_states_timed)
+        y_obs = additional_inputs['true_obs'][ignore_first:end_ind + 1, :, :]
+        w_ens = additional_inputs.get('ens_weights', None)
+        if w_ens is not None:
+            w_ens = w_ens[ignore_first:end_ind + 1, :, :]
+        
+        nll_vals = _compute_batched_nll(
+            h_ens, y_obs, w_ens, additional_inputs['sigma_y']
+        )
+
+        # y_obs shape: [T_slice, B_slice, d_obs]
+        y_norm = torch.norm(y_obs, p=2, dim=-1) # Shape: [T_slice, B_slice]
+        loss_values_per_element = nll_vals / (y_norm + 1e-8)
 
     else:
         raise NotImplementedError(f"Loss type '{loss_type}' is not implemented")
