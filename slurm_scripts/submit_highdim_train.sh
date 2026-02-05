@@ -1,56 +1,103 @@
 #!/bin/bash
 
-# Description: Batch submit Slurm jobs for train.py (via slurm_highdim_train.sh).
-# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, SUFFIX).
-# Output: Submits jobs via sbatch with specific environment variables.
+# Description: Batch submit Slurm jobs for train.py
+# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, SUFFIX)
 
-# Target Slurm script
 SLURM_SCRIPT="slurm_highdim_train.sh"
 
 # Default values
-DEF_DATASET="lorenz63"
+DEF_DATASET="lorenz96"
 DEF_EPOCHS=1000
 DEF_N=10
 DEF_SIGMA_Y=1
 DEF_VERSION="EtE-LRes"
 DEF_LOSS="es"
+DEF_WEIGHTS="none"
 DEF_SUFFIX=""
 
-# List of specific experiments to run
-# Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE SUFFIX"
-# Note: Removed USE_PF and LEARNING_RATE columns.
+# Experiment list
 EXPERIMENTS=(
-    "lorenz96 1000 10 1.0 CorrTerms nes"
-    "lorenz96 1000 10 1.0 EtE-LRes nes"
-    "ks 1000 10 1.0 CorrTerms nes"
-    "ks 1000 10 1.0 EtE-LRes nes"
+    #no nll
+    "lorenz96 500 10 1.0 EtE-LRes wpf_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes wpf_st_ed None"
+    "lorenz96 500 10 1.0 CorrTerms wpf_ed None"
+    "lorenz96 500 10 1.0 CorrTerms wpf_st_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes wpf_ammd None"
+    "lorenz96 500 10 1.0 EtE-LRes wpf_st_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms wpf_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms wpf_st_ammd None"
+    #no wpf
+    "lorenz96 500 10 1.0 EtE-LRes nll None"
+    "lorenz96 500 10 1.0 CorrTerms nll None"
+    "lorenz96 500 10 1.0 EtE-LRes nnll None"
+    "lorenz96 500 10 1.0 CorrTerms nnll None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nll None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nll None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nnll None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nnll None"
+    #pre_nll
+    "lorenz96 500 10 1.0 EtE-LRes pre_nll,wpf_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nll,wpf_ed None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nll,wpf_ammd None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nll,wpf_st_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nll,wpf_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nll,wpf_st_ammd None"
+    #pre_nnll
+    "lorenz96 500 10 1.0 EtE-LRes pre_nnll,wpf_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nnll,wpf_ed None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nnll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nnll,wpf_ammd None"
+    "lorenz96 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nnll,wpf_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms pre_nnll,wpf_st_ammd None"
+    #nll
+    "lorenz96 500 10 1.0 EtE-LRes nll,wpf_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes nll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 CorrTerms nll,wpf_ed None"
+    "lorenz96 500 10 1.0 CorrTerms nll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes nll,wpf_ammd None"
+    "lorenz96 500 10 1.0 EtE-LRes nll,wpf_st_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms nll,wpf_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms nll,wpf_st_ammd None"
+    #nnll
+    "lorenz96 500 10 1.0 EtE-LRes nnll,wpf_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes nnll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 CorrTerms nnll,wpf_ed None"
+    "lorenz96 500 10 1.0 CorrTerms nnll,wpf_st_ed None"
+    "lorenz96 500 10 1.0 EtE-LRes nnll,wpf_ammd None"
+    "lorenz96 500 10 1.0 EtE-LRes nnll,wpf_st_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms nnll,wpf_ammd None"
+    "lorenz96 500 10 1.0 CorrTerms nnll,wpf_st_ammd None"
 )
 
-# Iterate and submit
 for exp in "${EXPERIMENTS[@]}"; do
     # Parse the string into variables
-    read -r dataset epochs n sigma_y version loss_type suffix <<< "$exp"
+    read -r dataset epochs n sigma_y version loss_type loss_weights suffix <<< "$exp"
 
-    # Apply defaults if variable is empty
-    dataset=${dataset:-$DEF_DATASET}
-    epochs=${epochs:-$DEF_EPOCHS}
-    n=${n:-$DEF_N}
-    sigma_y=${sigma_y:-$DEF_SIGMA_Y}
-    version=${version:-$DEF_VERSION}
-    loss_type=${loss_type:-$DEF_LOSS}
-    suffix=${suffix:-$DEF_SUFFIX}
+    # Export variables to environment (prevents comma-parsing issues in --export)
+    export DATASET=${dataset:-$DEF_DATASET}
+    export EPOCHS=${epochs:-$DEF_EPOCHS}
+    export N=${n:-$DEF_N}
+    export SIGMA_Y=${sigma_y:-$DEF_SIGMA_Y}
+    export VERSION=${version:-$DEF_VERSION}
+    export LOSS_TYPE=${loss_type:-$DEF_LOSS}
+    export LOSS_WEIGHTS=${loss_weights:-$DEF_WEIGHTS}
+    export SUFFIX=${suffix:-$DEF_SUFFIX}
 
-    # --- Job Name Construction ---
-    # Example Name: lorenz63-es-N10-_1e-3
-    JOB_NAME="${dataset}-${loss_type}-N${n}"
-    if [ -n "$suffix" ]; then
-        JOB_NAME="${JOB_NAME}${suffix}" 
+    # Construct Job Name
+    JOB_NAME="${DATASET}-${LOSS_TYPE}-N${N}"
+    if [ "$SUFFIX" != "None" ] && [ -n "$SUFFIX" ]; then
+        JOB_NAME="${JOB_NAME}-${SUFFIX}" 
     fi
 
-    echo "Submitting job: $JOB_NAME (Sig=$sigma_y, V=$version, Suffix=$suffix)"
+    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS)"
 
-    # Submit using --export to pass variables
+    # Submit using --export=ALL to pass the exported environment variables
     sbatch -J "$JOB_NAME" \
-           --export=ALL,DATASET=$dataset,EPOCHS=$epochs,N=$n,SIGMA_Y=$sigma_y,VERSION=$version,LOSS_TYPE=$loss_type,SUFFIX=$suffix \
-           $SLURM_SCRIPT
+           --time=12:00:00 \
+           --export=ALL \
+           "$SLURM_SCRIPT"
 done

@@ -9,8 +9,8 @@
 #SBATCH --ntasks=1                      # 1 task
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o output_record/slurm.%N.%j.out      # STDOUT (saved to output_record)
-#SBATCH -e output_record/slurm.%N.%j.err      # STDERR (saved to output_record)
+#SBATCH -o output_record/highdim_train.%N.%j.out      # STDOUT (saved to output_record)
+#SBATCH -e output_record/highdim_train.%N.%j.err      # STDERR (saved to output_record)
 
 # Description: Slurm script for train.py with configurable parameters for Lorenz63.
 # Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, SUFFIX.
@@ -23,6 +23,7 @@ N=${N:-10}                           # Default N
 SIGMA_Y=${SIGMA_Y:-1}                # Default sigma_y
 VERSION=${VERSION:-"EtE-LRes"}       # Default version (--v)
 LOSS_TYPE=${LOSS_TYPE:-"es"}         # Default loss type
+LOSS_WEIGHTS=${LOSS_WEIGHTS:-"none"} # Default loss weights
 SUFFIX=${SUFFIX:-""}                 # Default suffix (empty string)
 
 echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, SUFFIX='$SUFFIX'"
@@ -45,4 +46,6 @@ python train.py \
     --suffix "$SUFFIX" \
     --no_running_loss \
     --loss_type $LOSS_TYPE \
-    --es_p 1
+    --loss_weights $LOSS_WEIGHTS \
+    --es_p 1 \
+    --save_epoch 10

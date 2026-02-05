@@ -1,0 +1,35 @@
+# -u: user, -t: state, -h: hide header
+squeue -u bhchen -t RUNNING -h | wc -l
+squeue -u bhchen -t PENDING -h | wc -l
+squeue -u bhchen -h | wc -l
+
+# -maxdepth 1: stay in current folder
+# -type d: look for directories only
+# -name: case-sensitive pattern matching
+find . -maxdepth 1 -type d -name "*nll*" -name "*02-03*"
+
+# srun
+srun --gres=gpu:2 --nodes=1 --partition=gpu --pty /bin/bash -l
+srun --pty -t 02:00:00 -N 1 --cpus-per-task=64 /bin/bash -l
+srun --pty -t 02:00:00 -N 1 --gres=gpu:1 --partition=gpu /bin/bash -l
+
+# notebook
+jupyter notebook --no-browser --port=8888 --ip=0.0.0.0
+
+# --- tmux Session Management ---
+
+# Create a new session with a specific name
+tmux new -s jupyter_session
+
+# Detach from the current session (leave it running in background)
+# Shortcut: Ctrl+b then d
+tmux detach
+
+# List all active sessions
+tmux ls
+
+# Re-attach to a specific session
+tmux attach -t jupyter_session
+
+# Kill a specific session
+tmux kill-session -t jupyter_session
