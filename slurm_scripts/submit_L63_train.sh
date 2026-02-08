@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Description: Batch submit Slurm jobs for train.py (via slurm_train.sh).
-# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LR, SUFFIX).
+# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LR, OBS_FN, WEIGHT_DECAY, SUFFIX).
 # Output: Submits jobs via sbatch using exported environment variables.
 
 # Target Slurm script
@@ -17,10 +17,12 @@ DEF_LOSS="es"
 DEF_WEIGHTS="none"
 DEF_USE_PF="true"
 DEF_LR="default"
+DEF_OBS_FN="identity"
+DEF_WEIGHT_DECAY="0"
 DEF_SUFFIX=""
 
 # List of specific experiments to run
-# Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF LEARNING_RATE SUFFIX"
+# Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF LEARNING_RATE OBS_FN WEIGHT_DECAY SUFFIX"
 # Note: If a value is missing (end of string), it defaults to the DEF variables above.
 # EXPERIMENTS=(
 #     "lorenz63 500 10 1.0 EtE-LRes pre_nll None true 1e-3"
@@ -42,57 +44,57 @@ DEF_SUFFIX=""
 # )
 EXPERIMENTS=(
     #no nll
-    "lorenz63 500 10 1.0 EtE-LRes wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes wpf_st_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms wpf_st_ammd None true 1e-3"
+    "lorenz63 500 10 1.0 EtE-LRes wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes wpf_st_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms wpf_st_ammd None true 1e-3 identity 0"
     #pre_nll
-    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_st_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_st_ammd None true 1e-3"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nll,wpf_st_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nll,wpf_st_ammd None true 1e-3 identity 0"
     #pre_nnll
-    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_st_ammd None true 1e-3"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes pre_nnll,wpf_st_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms pre_nnll,wpf_st_ammd None true 1e-3 identity 0"
     #nll
-    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_st_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nll,wpf_st_ammd None true 1e-3"
+    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nll,wpf_st_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nll,wpf_st_ammd None true 1e-3 identity 0"
     #nnll
-    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_ed None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_st_ed None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_st_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_ammd None true 1e-3"
-    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_st_ammd None true 1e-3"
+    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_st_ed None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 EtE-LRes nnll,wpf_st_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_ammd None true 1e-3 identity 0"
+    "lorenz63 500 10 1.0 CorrTerms nnll,wpf_st_ammd None true 1e-3 identity 0"
 )
 
 
 # Iterate and submit
 for exp in "${EXPERIMENTS[@]}"; do
     # Parse the string into variables
-    read -r dataset epochs n sigma_y version loss_type loss_weights use_pf learning_rate suffix <<< "$exp"
+    read -r dataset epochs n sigma_y version loss_type loss_weights use_pf learning_rate obs_fn weight_decay suffix <<< "$exp"
 
     # Export variables to current shell environment so --export=ALL can pick them up.
     export DATASET=${dataset:-$DEF_DATASET}
@@ -104,6 +106,8 @@ for exp in "${EXPERIMENTS[@]}"; do
     export LOSS_WEIGHTS=${loss_weights:-$DEF_WEIGHTS}
     export USE_PF=${use_pf:-$DEF_USE_PF}
     export LEARNING_RATE=${learning_rate:-$DEF_LR}
+    export OBS_FN=${obs_fn:-$DEF_OBS_FN}
+    export WEIGHT_DECAY=${weight_decay:-$DEF_WEIGHT_DECAY}
     export SUFFIX=${suffix:-$DEF_SUFFIX}
 
     # --- Job Name Construction ---
@@ -112,7 +116,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         JOB_NAME="${JOB_NAME}-${SUFFIX}"
     fi
 
-    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, V=$VERSION, PF=$USE_PF)"
+    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, V=$VERSION, PF=$USE_PF, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY)"
 
     # Submit using --export=ALL
     sbatch -J "$JOB_NAME" \

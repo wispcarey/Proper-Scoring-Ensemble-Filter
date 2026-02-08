@@ -8,8 +8,9 @@ python train.py \
    --N 10 \
    --sigma_y 1.0 \
    --seed 42 \
-   --v EtE-LRes \
+   --v CorrTerms \
    --no_running_loss \
+   --weight_decay 0.01 \
    --loss_type es \
    --es_p 1 \
    --save_epoch 10 \
