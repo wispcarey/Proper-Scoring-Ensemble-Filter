@@ -17,6 +17,34 @@ DEF_OBS_FN="identity"
 DEF_WEIGHT_DECAY="0"
 DEF_SUFFIX=""
 
+compute_time_limit() {
+    local epochs="$1"
+    local base_hours=18
+    local max_hours=72
+    local hours
+    local days
+    local rem
+
+    if [ "$epochs" -le 500 ]; then
+        hours=$base_hours
+    else
+        # Scale from the 500-epoch baseline and round up to avoid under-requesting time.
+        hours=$(( (epochs * base_hours + 500 - 1) / 500 ))
+    fi
+
+    if [ "$hours" -gt "$max_hours" ]; then
+        hours=$max_hours
+    fi
+
+    if [ "$hours" -ge 24 ]; then
+        days=$(( hours / 24 ))
+        rem=$(( hours % 24 ))
+        printf "%d-%02d:00:00" "$days" "$rem"
+    else
+        printf "%02d:00:00" "$hours"
+    fi
+}
+
 # Experiment list
 # EXPERIMENTS=(
 #     #no nll
@@ -101,6 +129,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     export OBS_FN=${obs_fn:-$DEF_OBS_FN}
     export WEIGHT_DECAY=${weight_decay:-$DEF_WEIGHT_DECAY}
     export SUFFIX=${suffix:-$DEF_SUFFIX}
+    TIME_LIMIT=$(compute_time_limit "$EPOCHS")
 
     # Construct Job Name
     JOB_NAME="${DATASET}-${LOSS_TYPE}-N${N}"
@@ -108,11 +137,11 @@ for exp in "${EXPERIMENTS[@]}"; do
         JOB_NAME="${JOB_NAME}-${SUFFIX}" 
     fi
 
-    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY)"
+    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY, Time=$TIME_LIMIT)"
 
     # Submit using --export=ALL to pass the exported environment variables
     sbatch -J "$JOB_NAME" \
-           --time=12:00:00 \
+           --time="$TIME_LIMIT" \
            --export=ALL \
            "$SLURM_SCRIPT"
 done

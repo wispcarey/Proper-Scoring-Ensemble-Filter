@@ -520,6 +520,7 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
         
         accumulated_loss_for_batch_load = 0.0
         num_valid_loss_contributions = 0
+        running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
         
         # Trajectory storage
         traj_cache = { 'ens_f': [], 'ens_a': [], 'target_ens': [], 'target_weights': [], 'true_obs': [] }
@@ -566,9 +567,7 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                                 kes_sigma=args.kes_sigma, return_sum=True, additional_inputs=add_in
                             ) for l in mode_cfg)
                             accumulated_loss_for_batch_load += step_loss_sum
-                            num_v = torch.sum(mask).item()
-                            num_valid_loss_contributions += num_v
-                            losses.update(step_loss_sum.item() / num_v, num_v)
+                            running_valid_count_t += torch.sum(mask)
             else:
                 if need_pre: traj_cache['ens_f'].append(ens_v_f)
                 if need_post: traj_cache['ens_a'].append(curr_v_a)
@@ -598,6 +597,13 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
                     num_v = torch.sum(mask).item()
                     num_valid_loss_contributions += num_v
                     losses.update(t_loss.item() / num_v, num_v)
+        elif args.running_loss:
+            num_valid_loss_contributions = int(running_valid_count_t.item())
+            if num_valid_loss_contributions > 0:
+                running_avg_loss = (
+                    accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
+                ).detach()
+                losses.update(running_avg_loss.item(), num_valid_loss_contributions)
 
         if num_valid_loss_contributions > 0:
             (accumulated_loss_for_batch_load / num_valid_loss_contributions).backward()
@@ -1783,6 +1789,7 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
         # --- Initialize variables for loss calculation ---
         accumulated_loss_for_batch_load = 0.0
         num_valid_loss_contributions = 0
+        running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
         collected_ens_v_a = [] if not args.running_loss else None
         collected_gt_v_a = [] if not args.running_loss else None
 
@@ -1826,10 +1833,7 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
                             kes_sigma=args.kes_sigma, return_sum=True) for lt in args.loss_type)
                         
                         accumulated_loss_for_batch_load += step_loss
-                        num_valid_in_step = torch.sum(valid_B_mask_this_step)
-                        num_valid_loss_contributions += num_valid_in_step.item()
-                        if num_valid_in_step > 0:
-                            losses.update(step_loss.item() / num_valid_in_step.item(), num_valid_in_step.item())
+                        running_valid_count_t += torch.sum(valid_B_mask_this_step)
             else: # Trajectory loss: collect tensors
                 collected_ens_v_a.append(current_analyzed_ens_v_a)
                 collected_gt_v_a.append(gt_v_a)
@@ -1841,12 +1845,14 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
         
         # ======================= [POST-LOOP BACKPROPAGATION] =======================
         if args.running_loss:
+            num_valid_loss_contributions = int(running_valid_count_t.item())
             if num_valid_loss_contributions > 0:
-                average_loss = accumulated_loss_for_batch_load / num_valid_loss_contributions
+                average_loss = accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
                 average_loss.backward()
                 if all_trainable_params:
                     nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
                 optimizer.step()
+                losses.update(average_loss.detach().item(), num_valid_loss_contributions)
             else:
                 num_batches_all_nan += 1
         else: # Trajectory loss
