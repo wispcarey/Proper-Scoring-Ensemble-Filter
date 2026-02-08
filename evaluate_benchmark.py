@@ -7,7 +7,7 @@ import time
 
 from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import partial_obs_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output
 from train_test_utils import test_ClassicFilter, print_test_results
 
 def get_benchmarks(args, source='dapper'):
@@ -150,7 +150,7 @@ if __name__ == "__main__":
             torch.manual_seed(int(args.seed))
 
         # H_info
-        H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
+        H_info = build_observation_operator(args)
 
         # modify test_batch_size
         if args.N == 100 and args.dataset == 'ks':

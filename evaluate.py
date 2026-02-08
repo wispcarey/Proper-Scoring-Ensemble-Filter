@@ -7,7 +7,7 @@ import time
 from config.cli import get_parameters
 
 from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import partial_obs_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output
 
 from train_test_utils import test_model, set_models, print_test_results
 
@@ -29,7 +29,7 @@ if __name__ == "__main__":
             torch.manual_seed(int(args.seed))
 
         # H_info
-        H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
+        H_info = build_observation_operator(args)
 
         # modify test_batch_size
         if args.N in [60, 100] and args.device =='cpu':
@@ -105,5 +105,4 @@ if __name__ == "__main__":
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}{save_suffix}.pt"))
         else:
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}{save_suffix}.pt"))
-
 

@@ -65,6 +65,18 @@ def int_or_default(value):
             return "default"
         raise argparse.ArgumentTypeError(f"Invalid value: {value}")
 
+def int_or_none_or_default(value):
+    if isinstance(value, str):
+        lower_val = value.lower()
+        if lower_val == "none":
+            return None
+        if lower_val == "default":
+            return "default"
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}")
+
 def parse_list_type(s):
     return s.split(',')
 
@@ -108,6 +120,15 @@ def get_parameters():
                         help='Observation dimension (overrides dataset default)')
     parser.add_argument('--obs_inds', type=parse_obs_inds, default="default",
                         help='Observation indices, comma separated e.g., "0,2,4" (overrides dataset default)')
+    parser.add_argument('--obs_fn', type=str, default='identity',
+                        choices=['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'linear', 'custom'],
+                        help='Post-function g(.) in y = g(Px), where P selects args.obs_inds.')
+    parser.add_argument('--obs_fn_out_dim', type=int_or_none_or_default, default='default',
+                        help='Output dimension of observation post-function (needed for linear/custom).')
+    parser.add_argument('--obs_fn_seed', type=int, default=None,
+                        help='Random seed for observation post-function parameters (e.g., random linear projection).')
+    parser.add_argument('--obs_custom_fn_path', type=str, default=None,
+                        help='Custom function path "module.submodule:function" when obs_fn=custom.')
 
     # loss function
     parser.add_argument('--ignore_first', type=int, default=0,
@@ -302,6 +323,36 @@ def get_parameters():
             args.obs_inds = torch.arange(0, args.ori_dim, 2)
         else:
             args.obs_inds = dataset_config.get('obs_inds')
+
+    if args.obs_inds is not None:
+        args.obs_inds = torch.as_tensor(args.obs_inds, dtype=torch.long)
+        if torch.any(args.obs_inds < 0) or torch.any(args.obs_inds >= args.ori_dim):
+            raise ValueError(f"obs_inds must be within [0, {args.ori_dim - 1}].")
+
+    # Observation function settings:
+    # y = g(Px), where P chooses obs_inds and g is selected by obs_fn.
+    base_obs_dim = int(len(args.obs_inds)) if args.obs_inds is not None else int(args.obs_dim)
+    if args.obs_fn_out_dim == 'default':
+        args.obs_fn_out_dim = None
+    if args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh']:
+        args.obs_dim = base_obs_dim
+    elif args.obs_fn in ['linear', 'custom']:
+        target_obs_dim = args.obs_fn_out_dim if args.obs_fn_out_dim is not None else args.obs_dim
+        if target_obs_dim in [None, 'default']:
+            raise ValueError(f"obs_fn={args.obs_fn} requires --obs_fn_out_dim or --obs_dim.")
+        args.obs_dim = int(target_obs_dim)
+    else:
+        raise ValueError(f"Unsupported obs_fn: {args.obs_fn}")
+
+    if args.obs_fn == 'custom' and (args.obs_custom_fn_path is None or ':' not in args.obs_custom_fn_path):
+        raise ValueError("obs_fn=custom requires --obs_custom_fn_path in the form module.submodule:function.")
+
+    args.obs_has_direct_locs = (
+        args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh']
+        and args.obs_inds is not None
+        and int(args.obs_dim) == int(len(args.obs_inds))
+    )
+    args.obs_coord_inds = args.obs_inds if args.obs_has_direct_locs else None
         
     args.clamp = dataset_config.get('clamp')
 
@@ -370,15 +421,17 @@ def get_parameters():
         args.local_input_dim += args.obs_dim
 
     # localization
-    if args.ori_dim is not None and args.obs_inds is not None:
+    if args.ori_dim is not None and args.obs_coord_inds is not None:
         full_inds = torch.arange(0, args.ori_dim)
-        Lvy = pairwise_distances(full_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
-        Lyy = pairwise_distances(args.obs_inds[:, None], args.obs_inds[:, None], domain=(args.ori_dim,)).to(args.device)
+        Lvy = pairwise_distances(full_inds[:, None], args.obs_coord_inds[:, None], domain=(args.ori_dim,)).to(args.device)
+        Lyy = pairwise_distances(args.obs_coord_inds[:, None], args.obs_coord_inds[:, None], domain=(args.ori_dim,)).to(args.device)
         args.diff_dist = torch.unique(torch.cat((Lvy.flatten(), Lyy.flatten())))
         args.num_dist = len(args.diff_dist)
         args.Lvy = Lvy
         args.Lyy = Lyy
     else:
+        if args.obs_fn in ['linear', 'custom'] and not args.no_localization:
+            print("[INFO] Disabling localization-distance precomputation for non-direct observation coordinates.")
         args.diff_dist = None
         args.num_dist = 0
         args.Lvy = None

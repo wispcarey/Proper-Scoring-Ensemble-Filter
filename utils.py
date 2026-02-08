@@ -4,6 +4,7 @@ import sys
 import datetime
 import pickle
 import math
+import importlib
 
 from contextlib import contextmanager
 from scipy.linalg import eigvals
@@ -768,15 +769,143 @@ def mystery_operator(H_size, device, seed=None):
         return x @ proj
     return inner, proj
 
-def partial_obs_operator(ori_dim, obs_inds, device, seed=None):
+def _load_custom_obs_fn(custom_fn_path):
+    """Load a user-defined observation post-function from 'module.submodule:function'."""
+    if custom_fn_path is None or ':' not in custom_fn_path:
+        raise ValueError("custom observation function must be 'module.submodule:function_name'.")
+    module_name, fn_name = custom_fn_path.split(':', 1)
+    module = importlib.import_module(module_name)
+    fn = getattr(module, fn_name, None)
+    if fn is None or not callable(fn):
+        raise ValueError(f"Cannot load callable '{fn_name}' from module '{module_name}'.")
+    return fn
+
+
+def _build_obs_post_fn(
+    obs_fn,
+    base_obs_dim,
+    device,
+    obs_fn_out_dim=None,
+    obs_fn_seed=None,
+    obs_custom_fn_path=None,
+):
+    """Builds the post-processing function g(.) for y = g(Px)."""
+    if obs_fn_seed is not None:
+        torch.manual_seed(obs_fn_seed)
+
+    obs_fn = (obs_fn or 'identity').lower()
+    post_matrix = None
+
+    if obs_fn in ['identity', 'none']:
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for identity observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = lambda x: x
+    elif obs_fn == 'square':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for square observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = lambda x: x ** 2
+    elif obs_fn == 'square_root':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for square_root observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = lambda x: torch.sign(x) * torch.sqrt(torch.abs(x))
+    elif obs_fn == 'cube':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for cube observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = lambda x: x ** 3
+    elif obs_fn == 'sin':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for sin observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = torch.sin
+    elif obs_fn == 'tanh':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for tanh observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = torch.tanh
+    elif obs_fn == 'linear':
+        if obs_fn_out_dim is None:
+            raise ValueError("obs_fn_out_dim must be provided for obs_fn='linear'.")
+        out_dim = int(obs_fn_out_dim)
+        post_matrix = torch.randn(base_obs_dim, out_dim, device=device)
+        post_fn = lambda x: x @ post_matrix
+    elif obs_fn == 'custom':
+        if obs_fn_out_dim is None:
+            raise ValueError("obs_fn_out_dim must be provided for obs_fn='custom'.")
+        out_dim = int(obs_fn_out_dim)
+        custom_fn = _load_custom_obs_fn(obs_custom_fn_path)
+        post_fn = custom_fn
+    else:
+        raise ValueError(
+            f"Unsupported obs_fn='{obs_fn}'. Use one of "
+            "['identity','square','square_root','cube','sin','tanh','linear','custom']."
+        )
+
+    return post_fn, post_matrix, out_dim
+
+
+def partial_obs_operator(
+    ori_dim,
+    obs_inds,
+    device,
+    seed=None,
+    obs_fn='identity',
+    obs_fn_out_dim=None,
+    obs_fn_seed=None,
+    obs_custom_fn_path=None,
+):
+    if obs_inds is None:
+        raise ValueError("obs_inds cannot be None for partial_obs_operator.")
     if seed is not None:
         torch.manual_seed(seed)
+    obs_inds = torch.as_tensor(obs_inds, dtype=torch.long, device=device)
     proj = torch.zeros(ori_dim, len(obs_inds), device=device)
     for i, obs_ind in enumerate(obs_inds):
         proj[obs_ind, i] = 1
+    post_fn, post_matrix, _ = _build_obs_post_fn(
+        obs_fn=obs_fn,
+        base_obs_dim=len(obs_inds),
+        device=device,
+        obs_fn_out_dim=obs_fn_out_dim,
+        obs_fn_seed=obs_fn_seed,
+        obs_custom_fn_path=obs_custom_fn_path,
+    )
+
     def inner(x):
-        return x @ proj
-    return inner, proj
+        return post_fn(x @ proj)
+
+    op_info = {
+        'proj': proj,
+        'post_matrix': post_matrix,
+        'obs_inds': obs_inds,
+        'obs_fn': obs_fn,
+    }
+    # Backward-compatible: for pure linear partial observation, keep returning matrix.
+    if obs_fn in ['identity', 'none'] and post_matrix is None:
+        return inner, proj
+    return inner, op_info
+
+
+def build_observation_operator(args):
+    """Construct observation operator from CLI args."""
+    seed_obs = getattr(args, 'seed_obs', None)
+    if seed_obs is None:
+        seed_raw = getattr(args, 'seed', None)
+        if seed_raw is not None and str(seed_raw).lower() != "none":
+            seed_obs = int(seed_raw)
+    return partial_obs_operator(
+        ori_dim=args.ori_dim,
+        obs_inds=args.obs_inds,
+        device=args.device,
+        seed=seed_obs,
+        obs_fn=getattr(args, 'obs_fn', 'identity'),
+        obs_fn_out_dim=getattr(args, 'obs_fn_out_dim', None),
+        obs_fn_seed=getattr(args, 'obs_fn_seed', None),
+        obs_custom_fn_path=getattr(args, 'obs_custom_fn_path', None),
+    )
 
 def get_dataloader(args, x0=None, test_only=False):
     if args.dataset.startswith('linear'):

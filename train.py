@@ -7,7 +7,7 @@ import torch.nn as nn
 from config.cli import get_parameters
 
 from utils import setup_optimizer_and_scheduler, save_checkpoint, load_checkpoint
-from utils import partial_obs_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output
 
 from train_test_utils import train_model, test_model, set_models, print_test_results
 
@@ -31,7 +31,7 @@ if __name__ == "__main__":
             torch.manual_seed(int(args.seed))
 
         # H_info
-        H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
+        H_info = build_observation_operator(args)
 
         train_loader, test_loader = get_dataloader(args)
 
@@ -83,7 +83,6 @@ if __name__ == "__main__":
                 torch.save(train_records, os.path.join(folder_name, f"training_records.pt"))
                 save_checkpoint(model_list, optimizer, scheduler, filename=os.path.join(folder_name, f"cp_{epoch}.pth"))
                 
-
 
 
 

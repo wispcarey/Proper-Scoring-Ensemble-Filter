@@ -19,6 +19,30 @@ from typing import Optional, List, Tuple, Dict, Any
 from tqdm.auto import tqdm
 
 
+def _build_observation_plot_tensor(args, batch_v, obs_y_list):
+    """Map observation-space tensors to state-space layout for plotting when possible."""
+    obs_tensor = torch.stack(obs_y_list).squeeze(2)
+    observations = torch.full_like(batch_v, float('nan'), device=batch_v.device)
+
+    obs_coord_inds = getattr(args, 'obs_coord_inds', None)
+    obs_inds = getattr(args, 'obs_inds', None)
+    target_inds = obs_coord_inds if obs_coord_inds is not None else obs_inds
+
+    if target_inds is not None:
+        target_inds = torch.as_tensor(target_inds, device=batch_v.device, dtype=torch.long)
+        if target_inds.numel() == obs_tensor.shape[-1]:
+            observations[:, :, target_inds] = obs_tensor
+        else:
+            print(
+                f"Warning: cannot scatter observations for plotting because "
+                f"obs_dim={obs_tensor.shape[-1]} != number of coordinate indices={target_inds.numel()}."
+            )
+    else:
+        print("Warning: no observation coordinate indices available; plotting observations as NaN.")
+
+    return observations
+
+
 def set_models(args):
     # set models
     if args.v == 'CorrTerms':
@@ -735,7 +759,7 @@ def generate_and_cache_pf_results(
                 pf_ens_v_a = bootstrap_particle_filter_analysis(
                     pf_ens_v_f,
                     obs_y_list[i + 1].squeeze(1),  # (B, obs_dim)
-                    H.transpose(1, 0),
+                    H_fun if not isinstance(H, torch.Tensor) else H.transpose(1, 0),
                     args.sigma_y,
                     resampling_method="multinomial",
                     sigma_reg=args.sigma_reg,
@@ -1135,12 +1159,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                         print(f"Warning: Could not concatenate loc_tensors due to shape mismatch or other error: {e}")
 
             # Build observation tensor for plotting (unchanged)
-            obs_tensor = torch.stack(obs_y_list).squeeze(2)
-            observations = torch.full_like(batch_v, float('nan'), device=args.device)
-            if hasattr(args, 'obs_inds') and args.obs_inds is not None:
-                observations[:, :, args.obs_inds] = obs_tensor
-            else:
-                print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
+            observations = _build_observation_plot_tensor(args, batch_v, obs_y_list)
     
     # Plotting (unchanged)
     if plot_figures: 
@@ -1463,22 +1482,26 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     common_enkf_args["observation_y"] = obs_y_active
 
                     if args.v == 'EnKF':
-                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        use_loc = (loc_radius is not None and args.Lvy is not None and args.Lyy is not None)
+                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if use_loc else None
+                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if use_loc else None
                         ens_v_a_active, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active, **common_enkf_args, method='EnKF-PertObs',
                             localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
 
                     elif args.v == 'ESRF':
-                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
-                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if loc_radius is not None else None
+                        use_loc = (loc_radius is not None and args.Lvy is not None and args.Lyy is not None)
+                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if use_loc else None
+                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if use_loc else None
                         ens_v_a_active, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active, **common_enkf_args, method='ESRF',
                             localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
 
                     elif args.v == 'LETKF':
                         coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        if hasattr(args, 'obs_inds') and args.obs_inds is not None:
+                        if hasattr(args, 'obs_coord_inds') and args.obs_coord_inds is not None and len(args.obs_coord_inds) == d_obs_shape:
+                            coords_obs = torch.as_tensor(args.obs_coord_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                        elif hasattr(args, 'obs_inds') and args.obs_inds is not None and len(args.obs_inds) == d_obs_shape:
                             coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
                         else:
                             coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
@@ -1490,7 +1513,9 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
                     elif args.v.startswith('iEnKS'):
                         coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        if hasattr(args, 'obs_inds') and args.obs_inds is not None:
+                        if hasattr(args, 'obs_coord_inds') and args.obs_coord_inds is not None and len(args.obs_coord_inds) == d_obs_shape:
+                            coords_obs = torch.as_tensor(args.obs_coord_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
+                        elif hasattr(args, 'obs_inds') and args.obs_inds is not None and len(args.obs_inds) == d_obs_shape:
                             coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
                         else:
                             coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
@@ -1594,12 +1619,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 all_results['pf_rrmse'] = torch.cat((all_results['pf_rrmse'], torch.stack(pf_rmse_list).nanmean(0) / rms_val))
             
             # Build observation tensor for plotting (unchanged)
-            obs_tensor = torch.stack(obs_y_list).squeeze(2)
-            observations = torch.full_like(batch_v, float('nan'), device=args.device)
-            if hasattr(args, 'obs_inds') and args.obs_inds is not None:
-                observations[:, :, args.obs_inds] = obs_tensor
-            else:
-                print("Warning: args.obs_inds not defined. Observations tensor might be all NaNs.")
+            observations = _build_observation_plot_tensor(args, batch_v, obs_y_list)
 
     # Plotting (unchanged)
     if plot_figures: 

@@ -7,7 +7,7 @@ import torch.nn as nn
 from config.cli import get_parameters
 
 from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import partial_obs_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output
 
 from train_test_utils import generate_and_cache_pf_results, print_test_results
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
             torch.manual_seed(int(args.seed))
 
         # H_info
-        H_info = partial_obs_operator(args.ori_dim, args.obs_inds, args.device)
+        H_info = build_observation_operator(args)
 
         test_loader = get_dataloader(args, test_only=True)
         
@@ -38,5 +38,4 @@ if __name__ == "__main__":
         test_results = generate_and_cache_pf_results(test_loader, args, H_info, check_disk=False, calculate_crps=False, save_figure=args.pf_save_figure)
         print_test_results(test_results)
         print(f"PF Time: {time.time() - t:.2f}s")
-
 
