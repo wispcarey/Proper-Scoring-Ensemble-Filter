@@ -13,7 +13,7 @@
 #SBATCH -e output_record/L63_train.%N.%j.err      # STDERR (saved to output_record)
 
 # Description: Slurm script for train.py with configurable parameters for Lorenz63.
-# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LEARNING_RATE, SUFFIX.
+# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, SUFFIX.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -26,6 +26,8 @@ LOSS_TYPE=${LOSS_TYPE:-"es"}         # Default loss type
 LOSS_WEIGHTS=${LOSS_WEIGHTS:-"none"} # Default loss weights
 USE_PF=${USE_PF:-"true"}             # Set to "false" to disable --pf_verification
 LEARNING_RATE=${LEARNING_RATE:-"default"} # Default learning rate
+OBS_FN=${OBS_FN:-"identity"}         # Default observation post-function
+WEIGHT_DECAY=${WEIGHT_DECAY:-"0"}    # Default weight decay
 SUFFIX=${SUFFIX:-""}                 # Default suffix (empty string)
 
 # 2. Logic for Boolean Flags
@@ -34,7 +36,7 @@ if [ "$USE_PF" = "true" ]; then
     PF_FLAG="--pf_verification"
 fi
 
-echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, PF=$USE_PF, LR=$LEARNING_RATE, SUFFIX='$SUFFIX', LOSS_WEIGHTS=$LOSS_WEIGHTS"
+echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, PF=$USE_PF, LR=$LEARNING_RATE, obs_fn=$OBS_FN, weight_decay=$WEIGHT_DECAY, SUFFIX='$SUFFIX', LOSS_WEIGHTS=$LOSS_WEIGHTS"
 
 # Load modules
 module load cuda/12.2
@@ -52,6 +54,8 @@ python train.py \
     --seed 42 \
     --v $VERSION \
     --learning_rate $LEARNING_RATE \
+    --obs_fn $OBS_FN \
+    --weight_decay $WEIGHT_DECAY \
     --suffix "$SUFFIX" \
     --no_localization \
     --no_running_loss \

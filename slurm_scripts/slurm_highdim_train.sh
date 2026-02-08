@@ -13,7 +13,7 @@
 #SBATCH -e output_record/highdim_train.%N.%j.err      # STDERR (saved to output_record)
 
 # Description: Slurm script for train.py with configurable parameters for Lorenz63.
-# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, SUFFIX.
+# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, OBS_FN, WEIGHT_DECAY, SUFFIX.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -24,9 +24,11 @@ SIGMA_Y=${SIGMA_Y:-1}                # Default sigma_y
 VERSION=${VERSION:-"EtE-LRes"}       # Default version (--v)
 LOSS_TYPE=${LOSS_TYPE:-"es"}         # Default loss type
 LOSS_WEIGHTS=${LOSS_WEIGHTS:-"none"} # Default loss weights
+OBS_FN=${OBS_FN:-"identity"}         # Default observation post-function
+WEIGHT_DECAY=${WEIGHT_DECAY:-"0"}    # Default weight decay
 SUFFIX=${SUFFIX:-""}                 # Default suffix (empty string)
 
-echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, SUFFIX='$SUFFIX'"
+echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, obs_fn=$OBS_FN, weight_decay=$WEIGHT_DECAY, SUFFIX='$SUFFIX'"
 
 # Load modules
 module load cuda/12.2
@@ -43,6 +45,8 @@ python train.py \
     --sigma_y $SIGMA_Y \
     --seed 42 \
     --v $VERSION \
+    --obs_fn $OBS_FN \
+    --weight_decay $WEIGHT_DECAY \
     --suffix "$SUFFIX" \
     --no_running_loss \
     --loss_type $LOSS_TYPE \

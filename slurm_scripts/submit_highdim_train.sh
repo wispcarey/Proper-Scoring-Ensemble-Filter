@@ -82,8 +82,8 @@ EXPERIMENTS=(
     "lorenz96 1000 10 1.0 CorrTerms nl2 None square_root 0.01"
     "lorenz96 1000 10 1.0 EtE-LRes es None arctan 0"
     "lorenz96 1000 10 1.0 EtE-LRes nl2 None arctan 0"
-    "lorenz96 1000 10 1.0 CorrTerms es None arctan 0"
-    "lorenz96 1000 10 1.0 CorrTerms nl2 None arctan 0"
+    "lorenz96 1000 10 1.0 CorrTerms es None arctan 0.01"
+    "lorenz96 1000 10 1.0 CorrTerms nl2 None arctan 0.01"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do

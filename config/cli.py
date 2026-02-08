@@ -121,7 +121,7 @@ def get_parameters():
     parser.add_argument('--obs_inds', type=parse_obs_inds, default="default",
                         help='Observation indices, comma separated e.g., "0,2,4" (overrides dataset default)')
     parser.add_argument('--obs_fn', type=str, default='identity',
-                        choices=['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'linear', 'custom'],
+                        choices=['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan', 'linear', 'custom'],
                         help='Post-function g(.) in y = g(Px), where P selects args.obs_inds.')
     parser.add_argument('--obs_fn_out_dim', type=int_or_none_or_default, default='default',
                         help='Output dimension of observation post-function (needed for linear/custom).')
@@ -334,7 +334,7 @@ def get_parameters():
     base_obs_dim = int(len(args.obs_inds)) if args.obs_inds is not None else int(args.obs_dim)
     if args.obs_fn_out_dim == 'default':
         args.obs_fn_out_dim = None
-    if args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh']:
+    if args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']:
         args.obs_dim = base_obs_dim
     elif args.obs_fn in ['linear', 'custom']:
         target_obs_dim = args.obs_fn_out_dim if args.obs_fn_out_dim is not None else args.obs_dim
@@ -348,7 +348,7 @@ def get_parameters():
         raise ValueError("obs_fn=custom requires --obs_custom_fn_path in the form module.submodule:function.")
 
     args.obs_has_direct_locs = (
-        args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh']
+        args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']
         and args.obs_inds is not None
         and int(args.obs_dim) == int(len(args.obs_inds))
     )

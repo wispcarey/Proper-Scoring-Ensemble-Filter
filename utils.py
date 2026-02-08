@@ -826,6 +826,11 @@ def _build_obs_post_fn(
             raise ValueError("obs_fn_out_dim must equal len(obs_inds) for tanh observation function.")
         out_dim = int(base_obs_dim)
         post_fn = torch.tanh
+    elif obs_fn == 'arctan':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for arctan observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = torch.atan
     elif obs_fn == 'linear':
         if obs_fn_out_dim is None:
             raise ValueError("obs_fn_out_dim must be provided for obs_fn='linear'.")
@@ -841,7 +846,7 @@ def _build_obs_post_fn(
     else:
         raise ValueError(
             f"Unsupported obs_fn='{obs_fn}'. Use one of "
-            "['identity','square','square_root','cube','sin','tanh','linear','custom']."
+            "['identity','square','square_root','cube','sin','tanh','arctan','linear','custom']."
         )
 
     return post_fn, post_matrix, out_dim
