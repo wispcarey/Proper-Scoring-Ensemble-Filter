@@ -44,6 +44,11 @@ def _build_observation_plot_tensor(args, batch_v, obs_y_list):
 
 
 def set_models(args):
+    has_loc_geometry = (
+        getattr(args, 'num_dist', 0) > 0
+        and getattr(args, 'Lvy', None) is not None
+        and getattr(args, 'Lyy', None) is not None
+    )
     # set models
     if args.v == 'CorrTerms':
         model = Simple_MLP(d_input=args.input_dim, d_output=args.obs_dim + args.ori_dim, num_hidden_layers=3).to(args.device)
@@ -54,7 +59,7 @@ def set_models(args):
                                             num_blocks=4, num_heads=8, ff_expansion=2).to(args.device)
     else:
         model = NaiveNetwork(1)
-    if args.no_localization or args.v.startswith('EtE'):
+    if args.no_localization or args.v.startswith('EtE') or not has_loc_geometry:
         local_model = NaiveNetwork(1)
     else:
         local_model = Simple_MLP(d_input=args.local_input_dim, d_output=args.num_dist, num_hidden_layers=2).to(args.device)
@@ -226,7 +231,15 @@ def _process_analysis_step(args, model_list, ens_v_f, hv, obs_y, ens_i_innov, me
 
         R_cov = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(d_obs, device=args.device).unsqueeze(0).repeat(B, 1, 1)
         
-        if args.no_localization:
+        can_use_loc = (
+            (not args.no_localization)
+            and args.diff_dist is not None
+            and args.Lvy is not None
+            and args.Lyy is not None
+            and getattr(args, 'num_dist', 0) > 0
+        )
+
+        if not can_use_loc:
             K1 = torch.bmm(Vnn2.transpose(1, 2), Ynn) 
             K2 = torch.bmm(Ynn.transpose(1, 2), Ynn) + R_cov * (N_ens - 1)
         else:

@@ -11,10 +11,11 @@ python train.py \
    --v EtE-LRes \
    --no_localization \
    --no_running_loss \
-   --loss_type wpf_ammd,nll \
+   --loss_type es \
    --es_p 1 \
    --test_steps 500 \
    --pf_verification \
    --pf_N 100000 \
    --sigma_reg None \
-   --save_epoch 10 
+   --save_epoch 10 \
+   --obs_fn square_root
