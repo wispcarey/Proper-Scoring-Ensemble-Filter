@@ -56,7 +56,7 @@ dataset="lorenz96"
 methods=("EnKF" "LETKF") 
 # methods=("EnKF") 
 
-sigma_y=0.7
+sigma_y=1.0
 # --- Evaluation Loop ---
 for N in 5 10 15 20 40 60 100; do
     for method in "${methods[@]}"; do
@@ -68,6 +68,7 @@ for N in 5 10 15 20 40 60 100; do
             --sigma_y "$sigma_y" \
             --seed 42 \
             --v "$method" \
+            --obs_fn square_root \
             --normal_output 
     done
 done
