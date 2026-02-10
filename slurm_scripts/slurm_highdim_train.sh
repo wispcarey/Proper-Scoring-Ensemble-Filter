@@ -48,7 +48,6 @@ python train.py \
     --obs_fn $OBS_FN \
     --weight_decay $WEIGHT_DECAY \
     --suffix "$SUFFIX" \
-    --no_running_loss \
     --loss_type $LOSS_TYPE \
     --loss_weights $LOSS_WEIGHTS \
     --es_p 1 \
