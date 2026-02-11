@@ -61,6 +61,15 @@ def redirect_output(save_output=True, save_folder=".", filename="output.txt"):
             # No redirection occurred, so no cleanup is needed.
             pass
 
+
+def should_redirect_output(args):
+    """
+    Return whether output should be redirected to file.
+
+    If args.normal_output exists and is True, print directly to console.
+    """
+    return not bool(getattr(args, "normal_output", False))
+
 def check_nan_in_model(model):
     for param in model.parameters():
         if torch.isnan(param).any():
@@ -228,6 +237,65 @@ class Rossler(nn.Module):
         dxdt[:, 2] =  b + x[:, 2] * (x[:, 0] - c) # dz/dt
 
         return dxdt
+
+
+class DoublingMap1D(nn.Module):
+    """Discrete map: x_{k+1} = (2 * x_k) mod 1."""
+
+    def __init__(self):
+        super(DoublingMap1D, self).__init__()
+
+    @staticmethod
+    def forward(t, x=None):
+        # Support both forward(x) and forward(t, x) call styles.
+        if x is None:
+            x = t
+        return torch.remainder(2.0 * x, 1.0)
+
+
+class ComplexSquareMap2D(nn.Module):
+    """
+    Discrete map on R^2:
+        [u_{k+1}, v_{k+1}] = [u_k^2 - v_k^2, 2 u_k v_k].
+    """
+
+    def __init__(self):
+        super(ComplexSquareMap2D, self).__init__()
+
+    @staticmethod
+    def forward(t, x=None):
+        # Support both forward(x) and forward(t, x) call styles.
+        if x is None:
+            x = t
+        rvals = torch.zeros_like(x)
+        u = x[:, 0]
+        v = x[:, 1]
+        rvals[:, 0] = u * u - v * v
+        rvals[:, 1] = 2.0 * u * v
+        return rvals
+
+
+def project_to_unit_circle(x, eps=1e-12):
+    """
+    Project 2D vectors to the unit circle to prevent numerical blow-ups.
+
+    Args:
+        x (torch.Tensor): Tensor with last dimension size 2.
+        eps (float): Minimum norm used in normalization.
+
+    Returns:
+        torch.Tensor: Unit-normalized vectors with same shape as input.
+    """
+    if x.shape[-1] != 2:
+        raise ValueError(f"project_to_unit_circle expects last dim=2, got {x.shape[-1]}")
+    norms = torch.linalg.norm(x, dim=-1, keepdim=True)
+    x_unit = x / norms.clamp_min(eps)
+    zero_mask = norms <= eps
+    if zero_mask.any():
+        fallback = torch.zeros_like(x_unit)
+        fallback[..., 0] = 1.0
+        x_unit = torch.where(zero_mask.expand_as(x_unit), fallback, x_unit)
+    return x_unit
 
 
 def etd_rk4_ns_wrapper(device=None, dt=0.01, N=32, nu=1e-3, forcing_scale=-4.0):
@@ -594,12 +662,33 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
         else:
             return torch.tensor(np.load(file_path), dtype=torch.float32)
 
+    def __load_valid_cached_data(file_path, tag):
+        if not (check_disk and os.path.exists(file_path)):
+            return None
+        cached = __save_or_load_data(file_path)
+        if torch.isfinite(cached).all():
+            return cached
+        print(f"[WARN] Found non-finite values in cached {tag}: {file_path}. Regenerating this file.")
+        return None
+
     def __generate_trajectory(vf, steps, model, dt, dt_iter, sigma_v, burn_in=0):
         trajectory = []
+        sigma_v_eff = 0.0 if sigma_v is None else sigma_v
         for step in range(burn_in + steps):
-            for _ in range(dt_iter):
-                vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
-            vf = vf + sigma_v * torch.randn_like(vf, dtype=torch.float32, device=vf.device)
+            if dataset == "doubling1d":
+                vf = model.forward(vf)
+                vf = torch.remainder(
+                    vf + sigma_v_eff * torch.randn_like(vf, dtype=torch.float32, device=vf.device),
+                    1.0,
+                )
+            elif dataset == "complex2d":
+                vf = model.forward(vf)
+                vf = vf + sigma_v_eff * torch.randn_like(vf, dtype=torch.float32, device=vf.device)
+                vf = project_to_unit_circle(vf)
+            else:
+                for _ in range(dt_iter):
+                    vf = rk4(model.forward, vf, step * dt, dt / dt_iter)
+                vf = vf + sigma_v_eff * torch.randn_like(vf, dtype=torch.float32, device=vf.device)
             trajectory.append(vf.unsqueeze(0))
         return torch.cat(trajectory).to(dtype=torch.float32)
 
@@ -616,6 +705,12 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
         model, dim, default_v0 = CircleODE, 2, torch.tensor([[-1.0, 1.0]])
     elif dataset == "Hdoublewell":
         model, dim, default_v0 = DoubleWellODE, 2, torch.tensor([[-1.0, 1.0]])
+    elif dataset == "doubling1d":
+        model, dim, default_v0 = DoublingMap1D, 1, torch.rand(1, 1)
+    elif dataset == "complex2d":
+        theta0 = 2.0 * math.pi * torch.rand(1, 1)
+        default_v0 = torch.cat([torch.cos(theta0), torch.sin(theta0)], dim=1)
+        model, dim = ComplexSquareMap2D, 2
     elif dataset == "ks":
         model = etd_rk4_wrapper(device=None, dt=dt / dt_iter)
         try:
@@ -654,9 +749,8 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
     # --- Training Data Generation ---
     with torch.no_grad():
         if not test_only:
-            if check_disk and os.path.exists(prefix_path):
-                v_traj = __save_or_load_data(prefix_path)
-            else:
+            v_traj = __load_valid_cached_data(prefix_path, "training trajectory")
+            if v_traj is None:
                 if dataset == "ks":
                     v_traj = custom_int(v0, model, len(t), dt, dt_iter).unsqueeze(1)
                 elif dataset == "ns":
@@ -681,9 +775,8 @@ def gen_data(dataset, t, steps_test, steps_valid, args, v0=None, sigma_v=0,
             vf = v0
 
         # --- Test Data Generation ---
-        if check_disk and os.path.exists(test_file_path):
-            v_traj_test = __save_or_load_data(test_file_path)
-        else:
+        v_traj_test = __load_valid_cached_data(test_file_path, "test trajectory")
+        if v_traj_test is None:
             total_steps = steps_burn + steps_test + steps_valid
             
             if dataset == "ks":
@@ -801,6 +894,11 @@ def _build_obs_post_fn(
             raise ValueError("obs_fn_out_dim must equal len(obs_inds) for identity observation function.")
         out_dim = int(base_obs_dim)
         post_fn = lambda x: x
+    elif obs_fn == 'cos2pi':
+        if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
+            raise ValueError("obs_fn_out_dim must equal len(obs_inds) for cos2pi observation function.")
+        out_dim = int(base_obs_dim)
+        post_fn = lambda x: torch.cos(2.0 * math.pi * x)
     elif obs_fn == 'square':
         if obs_fn_out_dim is not None and int(obs_fn_out_dim) != int(base_obs_dim):
             raise ValueError("obs_fn_out_dim must equal len(obs_inds) for square observation function.")
@@ -846,7 +944,7 @@ def _build_obs_post_fn(
     else:
         raise ValueError(
             f"Unsupported obs_fn='{obs_fn}'. Use one of "
-            "['identity','square','square_root','cube','sin','tanh','arctan','linear','custom']."
+            "['identity','cos2pi','square','square_root','cube','sin','tanh','arctan','linear','custom']."
         )
 
     return post_fn, post_matrix, out_dim

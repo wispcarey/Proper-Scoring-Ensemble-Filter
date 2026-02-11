@@ -7,7 +7,7 @@ import time
 from config.cli import get_parameters
 
 from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 
 from train_test_utils import test_model, set_models, print_test_results
 
@@ -24,7 +24,7 @@ if __name__ == "__main__":
         folder_name = os.path.dirname(args.cp_load_path)
     
     # redirect output
-    with redirect_output(save_output=not args.normal_output, save_folder=folder_name, filename="test_output.txt"):
+    with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
         if args.seed is not None and args.seed != "None":
             torch.manual_seed(int(args.seed))
 
@@ -53,7 +53,15 @@ if __name__ == "__main__":
         # test
         print("Test NN Results")
         t_start = time.time()
-        test_results = test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False)
+        test_results = test_model(
+            test_loader,
+            model_list,
+            args,
+            H_info=H_info,
+            plot_figures=args.save_test_figures,
+            fig_name=f'{folder_name}/test_{args.N}_0',
+            save_pdf=False,
+        )
         print_test_results(test_results)
         t_inference = time.time() - t_start
         print(f"Inference finished with time {t_inference: .2f}s.")
@@ -105,4 +113,3 @@ if __name__ == "__main__":
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}{save_suffix}.pt"))
         else:
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}{save_suffix}.pt"))
-

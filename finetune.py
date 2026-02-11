@@ -8,7 +8,7 @@ import torch.nn as nn
 from config.cli import get_parameters
 
 from utils import setup_optimizer_and_scheduler, save_checkpoint, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 from train_test_utils import train_model, test_model, set_models, print_test_results
 
 
@@ -19,7 +19,7 @@ if __name__ == "__main__":
         os.makedirs(args.save_folder)
 
     # redirect output
-    with redirect_output(save_output=not args.normal_output, save_folder=args.save_folder, filename="ft_output.txt"):
+    with redirect_output(save_output=should_redirect_output(args), save_folder=args.save_folder, filename="ft_output.txt"):
         # folder name
         folder_name = args.save_folder
         
@@ -81,7 +81,15 @@ if __name__ == "__main__":
             print("Training Start")
             
             # Initial test before training
-            initial_test_results = test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/ft_test_{args.N}_0', save_pdf=False)
+            initial_test_results = test_model(
+                test_loader,
+                model_list,
+                args,
+                H_info=H_info,
+                plot_figures=args.save_test_figures,
+                fig_name=f'{folder_name}/ft_test_{args.N}_0',
+                save_pdf=False,
+            )
             print_test_results(initial_test_results)
             
             for key, value in initial_test_results.items():
@@ -95,7 +103,15 @@ if __name__ == "__main__":
                 
                 if epoch % args.save_epoch == 0:
                     # Test at each save epoch
-                    epoch_test_results = test_model(test_loader, model_list, args, H_info=H_info, plot_figures=True, fig_name=f'{folder_name}/ft_test_{args.N}_{epoch}', save_pdf=False)
+                    epoch_test_results = test_model(
+                        test_loader,
+                        model_list,
+                        args,
+                        H_info=H_info,
+                        plot_figures=args.save_test_figures,
+                        fig_name=f'{folder_name}/ft_test_{args.N}_{epoch}',
+                        save_pdf=False,
+                    )
                     print_test_results(epoch_test_results)
                     
                     for key, value in epoch_test_results.items():

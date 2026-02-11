@@ -911,3 +911,193 @@ def plot_and_test_point_clouds(
     num_processed = len(indices_to_process)
     plot_types_str = "2 plots (adaptive/fixed)" if _limits is not None else "1 plot (adaptive)"
     print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")
+
+
+def _map_state_to_ring_xy(points: torch.Tensor) -> torch.Tensor:
+    """
+    Map state points (N, D) to unit-circle coordinates (N, 2).
+
+    - D == 1: theta = 2*pi*x
+    - D >= 2: theta = atan2(y, x), where x=points[:,0], y=points[:,1]
+    """
+    if points.ndim != 2:
+        raise ValueError(f"Expected points shape (N, D), got {tuple(points.shape)}")
+    d = points.shape[1]
+    if d < 1:
+        raise ValueError("State dimension must be >= 1 for ring mapping.")
+
+    if d == 1:
+        theta = 2.0 * np.pi * points[:, 0]
+    else:
+        theta = torch.atan2(points[:, 1], points[:, 0])
+
+    return torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+
+
+def plot_and_test_point_clouds_ring(
+    args: Namespace,
+    tensor: torch.Tensor,
+    num_samples_plot: int,
+    prefix: str,
+    point_color: str,
+    observation: Optional[torch.Tensor] = None,
+    true_state: Optional[torch.Tensor] = None,
+    plot_history: bool = True,
+    plot_indices: Optional[List[int]] = None,
+    history_traj: Optional[torch.Tensor] = None,
+):
+    """
+    Visualize 1D/2D point clouds on a unit circle using 2D density estimation.
+
+    - For 1D: state x is mapped by theta=2*pi*x.
+    - For 2D: state (u,v) is mapped by theta=atan2(v,u).
+    - Observation is interpreted as circle x-coordinate and plotted at (obs_x, 0).
+    - True state is mapped to ring and plotted with a black "x" marker if provided.
+    - History trajectory is optional and controlled by `plot_history`.
+    - If plotted ensemble size < 1000, draw all points directly (scatter).
+      Otherwise use 2D hexbin density.
+    """
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    if history_traj is not None and history_traj.is_cuda:
+        history_traj = history_traj.cpu()
+    if observation is not None and isinstance(observation, torch.Tensor) and observation.is_cuda:
+        observation = observation.cpu()
+    if true_state is not None and isinstance(true_state, torch.Tensor) and true_state.is_cuda:
+        true_state = true_state.cpu()
+
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected tensor shape (B, N, D), got {tuple(tensor.shape)}")
+
+    B, N, D = tensor.shape
+    if D < 1:
+        raise ValueError(f"State dimension must be >=1, got D={D}.")
+
+    if history_traj is not None:
+        if history_traj.ndim != 3:
+            print("Warning: history_traj must be (T, B, D). Ignoring trajectory.")
+            history_traj = None
+        else:
+            T_h, B_h, D_h = history_traj.shape
+            if B_h != B or D_h < 1:
+                print("Warning: history_traj shape is incompatible. Ignoring trajectory.")
+                history_traj = None
+
+    point_color = (point_color or "").lower().strip()
+    if point_color not in {"red", "blue"}:
+        point_color = "blue"
+
+    if plot_indices is None:
+        indices_to_process = list(range(B))
+    else:
+        indices_to_process = [idx for idx in plot_indices if 0 <= idx < B]
+
+    # Observation scalar -> x-coordinate on ring axis
+    obs_x = None
+    if observation is not None:
+        if isinstance(observation, torch.Tensor):
+            obs_tensor = observation.reshape(-1).detach().cpu()
+            if obs_tensor.numel() > 0:
+                obs_x = float(obs_tensor[0].item())
+        else:
+            obs_np = np.asarray(observation).reshape(-1)
+            if obs_np.size > 0:
+                obs_x = float(obs_np[0])
+
+    for i in indices_to_process:
+        full_points = tensor[i, :, :]  # (N, D)
+        n_to_plot = min(N, num_samples_plot)
+        density_threshold = 1000
+        if n_to_plot < density_threshold:
+            points_plot = full_points
+        else:
+            chosen = torch.randperm(N)[:n_to_plot]
+            points_plot = full_points[chosen, :]
+        xy_plot = _map_state_to_ring_xy(points_plot).numpy()
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+
+        # Unit circle reference
+        phi = np.linspace(0.0, 2.0 * np.pi, 400)
+        ax.plot(np.cos(phi), np.sin(phi), color='gray', linewidth=1.0, alpha=0.8, label='Unit circle')
+
+        if xy_plot.shape[0] < density_threshold:
+            # Small ensembles: plot all points directly.
+            ax.scatter(
+                xy_plot[:, 0], xy_plot[:, 1],
+                s=10, alpha=0.55, c=point_color, edgecolors='none', label='Ensemble'
+            )
+        else:
+            # Large ensembles: density view is clearer.
+            cmap = 'Reds' if point_color == 'red' else 'Blues'
+            hb = ax.hexbin(
+                xy_plot[:, 0], xy_plot[:, 1],
+                gridsize=60,
+                extent=(-1.25, 1.25, -1.25, 1.25),
+                mincnt=1,
+                bins='log',
+                cmap=cmap,
+                linewidths=0.0,
+                alpha=0.95,
+            )
+            cbar = fig.colorbar(hb, ax=ax, shrink=0.82, pad=0.02)
+            cbar.set_label("log10(count)")
+
+            # Optional sparse overlay to show geometry without overplotting.
+            n_overlay = min(1500, xy_plot.shape[0])
+            if n_overlay > 0:
+                idx_overlay = np.random.choice(xy_plot.shape[0], size=n_overlay, replace=False)
+                ax.scatter(
+                    xy_plot[idx_overlay, 0], xy_plot[idx_overlay, 1],
+                    s=2, alpha=0.12, c=point_color, edgecolors='none'
+                )
+
+        # History trajectory (mapped to ring)
+        if plot_history and history_traj is not None:
+            traj = history_traj[:, i, :]  # (T, D)
+            traj_xy = _map_state_to_ring_xy(traj).numpy()
+            ax.plot(traj_xy[:, 0], traj_xy[:, 1], color='black', linewidth=1.5, label='History trajectory')
+
+        # Observation as circle x-coordinate
+        if obs_x is not None:
+            obs_x_clip = float(np.clip(obs_x, -1.2, 1.2))
+            ax.scatter(obs_x_clip, 0.0, marker='*', s=160, c='orange', edgecolors='black',
+                       linewidth=0.6, zorder=10, label='Observation x-coordinate')
+            ax.axvline(obs_x_clip, color='orange', linestyle='--', linewidth=1.0, alpha=0.7)
+
+        # True state mapped to ring (if provided)
+        if true_state is not None:
+            if isinstance(true_state, torch.Tensor):
+                ts = true_state.detach().cpu()
+            else:
+                ts = torch.as_tensor(true_state)
+
+            true_xy = None
+            if ts.ndim == 1:
+                if ts.numel() >= D:
+                    true_xy = _map_state_to_ring_xy(ts[:D].reshape(1, D)).numpy()[0]
+            elif ts.ndim == 2:
+                if ts.shape[0] == B and ts.shape[1] >= D:
+                    true_xy = _map_state_to_ring_xy(ts[i, :D].reshape(1, D)).numpy()[0]
+                elif ts.shape[1] >= D:
+                    true_xy = _map_state_to_ring_xy(ts[0, :D].reshape(1, D)).numpy()[0]
+
+            if true_xy is not None:
+                ax.scatter(
+                    true_xy[0], true_xy[1],
+                    marker='x', s=90, c='black', linewidth=1.8, zorder=11, label='True state'
+                )
+
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(-1.25, 1.25)
+        ax.set_ylim(-1.25, 1.25)
+        ax.set_xlabel("ring-x")
+        ax.set_ylabel("ring-y")
+        mode_str = "scatter" if xy_plot.shape[0] < density_threshold else "hexbin density"
+        ax.set_title(f"{args.dataset} (ring map, {mode_str}), cloud {i}")
+        ax.legend(loc='upper right', fontsize=9, frameon=True)
+
+        fig.savefig(f"{prefix}_{i}_ring.png", bbox_inches='tight', dpi=150)
+        plt.close(fig)
+
+    print(f"Processed {len(indices_to_process)} ring-mapped point clouds with prefix '{prefix}'.")

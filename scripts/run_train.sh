@@ -3,18 +3,25 @@
 cd ..
 
 python train.py \
-   --dataset lorenz63 \
+   # --dataset doubling1d \
+   --dataset complex2d \
    --num_loader_workers 16 \
-   --epochs 1000 \
-   --N 10 \
-   --sigma_y 1 \
+   --epochs 100 \
+   --N 30 \
+   --batch_size 512 \
+   --sigma_y 0.1 \
    --seed 42 \
-   # --v EtE-LRes \
-   --v CorrTerms \
+   --v EtE-LRes \
    --no_running_loss \
    --loss_type nl2 \
    --no_localization \
-   --es_p 1
+   --es_p 1 \
+   --save_epoch 10 \
+   --normal_output \
+   --pf_verification \
+   --pf_N 1000000 \
+   --test_steps 200 \
+   --save_test_figures
 
 # python train.py \
 #    --dataset rossler \
@@ -67,7 +74,6 @@ python train.py \
 #     --sigma_y 0.7 \
 #     --seed 1 \
 #     --no_localization 
-
 
 
 

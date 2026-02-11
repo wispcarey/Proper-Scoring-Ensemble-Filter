@@ -84,7 +84,7 @@ def get_parameters():
     parser = argparse.ArgumentParser()
     # dataset setting
     parser.add_argument('--dataset', type=str, default='lorenz96', 
-                        choices=['lorenz63', 'rossler','lorenz96', 'ks', 'linear', 'circle', 'Hdoublewell'],
+                        choices=['lorenz63', 'rossler','lorenz96', 'ks', 'linear', 'circle', 'Hdoublewell', 'doubling1d', 'complex2d'],
                         help='Dataset name')
     parser.add_argument('--num_loader_workers', type=int, default=16,
                         help='number of workers for the data loader')
@@ -120,8 +120,8 @@ def get_parameters():
                         help='Observation dimension (overrides dataset default)')
     parser.add_argument('--obs_inds', type=parse_obs_inds, default="default",
                         help='Observation indices, comma separated e.g., "0,2,4" (overrides dataset default)')
-    parser.add_argument('--obs_fn', type=str, default='identity',
-                        choices=['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan', 'linear', 'custom'],
+    parser.add_argument('--obs_fn', type=str, default='default',
+                        choices=['default', 'identity', 'cos2pi', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan', 'linear', 'custom'],
                         help='Post-function g(.) in y = g(Px), where P selects args.obs_inds.')
     parser.add_argument('--obs_fn_out_dim', type=int_or_none_or_default, default='default',
                         help='Output dimension of observation post-function (needed for linear/custom).')
@@ -223,12 +223,16 @@ def get_parameters():
     parser.add_argument('--no_running_loss', action='store_true',
                         help='Do not use an accumulative loss in training. Calculate the loss once finishing the entire trajectory')
     # parser.set_defaults(no_running_loss=True)
+    parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'],
+                        help='Training precision. fp32 is default (no precision loss). bf16/fp16 enable mixed precision on CUDA.')
     
     # test settings
     parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')
     parser.add_argument('--pf_N', type=int, default=1000,
                         help='number particles for PF')
     parser.add_argument('--pf_save_figure', action='store_true', help='save_pf_visualization')
+    parser.add_argument('--save_test_figures', action='store_true',
+                        help='save visualization figures during test/evaluation')
     parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
                         help='the std of noise added to resampling in BPF')
 
@@ -331,10 +335,14 @@ def get_parameters():
 
     # Observation function settings:
     # y = g(Px), where P chooses obs_inds and g is selected by obs_fn.
+    if args.obs_fn == 'default':
+        args.obs_fn = dataset_config.get('obs_fn', 'identity')
+    args.obs_fn = (args.obs_fn or 'identity').lower()
+
     base_obs_dim = int(len(args.obs_inds)) if args.obs_inds is not None else int(args.obs_dim)
     if args.obs_fn_out_dim == 'default':
         args.obs_fn_out_dim = None
-    if args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']:
+    if args.obs_fn in ['identity', 'cos2pi', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']:
         args.obs_dim = base_obs_dim
     elif args.obs_fn in ['linear', 'custom']:
         target_obs_dim = args.obs_fn_out_dim if args.obs_fn_out_dim is not None else args.obs_dim
@@ -348,7 +356,7 @@ def get_parameters():
         raise ValueError("obs_fn=custom requires --obs_custom_fn_path in the form module.submodule:function.")
 
     args.obs_has_direct_locs = (
-        args.obs_fn in ['identity', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']
+        args.obs_fn in ['identity', 'cos2pi', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']
         and args.obs_inds is not None
         and int(args.obs_dim) == int(len(args.obs_inds))
     )
@@ -370,6 +378,8 @@ def get_parameters():
     else:
         print("Use CPU")
         args.use_data_parallel = False
+
+    print(f"[INFO] Precision mode: {args.precision}")
 
 
     if args.GPU_memory != 16 and args.batch_size is not None:

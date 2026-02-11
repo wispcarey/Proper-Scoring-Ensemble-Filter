@@ -1,15 +1,22 @@
 import numpy as np
 import time
 import os
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import math
 
-from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE
+from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE, DoublingMap1D, ComplexSquareMap2D
+from utils import project_to_unit_circle
 from utils import AverageMeter, mystery_operator, get_mean_std
 from utils import post_process, mean0
-from visualization import plot_particle_trajectories_with_histograms, plot_particle_trajectories, plot_and_test_point_clouds
+from visualization import (
+    plot_particle_trajectories_with_histograms,
+    plot_particle_trajectories,
+    plot_and_test_point_clouds,
+    plot_and_test_point_clouds_ring,
+)
 from localization import dist2coeff, create_loc_mat
 from loss import compute_loss, compute_es, wasserstein2_multivariate_gaussian
 from networks import NaiveNetwork, SetTransformer, Simple_MLP, ConditionTransformerNetwork
@@ -17,6 +24,67 @@ from benchmark_analysis import ensemble_kalman_filter_analysis, bootstrap_partic
 from typing import Optional, List, Tuple, Dict, Any
 
 from tqdm.auto import tqdm
+
+
+def _setup_mixed_precision(args):
+    """
+    Configure mixed precision runtime once per process.
+
+    Default is fp32 (disabled). Low precision modes are enabled only on CUDA.
+    """
+    if getattr(args, "_precision_runtime_configured", False):
+        return
+
+    precision = str(getattr(args, "precision", "fp32")).lower()
+    device_is_cuda = isinstance(args.device, torch.device) and args.device.type == "cuda"
+
+    args._amp_enabled = False
+    args._amp_dtype = None
+    args._grad_scaler = None
+
+    if precision == "fp32":
+        pass
+    elif precision == "bf16":
+        if device_is_cuda:
+            args._amp_enabled = True
+            args._amp_dtype = torch.bfloat16
+            print("[INFO] AMP enabled with bf16 on CUDA.")
+        else:
+            print("[WARN] bf16 mixed precision is only enabled for CUDA in this project. Falling back to fp32.")
+    elif precision == "fp16":
+        if device_is_cuda:
+            args._amp_enabled = True
+            args._amp_dtype = torch.float16
+            args._grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+            print("[INFO] AMP enabled with fp16 on CUDA (GradScaler active).")
+        else:
+            print("[WARN] fp16 mixed precision requires CUDA. Falling back to fp32.")
+    else:
+        print(f"[WARN] Unknown precision '{precision}'. Falling back to fp32.")
+
+    args._precision_runtime_configured = True
+
+
+def _autocast_context(args):
+    if getattr(args, "_amp_enabled", False):
+        return torch.autocast(device_type="cuda", dtype=args._amp_dtype, enabled=True)
+    return nullcontext()
+
+
+def _backward_and_step(loss, optimizer, all_trainable_params, args):
+    scaler = getattr(args, "_grad_scaler", None)
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        if all_trainable_params:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        if all_trainable_params:
+            nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
+        optimizer.step()
 
 
 def _build_observation_plot_tensor(args, batch_v, obs_y_list):
@@ -41,6 +109,384 @@ def _build_observation_plot_tensor(args, batch_v, obs_y_list):
         print("Warning: no observation coordinate indices available; plotting observations as NaN.")
 
     return observations
+
+
+def _select_plot_batch_index(ens_tensor: torch.Tensor) -> int:
+    """Pick a trajectory index with the fewest NaN time steps for visualization."""
+    if ens_tensor.ndim != 4 or ens_tensor.shape[1] == 0:
+        return 0
+    nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))  # [T, B]
+    nan_counts = nan_per_step.sum(dim=0)
+    return int(torch.argmin(nan_counts).item())
+
+
+def _get_lowdim_snapshot_indices(total_steps: int, start_step: int = 100, num_slices: int = 3, step_offset: int = 0):
+    """Select equally spaced snapshot indices using 1-based step labels."""
+    if total_steps <= 0:
+        return []
+
+    min_label = max(1 + step_offset, int(start_step))
+    max_label = total_steps + step_offset
+    if min_label > max_label:
+        min_label = max_label
+
+    if max_label - min_label + 1 >= num_slices:
+        labels = np.rint(np.linspace(min_label, max_label, num_slices)).astype(int).tolist()
+    else:
+        labels = list(range(min_label, max_label + 1))
+
+    # De-duplicate while preserving order.
+    dedup_labels = []
+    for lbl in labels:
+        if lbl not in dedup_labels:
+            dedup_labels.append(lbl)
+
+    selected = []
+    for lbl in dedup_labels:
+        idx = lbl - 1 - step_offset
+        if 0 <= idx < total_steps:
+            selected.append((idx, lbl))
+    return selected
+
+
+def _plot_last_three_steps_ring(args, ens_traj, true_traj, observations, fig_name, step_offset: int = 0):
+    """Use ring-mapped visualization for selected 3 low-dim slices."""
+    T = ens_traj.shape[0]
+    selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
+    for t_idx, step_label in selected_steps:
+        obs_t = observations[t_idx]
+        obs_input = obs_t if torch.isfinite(obs_t.reshape(-1)[:1]).all() else None
+        history_traj = true_traj[: t_idx + 1].unsqueeze(1)  # [t+1, 1, d]
+
+        plot_and_test_point_clouds_ring(
+            args=args,
+            tensor=ens_traj[t_idx : t_idx + 1],   # [1, N, d]
+            num_samples_plot=min(ens_traj.shape[1], 10000),
+            prefix=f"{fig_name}_slice_step{step_label}",
+            point_color="red",
+            observation=obs_input,
+            true_state=true_traj[t_idx],
+            plot_history=False,
+            plot_indices=[0],
+            history_traj=history_traj,
+        )
+
+
+def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig_name, save_pdf=False, step_offset: int = 0):
+    """Plot ensemble/true/obs snapshots for selected 3 steps (dim <= 3, non-ring datasets)."""
+    import matplotlib.pyplot as plt
+
+    T, _, D = ens_traj.shape
+    density_threshold = 1000
+    selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
+    if len(selected_steps) == 0:
+        return
+
+    if D == 3:
+        fig = plt.figure(figsize=(6 * len(selected_steps), 5))
+        for col, (t_idx, step_label) in enumerate(selected_steps, start=1):
+            ax = fig.add_subplot(1, len(selected_steps), col, projection='3d')
+            ens_t = ens_traj[t_idx]
+            valid = torch.isfinite(ens_t).all(dim=1)
+            ens_t = ens_t[valid]
+
+            if ens_t.shape[0] > 0:
+                ax.scatter(ens_t[:, 0], ens_t[:, 1], ens_t[:, 2], s=7, alpha=0.35, c='tab:red', label='Ensemble')
+            if torch.isfinite(true_traj[t_idx, :3]).all():
+                ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1], true_traj[t_idx, 2],
+                           marker='x', s=80, c='black', linewidth=1.6, label='True')
+            if torch.isfinite(observations[t_idx, :3]).all():
+                ax.scatter(observations[t_idx, 0], observations[t_idx, 1], observations[t_idx, 2],
+                           marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
+            ax.set_title(f"step={step_label}")
+            if col == 1:
+                ax.legend(loc='best', fontsize=8)
+        fig.tight_layout()
+    else:
+        fig, axes = plt.subplots(1, len(selected_steps), figsize=(5 * len(selected_steps), 4))
+        if len(selected_steps) == 1:
+            axes = [axes]
+
+        for ax, (t_idx, step_label) in zip(axes, selected_steps):
+            ens_t = ens_traj[t_idx]
+            valid = torch.isfinite(ens_t).all(dim=1)
+            ens_t = ens_t[valid]
+
+            if D == 2:
+                if ens_t.shape[0] > 0:
+                    if ens_t.shape[0] < density_threshold:
+                        ax.scatter(ens_t[:, 0], ens_t[:, 1], s=12, alpha=0.45, c='tab:red', label='Ensemble')
+                    else:
+                        ax.hexbin(
+                            ens_t[:, 0].numpy(),
+                            ens_t[:, 1].numpy(),
+                            gridsize=45,
+                            bins='log',
+                            mincnt=1,
+                            cmap='Reds',
+                            linewidths=0.0,
+                            alpha=0.9,
+                        )
+                if torch.isfinite(true_traj[t_idx, :2]).all():
+                    ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1],
+                               marker='x', s=80, c='black', linewidth=1.6, label='True')
+                if torch.isfinite(observations[t_idx, :2]).all():
+                    ax.scatter(observations[t_idx, 0], observations[t_idx, 1],
+                               marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
+                ax.set_xlabel("dim0")
+                ax.set_ylabel("dim1")
+                ax.set_aspect('equal', adjustable='box')
+            else:  # D == 1
+                if ens_t.shape[0] > 0:
+                    ax.scatter(ens_t[:, 0], torch.zeros_like(ens_t[:, 0]), s=8, alpha=0.35, c='tab:red', label='Ensemble')
+                if torch.isfinite(true_traj[t_idx, 0]).all():
+                    ax.scatter(true_traj[t_idx, 0], 0.0, marker='x', s=80, c='black', linewidth=1.6, label='True')
+                if torch.isfinite(observations[t_idx, 0]).all():
+                    ax.scatter(observations[t_idx, 0], 0.0, marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
+                ax.set_xlabel("dim0")
+                ax.set_yticks([])
+
+            ax.set_title(f"step={step_label}")
+            if ax is axes[0]:
+                ax.legend(loc='best', fontsize=8)
+        fig.tight_layout()
+
+    fig.savefig(f"{fig_name}_slice_steps.png", dpi=150, bbox_inches='tight')
+    if save_pdf:
+        fig.savefig(f"{fig_name}_slice_steps.pdf", bbox_inches='tight')
+    plt.close(fig)
+
+
+def _plot_lowdim_traj_summary(ens_traj, ref_traj, observations, fig_name, save_pdf=False):
+    """Plot trajectory-level summaries for dim <= 3 against a reference trajectory."""
+    import matplotlib.pyplot as plt
+
+    D = ref_traj.shape[-1]
+    dim_indices = list(range(D))
+
+    plot_particle_trajectories_with_histograms(
+        particles=ens_traj,
+        true_traj=ref_traj,
+        observation=observations,
+        dim_indices=dim_indices,
+        start_time=0,
+        end_time=ens_traj.shape[0],
+        mode='quantile',
+        save_fig=True,
+        save_pdf=save_pdf,
+        save_name=fig_name + "_trajdims",
+        hist_step=1,
+        fontsize=16,
+    )
+
+    ens_mean = ens_traj.mean(dim=1)
+    if D == 3:
+        fig = plt.figure(figsize=(6, 5))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.plot(ref_traj[:, 0], ref_traj[:, 1], ref_traj[:, 2], c='black', linewidth=1.6, label='Reference')
+        ax.plot(ens_mean[:, 0], ens_mean[:, 1], ens_mean[:, 2], c='tab:red', linewidth=1.2, label='Ensemble mean')
+        valid_obs = torch.isfinite(observations[:, :3]).all(dim=1)
+        if valid_obs.any():
+            obs = observations[valid_obs, :3]
+            ax.scatter(obs[:, 0], obs[:, 1], obs[:, 2], c='orange', s=10, alpha=0.8, label='Obs')
+        ax.set_title("Trajectory 3D View")
+        ax.legend(loc='best', fontsize=8)
+        fig.tight_layout()
+        fig.savefig(f"{fig_name}_traj3d.png", dpi=150, bbox_inches='tight')
+        if save_pdf:
+            fig.savefig(f"{fig_name}_traj3d.pdf", bbox_inches='tight')
+        plt.close(fig)
+    elif D == 2:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.plot(ref_traj[:, 0], ref_traj[:, 1], c='black', linewidth=1.6, label='Reference')
+        ax.plot(ens_mean[:, 0], ens_mean[:, 1], c='tab:red', linewidth=1.2, label='Ensemble mean')
+        valid_obs = torch.isfinite(observations[:, :2]).all(dim=1)
+        if valid_obs.any():
+            obs = observations[valid_obs, :2]
+            ax.scatter(obs[:, 0], obs[:, 1], c='orange', s=12, alpha=0.8, label='Obs')
+        ax.set_xlabel("dim0")
+        ax.set_ylabel("dim1")
+        ax.set_title("Trajectory 2D View")
+        ax.legend(loc='best', fontsize=8)
+        fig.tight_layout()
+        fig.savefig(f"{fig_name}_traj2d.png", dpi=150, bbox_inches='tight')
+        if save_pdf:
+            fig.savefig(f"{fig_name}_traj2d.pdf", bbox_inches='tight')
+        plt.close(fig)
+
+
+def _plot_test_visualizations(
+    args,
+    ens_tensor,
+    true_tensor,
+    observations,
+    fig_name,
+    save_pdf=False,
+    comparison_tensor=None,
+    step_offset: int = 0,
+):
+    """Dispatch visualization strategy by state dimension.
+
+    Args:
+        true_tensor: ground-truth trajectory used for per-step snapshots (e.g., black X).
+        comparison_tensor: reference trajectory used for ensemble-mean trajectory comparison.
+            If None, falls back to true_tensor.
+    """
+    if ens_tensor.ndim != 4 or ens_tensor.shape[1] == 0:
+        return
+    if comparison_tensor is None:
+        comparison_tensor = true_tensor
+
+    if args.ori_dim <= 3:
+        bidx = _select_plot_batch_index(ens_tensor)
+        ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
+        true_traj = true_tensor[:, bidx, :].detach().cpu()
+        compare_traj = comparison_tensor[:, bidx, :].detach().cpu()
+        obs_traj = observations[:, bidx, :].detach().cpu()
+
+        if args.dataset in {"doubling1d", "complex2d"}:
+            _plot_last_three_steps_ring(
+                args,
+                ens_traj,
+                true_traj,
+                obs_traj,
+                fig_name=fig_name,
+                step_offset=step_offset,
+            )
+        else:
+            _plot_last_three_steps_lowdim_generic(
+                ens_traj=ens_traj,
+                true_traj=true_traj,
+                observations=obs_traj,
+                fig_name=fig_name,
+                save_pdf=save_pdf,
+                step_offset=step_offset,
+            )
+
+        _plot_lowdim_traj_summary(
+            ens_traj=ens_traj,
+            ref_traj=compare_traj,
+            observations=obs_traj,
+            fig_name=fig_name,
+            save_pdf=save_pdf,
+        )
+        return
+
+    # High-dimensional fallback: keep existing plotting style.
+    time_idx_plot = -2
+    num_dims_plot = 4
+    dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
+
+    plot_particle_trajectories_with_histograms(
+        particles=ens_tensor[:, time_idx_plot, :, :],
+        true_traj=comparison_tensor[:, time_idx_plot, :],
+        observation=None,
+        dim_indices=dim_indices_plot,
+        start_time=0,
+        end_time=ens_tensor.shape[0],
+        mode='quantile',
+        save_fig=True,
+        save_pdf=save_pdf,
+        save_name=fig_name + "_hist",
+        hist_step=1,
+        fontsize=None,
+    )
+    plot_particle_trajectories(
+        particles=ens_tensor[:, time_idx_plot, :, :],
+        true_traj=comparison_tensor[:, time_idx_plot, :],
+        observation=observations[:, time_idx_plot, :],
+        cmap_name='bwr',
+        start_time=0,
+        end_time=ens_tensor.shape[0],
+        main_fig_size=(5, 2),
+        save_fig=True,
+        save_pdf=save_pdf,
+        save_name=fig_name + "_traj",
+        colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+        plot_vertical_colorbar=False,
+        plot_horizontal_colorbar=True,
+    )
+
+
+def _get_forward_fun(args):
+    """Selects the model propagator RHS/map for the current dataset."""
+    if args.dataset == "lorenz63":
+        return L63.forward
+    if args.dataset == "rossler":
+        return Rossler.forward
+    if args.dataset == "lorenz96":
+        return L96.forward
+    if args.dataset == "circle":
+        return CircleODE.forward
+    if args.dataset == "Hdoublewell":
+        return DoubleWellODE.forward
+    if args.dataset == "doubling1d":
+        return DoublingMap1D.forward
+    if args.dataset == "complex2d":
+        return ComplexSquareMap2D.forward
+    if args.dataset == "ks":
+        if args.dt_iter <= 0:
+            raise ValueError("args.dt_iter must be positive for KS.")
+        return etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
+    raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+
+
+def _forecast_ensemble(args, ens_v_a, step_idx, forward_fun):
+    """
+    Forecast one assimilation step for an ensemble tensor.
+
+    Args:
+        ens_v_a: analysis ensemble, shape [B, N, D].
+        step_idx: current time index i.
+        forward_fun: dynamics RHS/map selected by _get_forward_fun.
+    """
+    ens_size = ens_v_a.shape[1]
+    ens_v_f_in = ens_v_a.reshape(-1, args.ori_dim)
+    sigma_v = 0.0 if args.sigma_v is None else args.sigma_v
+
+    if args.dataset == "doubling1d":
+        ens_v_f_in = forward_fun(ens_v_f_in)
+        ens_v_f_in = torch.remainder(
+            ens_v_f_in + sigma_v * torch.randn_like(ens_v_f_in, device=args.device),
+            1.0,
+        )
+    elif args.dataset == "complex2d":
+        ens_v_f_in = forward_fun(ens_v_f_in)
+        ens_v_f_in = ens_v_f_in + sigma_v * torch.randn_like(ens_v_f_in, device=args.device)
+        ens_v_f_in = project_to_unit_circle(ens_v_f_in)
+    elif args.dataset == "ks":
+        for _ in range(args.dt_iter):
+            ens_v_f_in = forward_fun(ens_v_f_in, None, args.dt / args.dt_iter)
+        ens_v_f_in = ens_v_f_in + sigma_v * torch.randn_like(ens_v_f_in, device=args.device)
+    else:
+        for j_iter in range(args.dt_iter):
+            t_curr = step_idx * args.dt + j_iter * (args.dt / args.dt_iter)
+            ens_v_f_in = rk4(forward_fun, ens_v_f_in, t_curr, args.dt / args.dt_iter)
+        ens_v_f_in = ens_v_f_in + sigma_v * torch.randn_like(ens_v_f_in, device=args.device)
+
+    return ens_v_f_in.view(-1, ens_size, args.ori_dim)
+
+
+def _build_ienks_model_args(args, forward_fun):
+    """
+    Build model_args for iEnKS with dataset-specific propagator behavior.
+
+    KS is special: the propagator is ETD-RK4-based and ignores the rhs argument.
+    """
+    if args.dataset in ['doubling1d', 'complex2d']:
+        raise NotImplementedError("iEnKS is currently not supported for discrete-map datasets.")
+
+    if args.dataset == "ks":
+        propagator = lambda func, u, t, dt: etd_rk4_wrapper(device=args.device, dt=dt)(u, None, dt)
+    else:
+        propagator = rk4
+
+    return {
+        "propagator": propagator,
+        "rhs": forward_fun,
+        "dt": args.dt / args.dt_iter,
+        "steps_between_analyses": args.dt_iter,
+    }
 
 
 def set_models(args):
@@ -475,18 +921,11 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
     is_nll_mode = any('nll' in l['name'] for l in pre_losses + post_losses)
 
     # --- Forward Function Selection ---
-    if args.dataset == "lorenz63": forward_fun = L63.forward
-    elif args.dataset == 'rossler': forward_fun = Rossler.forward
-    elif args.dataset == "lorenz96": forward_fun = L96.forward
-    elif args.dataset == "circle": forward_fun = CircleODE.forward
-    elif args.dataset == "Hdoublewell": forward_fun = DoubleWellODE.forward
-    elif args.dataset == "ks":
-        if args.dt_iter <= 0: raise ValueError("args.dt_iter must be positive for KS.")
-        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
-    else: raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+    forward_fun = _get_forward_fun(args)
     
     if H_info is None: H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
     else: H_fun, H = H_info
+    _setup_mixed_precision(args)
 
     # --- Set Models to Train Mode ---
     model.train()
@@ -508,107 +947,104 @@ def train_model(epoch, loader, model_list, optimizer, scheduler, args, H_info=No
         current_actual_batch_size = batch_v_trajectory.shape[1]
         optimizer.zero_grad()
         
-        ens_v_a = batch_v_trajectory[0].unsqueeze(1).repeat(1, m, 1)
-        ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
-        
-        end_ind_t = min(epoch + 1, len(batch_v_trajectory) - 1) if args.loss_warm_up else len(batch_v_trajectory) - 1
-        if end_ind_t <= 0:
-            if (batch_ind + 1) % args.print_batch == 0:
-                print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\tSkipped batch due to end_ind_t <=0')
-            batch_time.update(time.time() - t_start)
-            continue
-        
-        accumulated_loss_for_batch_load = 0.0
-        num_valid_loss_contributions = 0
-        running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
-        
-        # Trajectory storage
-        traj_cache = { 'ens_f': [], 'ens_a': [], 'target_ens': [], 'target_weights': [], 'true_obs': [] }
-
-        for i in range(end_ind_t):
-            # --- Forecast Step ---
-            obs_y = H_fun(batch_v_trajectory[i + 1].unsqueeze(1))
-            obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
+        with _autocast_context(args):
+            ens_v_a = batch_v_trajectory[0].unsqueeze(1).repeat(1, m, 1)
+            ens_v_a = ens_v_a + torch.randn_like(ens_v_a, device=args.device) * args.sigma_ens
             
-            ens_v_f_in = ens_v_a.reshape(-1, args.ori_dim)
-            for j_iter in range(args.dt_iter):
-                if args.dataset == 'ks':
-                    ens_v_f_in = forward_fun(ens_v_f_in, None, args.dt / args.dt_iter)
+            end_ind_t = min(epoch + 1, len(batch_v_trajectory) - 1) if args.loss_warm_up else len(batch_v_trajectory) - 1
+            if end_ind_t <= 0:
+                if (batch_ind + 1) % args.print_batch == 0:
+                    print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\tSkipped batch due to end_ind_t <=0')
+                batch_time.update(time.time() - t_start)
+                continue
+            
+            accumulated_loss_for_batch_load = 0.0
+            num_valid_loss_contributions = 0
+            running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
+            
+            # Trajectory storage
+            traj_cache = { 'ens_f': [], 'ens_a': [], 'target_ens': [], 'target_weights': [], 'true_obs': [] }
+
+            for i in range(end_ind_t):
+                # --- Forecast Step ---
+                obs_y = H_fun(batch_v_trajectory[i + 1].unsqueeze(1))
+                obs_y += args.sigma_y * torch.randn_like(obs_y, device=args.device)
+                
+                ens_v_f = _forecast_ensemble(args, ens_v_a, i, forward_fun)
+                hv = H_fun(ens_v_f)
+                
+                curr_lik_w = compute_likelihood_weights(hv, obs_y, args.sigma_y) if is_wpf_mode else None
+
+                # --- Analysis Step ---
+                r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
+                curr_v_a, _ = _process_analysis_step(
+                    args, model_list, ens_v_f, hv, obs_y, 
+                    obs_y - hv - r_noise, torch.mean(ens_v_f, dim=1, keepdim=True), torch.mean(hv, dim=1, keepdim=True)
+                )
+
+                if args.running_loss:
+                    if (i + 1) > args.ignore_first:
+                        add_in = {}
+                        if is_wpf_mode: add_in.update({'target_ens': ens_v_f.unsqueeze(0), 'target_weights': curr_lik_w.unsqueeze(0), 'sigma': getattr(args, 'kes_sigma', 1.0)})
+                        if is_nll_mode: add_in.update({'obs_map': H_fun, 'sigma_y': args.sigma_y, 'true_obs': obs_y.unsqueeze(0)})
+
+                        for mode_cfg, ens_curr in [(pre_losses, ens_v_f), (post_losses, curr_v_a)]:
+                            if not mode_cfg: continue
+                            ens_ts = ens_curr.unsqueeze(0)
+                            mask = ~torch.isnan(ens_ts).any(dim=(0, 2, 3)).squeeze(0)
+                            if mask.any():
+                                step_loss_sum = sum(l['weight'] * compute_loss(
+                                    ens_tensor=ens_ts, batch_v=batch_v_trajectory[i+1].unsqueeze(0),
+                                    loss_type=l['name'], ignore_first=0, end_ind=None,
+                                    valid_B_mask=mask.unsqueeze(0), norm_p=args.es_p, 
+                                    kes_sigma=args.kes_sigma, return_sum=True, additional_inputs=add_in
+                                ) for l in mode_cfg)
+                                accumulated_loss_for_batch_load += step_loss_sum
+                                running_valid_count_t += torch.sum(mask)
                 else:
-                    ens_v_f_in = rk4(forward_fun, ens_v_f_in, i*args.dt + j_iter*(args.dt/args.dt_iter), args.dt/args.dt_iter)
-            
-            ens_v_f = ens_v_f_in.view(-1, m, args.ori_dim) + torch.randn_like(ens_v_f_in.view(-1, m, args.ori_dim), device=args.device) * args.sigma_v
-            hv = H_fun(ens_v_f)
-            
-            curr_lik_w = compute_likelihood_weights(hv, obs_y, args.sigma_y) if is_wpf_mode else None
+                    if need_pre: traj_cache['ens_f'].append(ens_v_f)
+                    if need_post: traj_cache['ens_a'].append(curr_v_a)
+                    if is_wpf_mode:
+                        traj_cache['target_ens'].append(ens_v_f)
+                        traj_cache['target_weights'].append(curr_lik_w)
+                    if is_nll_mode: traj_cache['true_obs'].append(obs_y.squeeze(1))
 
-            # --- Analysis Step ---
-            r_noise = mean0(args.sigma_y * torch.randn_like(hv, device=args.device))
-            curr_v_a, _ = _process_analysis_step(
-                args, model_list, ens_v_f, hv, obs_y, 
-                obs_y - hv - r_noise, torch.mean(ens_v_f, dim=1, keepdim=True), torch.mean(hv, dim=1, keepdim=True)
-            )
+                ens_v_a = curr_v_a
+                if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0:
+                    ens_v_a = ens_v_a.detach()
 
-            if args.running_loss:
-                if (i + 1) > args.ignore_first:
-                    add_in = {}
-                    if is_wpf_mode: add_in.update({'target_ens': ens_v_f.unsqueeze(0), 'target_weights': curr_lik_w.unsqueeze(0), 'sigma': getattr(args, 'kes_sigma', 1.0)})
-                    if is_nll_mode: add_in.update({'obs_map': H_fun, 'sigma_y': args.sigma_y, 'true_obs': obs_y.unsqueeze(0)})
+            # --- Trajectory Backprop ---
+            if not args.running_loss and len(traj_cache['ens_f'] if need_pre else traj_cache['ens_a']) > args.ignore_first:
+                batch_v = batch_v_trajectory[1:end_ind_t + 1][args.ignore_first:]
+                add_in_traj = {}
+                if is_wpf_mode: add_in_traj.update({'target_ens': torch.stack(traj_cache['target_ens'], dim=0)[args.ignore_first:], 'target_weights': torch.stack(traj_cache['target_weights'], dim=0)[args.ignore_first:], 'sigma': getattr(args, 'kes_sigma', 1.0)})
+                if is_nll_mode: add_in_traj.update({'obs_map': H_fun, 'sigma_y': args.sigma_y, 'true_obs': torch.stack(traj_cache['true_obs'], dim=0)[args.ignore_first:]})
 
-                    for mode_cfg, ens_curr in [(pre_losses, ens_v_f), (post_losses, curr_v_a)]:
-                        if not mode_cfg: continue
-                        ens_ts = ens_curr.unsqueeze(0)
-                        mask = ~torch.isnan(ens_ts).any(dim=(0, 2, 3)).squeeze(0)
-                        if mask.any():
-                            step_loss_sum = sum(l['weight'] * compute_loss(
-                                ens_tensor=ens_ts, batch_v=batch_v_trajectory[i+1].unsqueeze(0),
-                                loss_type=l['name'], ignore_first=0, end_ind=None,
-                                valid_B_mask=mask.unsqueeze(0), norm_p=args.es_p, 
-                                kes_sigma=args.kes_sigma, return_sum=True, additional_inputs=add_in
-                            ) for l in mode_cfg)
-                            accumulated_loss_for_batch_load += step_loss_sum
-                            running_valid_count_t += torch.sum(mask)
-            else:
-                if need_pre: traj_cache['ens_f'].append(ens_v_f)
-                if need_post: traj_cache['ens_a'].append(curr_v_a)
-                if is_wpf_mode:
-                    traj_cache['target_ens'].append(ens_v_f)
-                    traj_cache['target_weights'].append(curr_lik_w)
-                if is_nll_mode: traj_cache['true_obs'].append(obs_y.squeeze(1))
-
-            ens_v_a = curr_v_a
-            if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0:
-                ens_v_a = ens_v_a.detach()
-
-        # --- Trajectory Backprop ---
-        if not args.running_loss and len(traj_cache['ens_f'] if need_pre else traj_cache['ens_a']) > args.ignore_first:
-            batch_v = batch_v_trajectory[1:end_ind_t + 1][args.ignore_first:]
-            add_in_traj = {}
-            if is_wpf_mode: add_in_traj.update({'target_ens': torch.stack(traj_cache['target_ens'], dim=0)[args.ignore_first:], 'target_weights': torch.stack(traj_cache['target_weights'], dim=0)[args.ignore_first:], 'sigma': getattr(args, 'kes_sigma', 1.0)})
-            if is_nll_mode: add_in_traj.update({'obs_map': H_fun, 'sigma_y': args.sigma_y, 'true_obs': torch.stack(traj_cache['true_obs'], dim=0)[args.ignore_first:]})
-
-            for mode_cfg, key in [(pre_losses, 'ens_f'), (post_losses, 'ens_a')]:
-                if not mode_cfg: continue
-                ens_ts = torch.stack(traj_cache[key], dim=0)[args.ignore_first:]
-                mask = ~torch.isnan(ens_ts).any(dim=(2, 3))
-                if mask.any():
-                    t_loss = sum(l['weight'] * compute_loss(ens_tensor=ens_ts, batch_v=batch_v, loss_type=l['name'], ignore_first=0, end_ind=None, valid_B_mask=mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True, additional_inputs=add_in_traj) for l in mode_cfg)
-                    accumulated_loss_for_batch_load += t_loss
-                    num_v = torch.sum(mask).item()
-                    num_valid_loss_contributions += num_v
-                    losses.update(t_loss.item() / num_v, num_v)
-        elif args.running_loss:
-            num_valid_loss_contributions = int(running_valid_count_t.item())
-            if num_valid_loss_contributions > 0:
-                running_avg_loss = (
-                    accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
-                ).detach()
-                losses.update(running_avg_loss.item(), num_valid_loss_contributions)
+                for mode_cfg, key in [(pre_losses, 'ens_f'), (post_losses, 'ens_a')]:
+                    if not mode_cfg: continue
+                    ens_ts = torch.stack(traj_cache[key], dim=0)[args.ignore_first:]
+                    mask = ~torch.isnan(ens_ts).any(dim=(2, 3))
+                    if mask.any():
+                        t_loss = sum(l['weight'] * compute_loss(ens_tensor=ens_ts, batch_v=batch_v, loss_type=l['name'], ignore_first=0, end_ind=None, valid_B_mask=mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True, additional_inputs=add_in_traj) for l in mode_cfg)
+                        accumulated_loss_for_batch_load += t_loss
+                        num_v = torch.sum(mask).item()
+                        num_valid_loss_contributions += num_v
+                        losses.update(t_loss.item() / num_v, num_v)
+            elif args.running_loss:
+                num_valid_loss_contributions = int(running_valid_count_t.item())
+                if num_valid_loss_contributions > 0:
+                    running_avg_loss = (
+                        accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
+                    ).detach()
+                    losses.update(running_avg_loss.item(), num_valid_loss_contributions)
 
         if num_valid_loss_contributions > 0:
-            (accumulated_loss_for_batch_load / num_valid_loss_contributions).backward()
-            if all_trainable_params: nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-            optimizer.step()
+            _backward_and_step(
+                accumulated_loss_for_batch_load / num_valid_loss_contributions,
+                optimizer,
+                all_trainable_params,
+                args
+            )
         else: num_batches_all_nan += 1
 
         batch_time.update(time.time() - t_start)
@@ -660,22 +1096,7 @@ def generate_and_cache_pf_results(
     """
 
     # --- Model and Observation Initialization ---
-    if args.dataset == "lorenz63":
-        forward_fun = L63.forward
-    elif args.dataset == 'rossler':
-        forward_fun = Rossler.forward
-    elif args.dataset == "lorenz96":
-        forward_fun = L96.forward
-    elif args.dataset == "circle":
-        forward_fun = CircleODE.forward
-    elif args.dataset == "Hdoublewell":
-        forward_fun = DoubleWellODE.forward
-    elif args.dataset == "ks":
-        if args.dt_iter <= 0:
-            raise ValueError("args.dt_iter must be positive for KS model.")
-        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+    forward_fun = _get_forward_fun(args)
 
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
@@ -713,6 +1134,15 @@ def generate_and_cache_pf_results(
     # --- Which batch indices to visualize when saving figures ---
     # (Matches your previous behavior of plotting the first two items if available.)
     vis_indices: List[int] = [i for i in [0, 1] if i < batch_size]
+    can_plot_3d = int(getattr(args, 'ori_dim', 0)) >= 3
+    can_plot_ring = int(getattr(args, 'ori_dim', 0)) in [1, 2]
+    if save_figure and can_plot_ring:
+        print(f"[INFO] Using ring-mapped PF visualization for dataset='{args.dataset}' (ori_dim={args.ori_dim}).")
+    if save_figure and (not can_plot_3d and not can_plot_ring):
+        print(
+            f"[INFO] Skipping PF visualization for dataset='{args.dataset}' "
+            f"because ori_dim={args.ori_dim} is unsupported for current plotters."
+        )
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -721,6 +1151,8 @@ def generate_and_cache_pf_results(
             # --- Particle Filter Initialization ---
             pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)  # (B, Np, D)
             pf_ens_v_a += torch.randn_like(pf_ens_v_a, device=args.device) * args.sigma_ens
+            if args.dataset == "complex2d":
+                pf_ens_v_a = project_to_unit_circle(pf_ens_v_a)
 
             # These will be stacked and cached per-batch
             batch_prior_means_to_cache, batch_prior_covs_to_cache = [], []
@@ -747,20 +1179,7 @@ def generate_and_cache_pf_results(
             # --- Main PF Assimilation Loop ---
             for i in range(len(batch_v) - 1):
                 # -------- Forecast (PRIOR) step --------
-                pf_ens_v_a_forecast_input = pf_ens_v_a.view(-1, args.ori_dim)  # (B*Np, D)
-                for j_iter in range(args.dt_iter):
-                    if args.dataset == 'ks':
-                        pf_ens_v_a_forecast_input = forward_fun(
-                            pf_ens_v_a_forecast_input, None, args.dt / args.dt_iter
-                        )
-                    else:
-                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                        pf_ens_v_a_forecast_input = rk4(
-                            forward_fun, pf_ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter
-                        )
-
-                pf_ens_v_f = pf_ens_v_a_forecast_input.view(-1, args.pf_N, args.ori_dim)  # (B, Np, D)
-                pf_ens_v_f += torch.randn_like(pf_ens_v_f) * args.sigma_v
+                pf_ens_v_f = _forecast_ensemble(args, pf_ens_v_a, i, forward_fun)
 
                 # Cache PRIOR stats (means/covs)
                 prior_mean = torch.mean(pf_ens_v_f, dim=1)                     # (B, D)
@@ -768,11 +1187,8 @@ def generate_and_cache_pf_results(
                 batch_prior_means_to_cache.append(prior_mean)
                 batch_prior_covs_to_cache.append(prior_cov)
 
-                # Prepare state-space "observation" position for plotting (use true state at t=i+1)
-                # This gives a 3D anchor to show as an orange star.
-                # If your desired "observation" lives in obs-space, adapt this mapping accordingly.
+                # Prepare true state for metrics/visualization.
                 true_state_ti1 = batch_v[i + 1]  # (B, D)
-                obs_for_plot = true_state_ti1[:, :3].detach().cpu()  # (B, 3)
 
                 # -------- Analysis (POSTERIOR) step --------
                 pf_ens_v_a = bootstrap_particle_filter_analysis(
@@ -801,7 +1217,7 @@ def generate_and_cache_pf_results(
                     batch_crps_steps.append(crps_ti)
 
                 # -------- Visualization (PRIOR + POSTERIOR), both include observation --------
-                if i < 600 and save_figure:
+                if i < 600 and save_figure and (can_plot_3d or can_plot_ring):
                     save_folder = f'save/{args.dataset}_pf_vis'
                     os.makedirs(save_folder, exist_ok=True)
 
@@ -813,47 +1229,73 @@ def generate_and_cache_pf_results(
 
                     # We plot per selected batch index so each figure gets the correct observation vector
                     for bidx in vis_indices:
-                        # Prepare per-item tensors for the plotting helper (shape: (1, Np, 3))
-                        prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :3].detach().cpu()
-                        posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :3].detach().cpu()
+                        if can_plot_3d:
+                            # Prepare per-item tensors for the plotting helper (shape: (1, Np, 3))
+                            prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :3].detach().cpu()
+                            posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :3].detach().cpu()
 
-                        # History trajectory for this item up to current step (shape: steps x 1 x 3)
-                        hist_traj = batch_v[1:i+2, bidx:bidx+1, :3].detach().cpu()
+                            # History trajectory for this item up to current step (shape: steps x 1 x 3)
+                            hist_traj = batch_v[1:i+2, bidx:bidx+1, :3].detach().cpu()
 
-                        # Per-item observation vector (3,)
-                        obs_vec = obs_for_plot[bidx]  # (3,)
+                            # PRIOR (blue)
+                            prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
+                            plot_and_test_point_clouds(
+                                args,
+                                prior_cloud_for_plot,             # (1, Np, 3)
+                                num_samples_plot=100000,
+                                num_samples_test=1000,
+                                prefix=prefix_prior,
+                                point_color="blue",
+                                observation=None,
+                                num_repeats=1,
+                                plot_indices=[0],
+                                history_traj=hist_traj,
+                            )
 
-                        # PRIOR (blue)
-                        prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
-                        plot_and_test_point_clouds(
-                            args,
-                            prior_cloud_for_plot,             # (1, Np, 3)
-                            num_samples_plot=100000,
-                            num_samples_test=1000,
-                            prefix=prefix_prior,
-                            point_color="blue",
-                            # observation=obs_vec,
-                            observation=None,
-                            num_repeats=1,
-                            plot_indices=[0],
-                            history_traj=hist_traj,
-                        )
+                            # POSTERIOR (red)
+                            prefix_post = f"{base_prefix}_b{bidx}_POST"
+                            plot_and_test_point_clouds(
+                                args,
+                                posterior_cloud_for_plot,         # (1, Np, 3)
+                                num_samples_plot=100000,
+                                num_samples_test=1000,
+                                prefix=prefix_post,
+                                point_color="red",
+                                observation=None,
+                                num_repeats=1,
+                                plot_indices=[0],
+                                history_traj=hist_traj,
+                            )
+                        elif can_plot_ring:
+                            # Use full state for ring mapping (1D/2D).
+                            prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :].detach().cpu()
+                            posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :].detach().cpu()
+                            hist_traj = batch_v[1:i+2, bidx:bidx+1, :].detach().cpu()
+                            obs_x = obs_y_list[i + 1][bidx, 0].detach().cpu()
 
-                        # POSTERIOR (red)
-                        prefix_post = f"{base_prefix}_b{bidx}_POST"
-                        plot_and_test_point_clouds(
-                            args,
-                            posterior_cloud_for_plot,         # (1, Np, 3)
-                            num_samples_plot=100000,
-                            num_samples_test=1000,
-                            prefix=prefix_post,
-                            point_color="red",
-                            # observation=obs_vec,
-                            observation=None,
-                            num_repeats=1,
-                            plot_indices=[0],
-                            history_traj=hist_traj,
-                        )
+                            prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
+                            plot_and_test_point_clouds_ring(
+                                args,
+                                prior_cloud_for_plot,
+                                num_samples_plot=100000,
+                                prefix=prefix_prior,
+                                point_color="blue",
+                                observation=obs_x,
+                                plot_indices=[0],
+                                history_traj=hist_traj,
+                            )
+
+                            prefix_post = f"{base_prefix}_b{bidx}_POST"
+                            plot_and_test_point_clouds_ring(
+                                args,
+                                posterior_cloud_for_plot,
+                                num_samples_plot=100000,
+                                prefix=prefix_post,
+                                point_color="red",
+                                observation=obs_x,
+                                plot_indices=[0],
+                                history_traj=hist_traj,
+                            )
 
             # --- Aggregate and Cache Batch Results ---
             all_pf_results_to_cache.append({
@@ -934,22 +1376,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     m = args.N
     
     # Select forward function
-    if args.dataset == "lorenz63":
-        forward_fun = L63.forward
-    elif args.dataset == 'rossler':
-        forward_fun = Rossler.forward
-    elif args.dataset == "lorenz96":
-        forward_fun = L96.forward
-    elif args.dataset == "circle":
-        forward_fun = CircleODE.forward
-    elif args.dataset == "Hdoublewell":
-        forward_fun = DoubleWellODE.forward
-    elif args.dataset == "ks":
-        if args.dt_iter <= 0:
-            raise ValueError("args.dt_iter must be positive for KS model.")
-        forward_fun = etd_rk4_wrapper(device=args.device, dt=args.dt / args.dt_iter)
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+    forward_fun = _get_forward_fun(args)
 
     # Observation operator
     if H_info is None:
@@ -1037,15 +1464,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     continue  # keep T length for plotting/metrics
 
                 # -------- Forecast step (not timed here) --------
-                ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)  # [B*N, d]
-                for j_iter in range(args.dt_iter):
-                    if args.dataset == 'ks':
-                        ens_v_a_forecast_input = forward_fun(ens_v_a_forecast_input, None, args.dt / args.dt_iter)
-                    else:
-                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                        ens_v_a_forecast_input = rk4(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+                ens_v_f = _forecast_ensemble(args, ens_v_a, i, forward_fun)
 
                 # Deactivate offending trajectories that became NaN after forecast
                 nan_now = torch.isnan(ens_v_f).any(dim=(1, 2))
@@ -1180,44 +1599,32 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             # Build observation tensor for plotting (unchanged)
             observations = _build_observation_plot_tensor(args, batch_v, obs_y_list)
     
-    # Plotting (unchanged)
-    if plot_figures: 
-        time_idx_plot = -2
-        num_dims_plot = 4
-        dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
+    if plot_figures:
+        ens_plot = ens_tensor
+        true_plot = batch_v
+        compare_plot = batch_v
+        obs_plot = observations
 
+        # With PF verification, compare ensemble means against PF posterior means,
+        # while keeping per-step snapshot markers on true states.
         if args.pf_verification:
-            batch_v = cached_pf_data[-1]['means']
-            ens_tensor = ens_tensor[1:]
-            observations = observations[1:]
-        plot_particle_trajectories_with_histograms(
-            particles=ens_tensor[:, time_idx_plot, :, :], 
-            true_traj=batch_v[:, time_idx_plot, :], 
-            observation=None, 
-            dim_indices=dim_indices_plot,
-            start_time=0,
-            end_time=ens_tensor.shape[0],
-            mode='quantile',
-            save_fig=True,
+            true_plot = true_plot[1:]
+            compare_plot = cached_pf_data[-1]['means']
+            ens_plot = ens_plot[1:]
+            obs_plot = obs_plot[1:]
+            step_offset = 1
+        else:
+            step_offset = 0
+
+        _plot_test_visualizations(
+            args=args,
+            ens_tensor=ens_plot,
+            true_tensor=true_plot,
+            comparison_tensor=compare_plot,
+            observations=obs_plot,
+            fig_name=fig_name,
             save_pdf=save_pdf,
-            save_name=fig_name + "_hist",
-            hist_step=1,
-            fontsize=None
-        )
-        plot_particle_trajectories(
-            particles=ens_tensor[:, time_idx_plot, :, :], 
-            true_traj=batch_v[:, time_idx_plot, :], 
-            observation=observations[:, time_idx_plot, :],
-            cmap_name='bwr',
-            start_time=0,
-            end_time=ens_tensor.shape[0], 
-            main_fig_size=(5, 2), 
-            save_fig=True,
-            save_pdf=save_pdf,
-            save_name=fig_name + "_traj",
-            colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-            plot_vertical_colorbar=False,
-            plot_horizontal_colorbar=True
+            step_offset=step_offset,
         )
 
     # Final metrics (RMV removed)
@@ -1350,28 +1757,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     m = args.N
 
     # Select forward function
-    if args.dataset == "lorenz63":
-        forward_fun = L63.forward
-        model_propagator = rk4
-    elif args.dataset == "lorenz96":
-        forward_fun = L96.forward
-        model_propagator = rk4
-    elif args.dataset == 'rossler':
-        forward_fun = Rossler.forward
-        model_propagator = rk4
-    elif args.dataset == "circle":
-        forward_fun = CircleODE.forward
-        model_propagator = rk4
-    elif args.dataset == "Hdoublewell":
-        forward_fun = DoubleWellODE.forward
-        model_propagator = rk4
-    elif args.dataset == "ks":
-        if args.dt_iter <= 0:
-            raise ValueError("args.dt_iter must be positive for KS model.")
-        forward_fun = None
-        model_propagator = lambda func, u, t, dt: etd_rk4_wrapper(device=args.device, dt=dt)(u, None, dt)
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+    forward_fun = _get_forward_fun(args)
+    ienks_model_args = _build_ienks_model_args(args, forward_fun) if args.v.startswith('iEnKS') else None
 
     # Observation operator
     if H_info is None:
@@ -1465,12 +1852,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 if args.v.startswith('iEnKS'):
                     ens_v_f = ens_v_a  # smoothing will handle propagation
                 else:
-                    ens_v_a_forecast_input = ens_v_a.view(-1, args.ori_dim)  # [B*N, d]
-                    for j_iter in range(args.dt_iter):
-                        current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                        ens_v_a_forecast_input = model_propagator(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                    ens_v_f = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                    ens_v_f += torch.randn_like(ens_v_f, device=args.device) * args.sigma_v
+                    ens_v_f = _forecast_ensemble(args, ens_v_a, i, forward_fun)
 
                 # ---- NEW: detect NaNs in forecast and deactivate offending trajectories ----
                 nan_now = torch.isnan(ens_v_f).any(dim=(1, 2))
@@ -1540,12 +1922,6 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                             coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
                         domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
 
-                        model_args_ienks = {
-                            "propagator": model_propagator,
-                            "rhs": forward_fun,
-                            "dt": args.dt / args.dt_iter,
-                            "steps_between_analyses": args.dt_iter,
-                        }
                         E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active,
                             **common_enkf_args,
@@ -1557,16 +1933,11 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                             ienks_lag=1,
                             ienks_niter=10,
                             ienks_wtol=1e-5,
-                            model_args=model_args_ienks
+                            model_args=ienks_model_args
                         )
 
                         # Forecast from smoothed start to analysis time
-                        ens_v_a_forecast_input = E_smoothed_at_start.clone().view(-1, args.ori_dim)
-                        for j_iter in range(args.dt_iter):
-                            current_time_for_rk4 = i * args.dt + j_iter * (args.dt / args.dt_iter)
-                            ens_v_a_forecast_input = model_propagator(forward_fun, ens_v_a_forecast_input, current_time_for_rk4, args.dt / args.dt_iter)
-                        ens_v_a_active = ens_v_a_forecast_input.view(-1, m, args.ori_dim)
-                        ens_v_a_active += torch.randn_like(ens_v_a_active, device=args.device) * args.sigma_v
+                        ens_v_a_active = _forecast_ensemble(args, E_smoothed_at_start, i, forward_fun)
 
                     else:
                         raise NotImplementedError(f"The filter {args.v} is not implemented")
@@ -1751,6 +2122,7 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1,-2))
+    _setup_mixed_precision(args)
     
     # --- Set Models to Train Mode ---
     model.train()
@@ -1779,112 +2151,109 @@ def train_model_v2(epoch, loader, model_list, optimizer, scheduler, args):
         current_actual_batch_size = m.shape[0]
         D, D_obs = args.ori_dim, args.obs_dim
         optimizer.zero_grad()
-
-        # --- Initialize States and Noise Covariances ---
-        ens_v_a = m.unsqueeze(1).repeat(1, N, 1) + torch.bmm(torch.randn_like(m.unsqueeze(1).repeat(1, N, 1)), C.transpose(-1,-2))
-        gt_v_a = m.unsqueeze(1)
-        Q = (sigma_v.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D, device=args.device).unsqueeze(0)
-        R = (sigma_y.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D_obs, device=args.device).unsqueeze(0)
-
-        # --- Initialize variables for loss calculation ---
-        accumulated_loss_for_batch_load = 0.0
-        num_valid_loss_contributions = 0
-        running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
-        collected_ens_v_a = [] if not args.running_loss else None
-        collected_gt_v_a = [] if not args.running_loss else None
-
-        end_ind_t = min(epoch + 1, args.train_steps - 1) if args.loss_warm_up else args.train_steps - 1
+        loss_for_backward = None
         
-        if end_ind_t <= 0:
-            if (batch_ind + 1) % args.print_batch == 0:
-                print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
-                      f'Skipped batch due to end_ind_t <=0 (Warm-up)')
-            batch_time.update(time.time() - t_start)
-            continue
+        with _autocast_context(args):
+            # --- Initialize States and Noise Covariances ---
+            ens_v_a = m.unsqueeze(1).repeat(1, N, 1) + torch.bmm(torch.randn_like(m.unsqueeze(1).repeat(1, N, 1)), C.transpose(-1,-2))
+            gt_v_a = m.unsqueeze(1)
+            Q = (sigma_v.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D, device=args.device).unsqueeze(0)
+            R = (sigma_y.view(current_actual_batch_size, 1, 1) ** 2) * torch.eye(D_obs, device=args.device).unsqueeze(0)
 
-        # ======================= [REFACTORED UNIFIED TIME-STEP LOOP] =======================
-        for i in range(end_ind_t):
-            # --- Common Forecast and Analysis Step ---
-            gt_v_a = forward_fun(gt_v_a, A) + torch.bmm(torch.randn_like(gt_v_a), Q.sqrt())
-            obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a, H)), R.sqrt())
-            ens_v_f = forward_fun(ens_v_a, A) + torch.bmm(torch.randn_like(ens_v_a), Q.sqrt())
-            hv = H_fun(ens_v_f, H)
-            r_noise = mean0(torch.bmm(torch.randn_like(hv), R.sqrt()))
-            ens_i_innov = obs_y - hv - r_noise
-            mean_hv = torch.mean(hv, dim=1, keepdim=True)
-            mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
+            # --- Initialize variables for loss calculation ---
+            accumulated_loss_for_batch_load = 0.0
+            num_valid_loss_contributions = 0
+            running_valid_count_t = torch.zeros((), device=args.device, dtype=torch.long) if args.running_loss else None
+            collected_ens_v_a = [] if not args.running_loss else None
+            collected_gt_v_a = [] if not args.running_loss else None
 
-            current_analyzed_ens_v_a, _ = _process_analysis_step(
-                args, model_list, ens_v_f, hv, obs_y,
-                ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=sigma_y,
-            )
+            end_ind_t = min(epoch + 1, args.train_steps - 1) if args.loss_warm_up else args.train_steps - 1
             
-            # --- Strategy-Dependent Action inside the loop ---
-            if args.running_loss:
-                if (i + 1) > args.ignore_first:
-                    ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
-                    batch_v_step = gt_v_a.squeeze(1).unsqueeze(0)
-                    valid_B_mask_this_step = ~torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0)
+            if end_ind_t <= 0:
+                if (batch_ind + 1) % args.print_batch == 0:
+                    print(f'Training epoch : [{epoch}][{batch_ind + 1}/{len(loader)}]\t'
+                          f'Skipped batch due to end_ind_t <=0 (Warm-up)')
+                batch_time.update(time.time() - t_start)
+                continue
 
-                    if valid_B_mask_this_step.any():
-                        step_loss = sum(compute_loss(
-                            ens_tensor=ens_tensor_step, batch_v=batch_v_step, loss_type=lt, ignore_first=0, end_ind=None,
-                            valid_B_mask=valid_B_mask_this_step.unsqueeze(0), norm_p=args.es_p,
-                            kes_sigma=args.kes_sigma, return_sum=True) for lt in args.loss_type)
-                        
-                        accumulated_loss_for_batch_load += step_loss
-                        running_valid_count_t += torch.sum(valid_B_mask_this_step)
-            else: # Trajectory loss: collect tensors
-                collected_ens_v_a.append(current_analyzed_ens_v_a)
-                collected_gt_v_a.append(gt_v_a)
-            
-            # --- Common State Update and Detach Logic ---
-            ens_v_a = current_analyzed_ens_v_a
-            if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
-                ens_v_a = ens_v_a.detach()
-        
-        # ======================= [POST-LOOP BACKPROPAGATION] =======================
-        if args.running_loss:
-            num_valid_loss_contributions = int(running_valid_count_t.item())
-            if num_valid_loss_contributions > 0:
-                average_loss = accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
-                average_loss.backward()
-                if all_trainable_params:
-                    nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-                optimizer.step()
-                losses.update(average_loss.detach().item(), num_valid_loss_contributions)
-            else:
-                num_batches_all_nan += 1
-        else: # Trajectory loss
-            if len(collected_ens_v_a) > args.ignore_first:
-                ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:]
-                batch_v = torch.stack(collected_gt_v_a, dim=0).squeeze(2)[args.ignore_first:]
+            # ======================= [REFACTORED UNIFIED TIME-STEP LOOP] =======================
+            for i in range(end_ind_t):
+                # --- Common Forecast and Analysis Step ---
+                gt_v_a = forward_fun(gt_v_a, A) + torch.bmm(torch.randn_like(gt_v_a), Q.sqrt())
+                obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a, H)), R.sqrt())
+                ens_v_f = forward_fun(ens_v_a, A) + torch.bmm(torch.randn_like(ens_v_a), Q.sqrt())
+                hv = H_fun(ens_v_f, H)
+                r_noise = mean0(torch.bmm(torch.randn_like(hv), R.sqrt()))
+                ens_i_innov = obs_y - hv - r_noise
+                mean_hv = torch.mean(hv, dim=1, keepdim=True)
+                mean_ens_v_f = torch.mean(ens_v_f, dim=1, keepdim=True)
+
+                current_analyzed_ens_v_a, _ = _process_analysis_step(
+                    args, model_list, ens_v_f, hv, obs_y,
+                    ens_i_innov, mean_ens_v_f, mean_hv, sigma_y=sigma_y,
+                )
                 
-                if ens_tensor.shape[0] > 0:
-                    valid_B_mask = ~torch.isnan(ens_tensor).any(dim=(2, 3))
-                    num_valid_loss_contributions = torch.sum(valid_B_mask).item()
+                # --- Strategy-Dependent Action inside the loop ---
+                if args.running_loss:
+                    if (i + 1) > args.ignore_first:
+                        ens_tensor_step = current_analyzed_ens_v_a.unsqueeze(0)
+                        batch_v_step = gt_v_a.squeeze(1).unsqueeze(0)
+                        valid_B_mask_this_step = ~torch.isnan(ens_tensor_step).any(dim=(0, 2, 3)).squeeze(0)
 
-                    if num_valid_loss_contributions > 0:
-                        # normalize_val = torch.std(batch_v, dim=0)
-                        normalize_val = None
-                        total_loss = sum(compute_loss(
-                            ens_tensor=ens_tensor, batch_v=batch_v, loss_type=lt, ignore_first=0, end_ind=None,
-                            valid_B_mask=valid_B_mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,
-                            normalize_val=normalize_val,
-                        ) for lt in args.loss_type)
-                        
-                        average_loss = total_loss / num_valid_loss_contributions
-                        average_loss.backward()
-                        if all_trainable_params:
-                            nn.utils.clip_grad_norm_(all_trainable_params, max_norm=getattr(args, 'grad_clip_norm', 1.0))
-                        optimizer.step()
-                        losses.update(average_loss.item(), num_valid_loss_contributions)
+                        if valid_B_mask_this_step.any():
+                            step_loss = sum(compute_loss(
+                                ens_tensor=ens_tensor_step, batch_v=batch_v_step, loss_type=lt, ignore_first=0, end_ind=None,
+                                valid_B_mask=valid_B_mask_this_step.unsqueeze(0), norm_p=args.es_p,
+                                kes_sigma=args.kes_sigma, return_sum=True) for lt in args.loss_type)
+                            
+                            accumulated_loss_for_batch_load += step_loss
+                            running_valid_count_t += torch.sum(valid_B_mask_this_step)
+                else: # Trajectory loss: collect tensors
+                    collected_ens_v_a.append(current_analyzed_ens_v_a)
+                    collected_gt_v_a.append(gt_v_a)
+                
+                # --- Common State Update and Detach Logic ---
+                ens_v_a = current_analyzed_ens_v_a
+                if epoch <= args.detach_training_epoch and args.detach_steps > 0 and (i + 1) % args.detach_steps == 0 and (i + 1) < end_ind_t:
+                    ens_v_a = ens_v_a.detach()
+            
+            # ======================= [POST-LOOP BACKPROPAGATION] =======================
+            if args.running_loss:
+                num_valid_loss_contributions = int(running_valid_count_t.item())
+                if num_valid_loss_contributions > 0:
+                    average_loss = accumulated_loss_for_batch_load / running_valid_count_t.to(accumulated_loss_for_batch_load.dtype)
+                    loss_for_backward = average_loss
+                    losses.update(average_loss.detach().item(), num_valid_loss_contributions)
+                else:
+                    num_batches_all_nan += 1
+            else: # Trajectory loss
+                if len(collected_ens_v_a) > args.ignore_first:
+                    ens_tensor = torch.stack(collected_ens_v_a, dim=0)[args.ignore_first:]
+                    batch_v = torch.stack(collected_gt_v_a, dim=0).squeeze(2)[args.ignore_first:]
+                    
+                    if ens_tensor.shape[0] > 0:
+                        valid_B_mask = ~torch.isnan(ens_tensor).any(dim=(2, 3))
+                        num_valid_loss_contributions = torch.sum(valid_B_mask).item()
+
+                        if num_valid_loss_contributions > 0:
+                            normalize_val = None
+                            total_loss = sum(compute_loss(
+                                ens_tensor=ens_tensor, batch_v=batch_v, loss_type=lt, ignore_first=0, end_ind=None,
+                                valid_B_mask=valid_B_mask, norm_p=args.es_p, kes_sigma=args.kes_sigma, return_sum=True,
+                                normalize_val=normalize_val,
+                            ) for lt in args.loss_type)
+                            
+                            average_loss = total_loss / num_valid_loss_contributions
+                            loss_for_backward = average_loss
+                            losses.update(average_loss.item(), num_valid_loss_contributions)
+                        else:
+                            num_batches_all_nan += 1
                     else:
                         num_batches_all_nan += 1
                 else:
                     num_batches_all_nan += 1
-            else:
-                num_batches_all_nan += 1
+        if loss_for_backward is not None:
+            _backward_and_step(loss_for_backward, optimizer, all_trainable_params, args)
 
         # --- Common Logging and Timing ---
         batch_time.update(time.time() - t_start)

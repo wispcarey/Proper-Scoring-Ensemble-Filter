@@ -7,7 +7,7 @@ import time
 
 from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output
+from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 from train_test_utils import test_ClassicFilter, print_test_results
 
 def get_benchmarks(args, source='dapper'):
@@ -145,7 +145,7 @@ if __name__ == "__main__":
         os.makedirs(folder_name)
     
     # redirect output
-    with redirect_output(save_output=not args.normal_output, save_folder=folder_name, filename="test_output.txt"):
+    with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
         if args.seed is not None and args.seed != "None":
             torch.manual_seed(int(args.seed))
 
