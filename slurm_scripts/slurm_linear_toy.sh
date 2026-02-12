@@ -14,7 +14,7 @@
 #SBATCH -e output_record/slurm.%N.%j.err      # STDERR
 
 # Description: Slurm script for train_v2.py with auto-calculated obs_dim.
-# Input: Env vars LOSS_TYPE, EPOCHS, LR, DIM, HIDDEN_DIM, SUFFIX.
+# Input: Env vars LOSS_TYPE, EPOCHS, LR, DIM, HIDDEN_DIM, ADAPTIVE_SIGMA_Y, SUFFIX.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -24,6 +24,14 @@ LR=${LR:-1e-2}                  # Default learning rate
 DIM=${DIM:-10}                  # Default dimension
 HIDDEN_DIM=${HIDDEN_DIM:-128}   # Default hidden dimension
 SUFFIX=${SUFFIX:-$DIM}          # Default suffix (uses DIM if not set)
+ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"} # Set to "true" to enable --adaptive_sigma_y
+
+ADAPTIVE_SIGMA_Y_FLAG=""
+case "${ADAPTIVE_SIGMA_Y,,}" in
+    true|1|yes|y)
+        ADAPTIVE_SIGMA_Y_FLAG="--adaptive_sigma_y"
+        ;;
+esac
 
 # 2. Validation & Calculation
 # Check if DIM is even
@@ -33,7 +41,7 @@ if (( DIM % 2 != 0 )); then
 fi
 
 OBS_DIM=$((DIM / 2))
-echo "Configuration: DIM=$DIM, OBS_DIM=$OBS_DIM, HIDDEN_DIM=$HIDDEN_DIM, SUFFIX=$SUFFIX"
+echo "Configuration: DIM=$DIM, OBS_DIM=$OBS_DIM, HIDDEN_DIM=$HIDDEN_DIM, SUFFIX=$SUFFIX, ADAPTIVE_SIGMA_Y=$ADAPTIVE_SIGMA_Y"
 
 # Load modules
 module load cuda/12.2
@@ -57,4 +65,5 @@ python train_v2.py \
     --obs_dim $OBS_DIM \
     --hidden_dim $HIDDEN_DIM \
     --learning_rate $LR \
+    $ADAPTIVE_SIGMA_Y_FLAG \
     --suffix $SUFFIX

@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import torch
 import sys
@@ -80,6 +81,136 @@ def int_or_none_or_default(value):
 def parse_list_type(s):
     return s.split(',')
 
+
+def parse_test_plot_index(value):
+    """
+    Parse test plot trajectory selection:
+    - "adaptive" -> "adaptive" (adaptive selection)
+    - "0"        -> [0]
+    - "0,1"      -> [0, 1]
+    """
+    sval = str(value).strip().lower()
+    if sval == "adaptive":
+        return "adaptive"
+
+    raw_items = [item.strip() for item in str(value).split(",") if item.strip() != ""]
+    if len(raw_items) == 0:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --test_plot_index value: '{value}'. Use 'adaptive' or comma-separated non-negative integers."
+        )
+
+    indices = []
+    for item in raw_items:
+        try:
+            idx = int(item)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --test_plot_index item '{item}'. Use 'adaptive' or comma-separated non-negative integers."
+            )
+        if idx < 0:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --test_plot_index item '{item}'. Indices must be non-negative."
+            )
+        indices.append(idx)
+
+    return indices
+
+
+def _parse_csv_float(value):
+    if value is None:
+        return None
+    sval = str(value).strip()
+    if sval == "" or sval.lower() in {"nan", "none", "-"}:
+        return None
+    try:
+        return float(sval)
+    except ValueError:
+        return None
+
+
+def _load_default_snr_row(dataset, csv_path):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"--adaptive_sigma_y is enabled but CSV file was not found: {csv_path}. "
+            "Please generate it first with test_notebooks/print_default_snr_table.py."
+        )
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("dataset", "")).strip() == dataset:
+                return row
+
+    raise ValueError(
+        f"--adaptive_sigma_y is enabled but dataset '{dataset}' was not found in {csv_path}."
+    )
+
+
+def _apply_adaptive_sigma_y_if_needed(args, dataset_config):
+    if not getattr(args, "adaptive_sigma_y", False):
+        return
+
+    if args.sigma_y is None:
+        raise ValueError("--adaptive_sigma_y requires a finite sigma_y value (not None).")
+
+    sigma_y_input = float(args.sigma_y)
+    if sigma_y_input <= 0:
+        raise ValueError("--adaptive_sigma_y requires sigma_y > 0.")
+
+    csv_path = os.path.join("save", "default_snr", "default_snr.csv")
+    row = _load_default_snr_row(dataset=args.dataset, csv_path=csv_path)
+
+    sigma_y_default = _parse_csv_float(row.get("sigma_y_default"))
+    snr_default_ref = _parse_csv_float(row.get("default"))
+    if sigma_y_default is None or snr_default_ref is None:
+        raise ValueError(
+            f"Dataset '{args.dataset}' in {csv_path} must contain numeric values for "
+            "'sigma_y_default' and 'default'."
+        )
+
+    if sigma_y_default <= 0 or snr_default_ref <= 0:
+        raise ValueError(
+            f"Dataset '{args.dataset}' in {csv_path} must have positive 'sigma_y_default' and 'default'."
+        )
+
+    snr_default_at_input_sigma = snr_default_ref * (sigma_y_default ** 2) / (sigma_y_input ** 2)
+    if snr_default_at_input_sigma <= 0:
+        raise ValueError("Computed target default SNR is non-positive; cannot adapt sigma_y.")
+
+    dataset_default_obs_fn = (dataset_config.get("obs_fn", "identity") or "identity").lower()
+    if args.obs_fn == dataset_default_obs_fn:
+        obs_key = "default"
+    else:
+        obs_key = args.obs_fn
+
+    snr_obs_ref = _parse_csv_float(row.get(obs_key))
+    if snr_obs_ref is None:
+        raise ValueError(
+            f"--adaptive_sigma_y cannot be used: obs_fn='{args.obs_fn}' is not available for dataset "
+            f"'{args.dataset}' in {csv_path} (missing column/value '{obs_key}')."
+        )
+    if snr_obs_ref <= 0:
+        raise ValueError(
+            f"--adaptive_sigma_y cannot be used: reference SNR for obs_fn='{args.obs_fn}' is non-positive."
+        )
+
+    adapted_sigma_y = sigma_y_default * math.sqrt(snr_obs_ref / snr_default_at_input_sigma)
+    if not math.isfinite(adapted_sigma_y) or adapted_sigma_y <= 0:
+        raise ValueError("Failed to compute a valid adapted sigma_y.")
+
+    # Truncate (not round) to 2 decimal places.
+    adapted_sigma_y = math.trunc(adapted_sigma_y * 100.0) / 100.0
+    if adapted_sigma_y <= 0:
+        raise ValueError("Adapted sigma_y becomes non-positive after truncation to 2 decimals.")
+
+    args.sigma_y = float(adapted_sigma_y)
+    if not math.isclose(args.sigma_y, sigma_y_input, rel_tol=0.0, abs_tol=1e-12):
+        print(
+            f"[INFO] adaptive_sigma_y updated sigma_y: dataset={args.dataset}, obs_fn={args.obs_fn}, "
+            f"input_sigma_y={sigma_y_input:.6f}, adapted_sigma_y={args.sigma_y:.6f}"
+        )
+
+
 def get_parameters():
     parser = argparse.ArgumentParser()
     # dataset setting
@@ -129,6 +260,8 @@ def get_parameters():
                         help='Random seed for observation post-function parameters (e.g., random linear projection).')
     parser.add_argument('--obs_custom_fn_path', type=str, default=None,
                         help='Custom function path "module.submodule:function" when obs_fn=custom.')
+    parser.add_argument('--adaptive_sigma_y', action='store_true',
+                        help='Adapt sigma_y using save/default_snr/default_snr.csv to match default-SNR across obs_fn.')
 
     # loss function
     parser.add_argument('--ignore_first', type=int, default=0,
@@ -233,6 +366,8 @@ def get_parameters():
     parser.add_argument('--pf_save_figure', action='store_true', help='save_pf_visualization')
     parser.add_argument('--save_test_figures', action='store_true',
                         help='save visualization figures during test/evaluation')
+    parser.add_argument('--test_plot_index', type=parse_test_plot_index, default='0',
+                        help="Global trajectory index selection for test/PF plotting: e.g. '0', '0,1', or 'adaptive'.")
     parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
                         help='the std of noise added to resampling in BPF')
 
@@ -251,6 +386,9 @@ def get_parameters():
                         default='EtE-LRes', help='versions')
 
     args = parser.parse_args()
+
+    if not isinstance(args.test_plot_index, (list, tuple)):
+        args.test_plot_index = parse_test_plot_index(args.test_plot_index)
 
     # iterations = args.lr_decay_epochs.split(',')
     # args.lr_decay_epochs = list([])
@@ -354,6 +492,8 @@ def get_parameters():
 
     if args.obs_fn == 'custom' and (args.obs_custom_fn_path is None or ':' not in args.obs_custom_fn_path):
         raise ValueError("obs_fn=custom requires --obs_custom_fn_path in the form module.submodule:function.")
+
+    _apply_adaptive_sigma_y_if_needed(args, dataset_config)
 
     args.obs_has_direct_locs = (
         args.obs_fn in ['identity', 'cos2pi', 'square', 'square_root', 'cube', 'sin', 'tanh', 'arctan']

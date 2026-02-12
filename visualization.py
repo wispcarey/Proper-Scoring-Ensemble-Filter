@@ -934,6 +934,87 @@ def _map_state_to_ring_xy(points: torch.Tensor) -> torch.Tensor:
     return torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
 
 
+def _map_state_to_ring_phase01(points: torch.Tensor) -> torch.Tensor:
+    """
+    Map state points (N, D) to normalized ring phase in [0, 1).
+
+    - D == 1: theta = 2*pi*x, phase = mod(theta / 2*pi, 1) = mod(x, 1)
+    - D >= 2: theta = atan2(y, x), phase = mod(theta / 2*pi, 1)
+    """
+    if points.ndim != 2:
+        raise ValueError(f"Expected points shape (N, D), got {tuple(points.shape)}")
+    d = points.shape[1]
+    if d < 1:
+        raise ValueError("State dimension must be >= 1 for ring mapping.")
+
+    if d == 1:
+        theta = 2.0 * np.pi * points[:, 0]
+    else:
+        theta = torch.atan2(points[:, 1], points[:, 0])
+
+    phase01 = torch.remainder(theta / (2.0 * np.pi), 1.0)
+    return phase01
+
+
+def _adaptive_kde_std(n_samples: int, base_std: float = 0.01) -> float:
+    """
+    Adaptive KDE std on [0,1):
+    - Keep 0.01 as the reference at n=500.
+    - Use larger smoothing for smaller n.
+    """
+    n = max(int(n_samples), 1)
+    scaled = base_std * np.sqrt(500.0 / float(n))
+    return float(np.clip(scaled, 0.005, 0.08))
+
+
+def _wrapped_kde_pdf_01(samples: np.ndarray, grid: np.ndarray, std: float) -> np.ndarray:
+    """
+    Wrapped Gaussian KDE on circular support [0,1).
+    """
+    if samples.size == 0:
+        return np.zeros_like(grid)
+
+    std = float(max(std, 1e-6))
+    diff0 = (grid[:, None] - samples[None, :]) / std
+    diffm = (grid[:, None] - (samples[None, :] - 1.0)) / std
+    diffp = (grid[:, None] - (samples[None, :] + 1.0)) / std
+
+    kernel = np.exp(-0.5 * diff0 * diff0) + np.exp(-0.5 * diffm * diffm) + np.exp(-0.5 * diffp * diffp)
+    norm = 1.0 / (np.sqrt(2.0 * np.pi) * std)
+    density = norm * np.mean(kernel, axis=1)
+
+    area = np.trapz(density, grid)
+    if area > 0:
+        density = density / area
+    return density
+
+
+def _smooth_histogram_pdf(pdf_vals: np.ndarray, bin_width: float, window_size: int = 9) -> np.ndarray:
+    """
+    Smooth histogram-based PDF on circular support [0,1) with wrapped moving average,
+    then re-normalize area to 1.
+    """
+    if pdf_vals.size == 0:
+        return pdf_vals
+
+    win = int(max(1, window_size))
+    if win % 2 == 0:
+        win += 1
+    if win == 1:
+        return pdf_vals
+
+    kernel = np.ones(win, dtype=np.float64) / float(win)
+    half = win // 2
+    padded = np.concatenate([pdf_vals[-half:], pdf_vals, pdf_vals[:half]])
+    smoothed = np.convolve(padded, kernel, mode='valid')
+    smoothed = smoothed[:pdf_vals.size]
+
+    area = float(np.sum(smoothed) * max(float(bin_width), 1e-12))
+    if area > 0:
+        smoothed = smoothed / area
+    return smoothed
+
+
 def plot_and_test_point_clouds_ring(
     args: Namespace,
     tensor: torch.Tensor,
@@ -945,6 +1026,7 @@ def plot_and_test_point_clouds_ring(
     plot_history: bool = True,
     plot_indices: Optional[List[int]] = None,
     history_traj: Optional[torch.Tensor] = None,
+    plot_cdf: bool = True,
 ):
     """
     Visualize 1D/2D point clouds on a unit circle using 2D density estimation.
@@ -956,6 +1038,14 @@ def plot_and_test_point_clouds_ring(
     - History trajectory is optional and controlled by `plot_history`.
     - If plotted ensemble size < 1000, draw all points directly (scatter).
       Otherwise use 2D hexbin density.
+    - Optionally saves an empirical CDF of phase=angle/(2*pi) projected to [0, 1)
+      when `plot_cdf=True`. The CDF plot intentionally excludes
+      observation/history/true-state overlays.
+    - If `plot_cdf=True`, also saves a PDF on [0,1):
+      * N < 500: wrapped KDE with adaptive std (base 0.01 at N=500).
+      * N >= 500: histogram-based PDF with adaptive bins:
+        bins = min(2000, round(10 * N / 500)), so N=500 -> 10.
+        Then applies moving-average smoothing.
     """
     if tensor.is_cuda:
         tensor = tensor.cpu()
@@ -1099,5 +1189,55 @@ def plot_and_test_point_clouds_ring(
 
         fig.savefig(f"{prefix}_{i}_ring.png", bbox_inches='tight', dpi=150)
         plt.close(fig)
+
+        if plot_cdf:
+            # Empirical CDF on normalized phase in [0, 1), using the full cloud.
+            phase01 = _map_state_to_ring_phase01(full_points).detach().cpu().numpy()
+            phase01 = phase01[np.isfinite(phase01)]
+            if phase01.size > 0:
+                phase_sorted = np.sort(phase01)
+                cdf = np.arange(1, phase_sorted.size + 1, dtype=np.float64) / float(phase_sorted.size)
+
+                fig_cdf, ax_cdf = plt.subplots(figsize=(7, 4.2))
+                ax_cdf.step(phase_sorted, cdf, where='post', color=point_color, linewidth=1.6)
+                ax_cdf.set_xlim(0.0, 1.0)
+                ax_cdf.set_ylim(0.0, 1.0)
+                ax_cdf.set_xlabel("phase = angle / (2*pi)")
+                ax_cdf.set_ylabel("empirical CDF")
+                ax_cdf.set_title(f"{args.dataset} empirical CDF, cloud {i}")
+                ax_cdf.grid(True, linestyle='--', alpha=0.35)
+                fig_cdf.tight_layout()
+                fig_cdf.savefig(f"{prefix}_{i}_ring_cdf.png", bbox_inches='tight', dpi=150)
+                plt.close(fig_cdf)
+
+                # PDF on [0, 1): KDE for small N, histogram PDF for large N.
+                n_phase = int(phase01.size)
+                fig_pdf, ax_pdf = plt.subplots(figsize=(7, 4.2))
+                if n_phase < 500:
+                    grid = np.linspace(0.0, 1.0, 1000)
+                    kde_std = _adaptive_kde_std(n_phase, base_std=0.01)
+                    pdf_vals = _wrapped_kde_pdf_01(phase01, grid, kde_std)
+                    ax_pdf.plot(grid, pdf_vals, color=point_color, linewidth=1.8)
+                    ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
+                else:
+                    n_bins = int(np.round(10.0 * float(n_phase) / 500.0))
+                    n_bins = int(np.clip(n_bins, 10, 2000))
+                    hist, edges = np.histogram(phase01, bins=n_bins, range=(0.0, 1.0), density=True)
+                    centers = 0.5 * (edges[:-1] + edges[1:])
+                    smoothed_hist = _smooth_histogram_pdf(
+                        hist,
+                        bin_width=(edges[1] - edges[0]) if edges.size >= 2 else 1.0,
+                        window_size=9,
+                    )
+                    ax_pdf.plot(centers, smoothed_hist, color=point_color, linewidth=1.6)
+                    ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
+
+                ax_pdf.set_xlim(0.0, 1.0)
+                ax_pdf.set_xlabel("phase = angle / (2*pi)")
+                ax_pdf.set_ylabel("PDF")
+                ax_pdf.grid(True, linestyle='--', alpha=0.35)
+                fig_pdf.tight_layout()
+                fig_pdf.savefig(f"{prefix}_{i}_ring_pdf.png", bbox_inches='tight', dpi=150)
+                plt.close(fig_pdf)
 
     print(f"Processed {len(indices_to_process)} ring-mapped point clouds with prefix '{prefix}'.")

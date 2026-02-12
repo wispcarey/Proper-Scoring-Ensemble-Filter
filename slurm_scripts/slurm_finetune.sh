@@ -13,7 +13,7 @@
 #SBATCH -e output_record/ft.%x.%j.err      # STDERR
 
 # Description: Slurm execution script for finetune.py.
-# Input: Env vars defined in submit_finetune.sh.
+# Input: Env vars defined in submit_finetune.sh (including optional ADAPTIVE_SIGMA_Y).
 # Output: Fine-tuned model checkpoints and logs.
 
 # 1. Configuration (Defaults for safety)
@@ -30,8 +30,16 @@ VERSION=${VERSION:-"EtE-LRes"}
 CP_PATH=${CP_PATH:-""}
 SIGMA_Y=${SIGMA_Y:-1.0}
 LOSS_TYPE=${LOSS_TYPE:-"es"}
+ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"}
 
-echo "Starting Finetune: Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y"
+ADAPTIVE_SIGMA_Y_FLAG=""
+case "${ADAPTIVE_SIGMA_Y,,}" in
+    true|1|yes|y)
+        ADAPTIVE_SIGMA_Y_FLAG="--adaptive_sigma_y"
+        ;;
+esac
+
+echo "Starting Finetune: Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y, LR=$LR, Adaptive=$ADAPTIVE_SIGMA_Y"
 echo "Checkpoint Load: $CP_PATH"
 
 # Load modules
@@ -48,6 +56,7 @@ python finetune.py \
     --train_steps $TRAIN_STEPS \
     --train_traj_num $TRAIN_TRAJ_NUM \
     --sigma_y $SIGMA_Y \
+    $ADAPTIVE_SIGMA_Y_FLAG \
     --seed $SEED \
     --learning_rate $LR \
     --cp_load_path "$CP_PATH" \

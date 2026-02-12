@@ -18,4 +18,4 @@ python train.py \
    --pf_N 100000 \
    --sigma_reg None \
    --save_epoch 10 \
-   --obs_fn square_root
+   --obs_fn identity

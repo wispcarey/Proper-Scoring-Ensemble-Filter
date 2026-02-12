@@ -111,6 +111,60 @@ def _build_observation_plot_tensor(args, batch_v, obs_y_list):
     return observations
 
 
+def _sigma_y_sq_per_traj(sigma_y, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Normalize sigma_y into a per-trajectory variance vector with shape [B]."""
+    sigma_y_tensor = torch.as_tensor(sigma_y, device=device, dtype=dtype)
+
+    if sigma_y_tensor.ndim >= 1 and sigma_y_tensor.shape[0] == batch_size:
+        sigma_y_vec = sigma_y_tensor.reshape(batch_size, -1)[:, 0]
+        return sigma_y_vec * sigma_y_vec
+
+    flat = sigma_y_tensor.reshape(-1)
+    if flat.numel() == 1:
+        return (flat[0] * flat[0]).expand(batch_size)
+    if flat.numel() == batch_size:
+        return flat * flat
+
+    print(
+        f"Warning: sigma_y shape {tuple(sigma_y_tensor.shape)} is not aligned with batch size {batch_size}. "
+        "Falling back to sigma_y[0] for all trajectories."
+    )
+    return (flat[0] * flat[0]).expand(batch_size)
+
+
+def _compute_traj_snr_var_from_hvalues(h_values: torch.Tensor, sigma_y) -> torch.Tensor:
+    """
+    Compute per-trajectory SNR_var from clean observation-space trajectories.
+
+    Args:
+        h_values: [T, B, d_obs], where h_values[t, b] = h(v_t^b).
+        sigma_y: Scalar or per-trajectory observation noise std.
+
+    Returns:
+        Tensor with shape [B], each entry is SNR_var for one trajectory.
+    """
+    if h_values.ndim != 3:
+        raise ValueError(f"h_values must have shape [T, B, d_obs], but got {tuple(h_values.shape)}.")
+
+    _, batch_size, d_obs = h_values.shape
+    mean_h = torch.nanmean(h_values, dim=0, keepdim=True)
+    signal_var = torch.nanmean(torch.sum((h_values - mean_h) ** 2, dim=-1), dim=0)
+
+    sigma_y_sq = _sigma_y_sq_per_traj(
+        sigma_y=sigma_y,
+        batch_size=batch_size,
+        device=h_values.device,
+        dtype=h_values.dtype,
+    )
+    denom = float(d_obs) * sigma_y_sq
+
+    eps = torch.finfo(h_values.dtype).eps if torch.is_floating_point(h_values) else 1e-12
+    snr_var = signal_var / torch.clamp(denom, min=eps)
+    invalid = ~torch.isfinite(signal_var) | ~torch.isfinite(denom)
+    snr_var = snr_var.masked_fill(invalid, float('nan'))
+    return snr_var
+
+
 def _select_plot_batch_index(ens_tensor: torch.Tensor) -> int:
     """Pick a trajectory index with the fewest NaN time steps for visualization."""
     if ens_tensor.ndim != 4 or ens_tensor.shape[1] == 0:
@@ -118,6 +172,96 @@ def _select_plot_batch_index(ens_tensor: torch.Tensor) -> int:
     nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))  # [T, B]
     nan_counts = nan_per_step.sum(dim=0)
     return int(torch.argmin(nan_counts).item())
+
+
+def _resolve_plot_batch_indices(args, batch_size: int, nan_counts: Optional[torch.Tensor] = None) -> List[int]:
+    """
+    Resolve batch indices for plotting from args.test_plot_index.
+
+    Supported forms:
+    - "adaptive": choose one index with fewest NaN steps
+    - int/list/tuple of ints: use those indices (after bounds filtering)
+    """
+    if batch_size <= 0:
+        return []
+
+    cfg = getattr(args, "test_plot_index", [0])
+    if isinstance(cfg, str) and cfg.lower() == "adaptive":
+        if nan_counts is not None and nan_counts.numel() == batch_size:
+            return [int(torch.argmin(nan_counts).item())]
+        return [0]
+
+    if isinstance(cfg, int):
+        requested = [int(cfg)]
+    elif isinstance(cfg, (list, tuple)):
+        requested = [int(x) for x in cfg]
+    else:
+        requested = [0]
+
+    valid = []
+    for idx in requested:
+        if 0 <= idx < batch_size and idx not in valid:
+            valid.append(idx)
+
+    if len(valid) == 0:
+        print(
+            f"Warning: no valid plot indices in test_plot_index={cfg} for batch_size={batch_size}. "
+            "Falling back to [0]."
+        )
+        return [0]
+    return valid
+
+
+def _normalize_global_plot_indices(args) -> Tuple[str, List[int]]:
+    """
+    Normalize args.test_plot_index into either:
+    - ("adaptive", [])
+    - ("global", [global_idx0, global_idx1, ...])
+    """
+    cfg = getattr(args, "test_plot_index", [0])
+    if isinstance(cfg, str) and cfg.lower() == "adaptive":
+        return "adaptive", []
+
+    if isinstance(cfg, int):
+        requested = [int(cfg)]
+    elif isinstance(cfg, (list, tuple)):
+        requested = []
+        for x in cfg:
+            try:
+                requested.append(int(x))
+            except Exception:
+                continue
+    else:
+        requested = [0]
+
+    valid = []
+    for idx in requested:
+        if idx >= 0 and idx not in valid:
+            valid.append(idx)
+
+    if len(valid) == 0:
+        print(f"Warning: invalid global test_plot_index={cfg}. Falling back to [0].")
+        valid = [0]
+
+    return "global", valid
+
+
+def _resolve_global_plot_indices_for_batch(
+    global_indices: List[int],
+    batch_start_index: int,
+    batch_size: int,
+) -> List[int]:
+    """Map global trajectory indices to local batch indices for current batch."""
+    if batch_size <= 0:
+        return []
+    local = []
+    batch_end = batch_start_index + batch_size
+    for gidx in global_indices:
+        if batch_start_index <= gidx < batch_end:
+            lidx = int(gidx - batch_start_index)
+            if lidx not in local:
+                local.append(lidx)
+    return local
 
 
 def _get_lowdim_snapshot_indices(total_steps: int, start_step: int = 100, num_slices: int = 3, step_offset: int = 0):
@@ -324,6 +468,9 @@ def _plot_test_visualizations(
     save_pdf=False,
     comparison_tensor=None,
     step_offset: int = 0,
+    plot_batch_indices: Optional[List[int]] = None,
+    batch_start_index: int = 0,
+    global_index_naming: bool = False,
 ):
     """Dispatch visualization strategy by state dimension.
 
@@ -337,75 +484,97 @@ def _plot_test_visualizations(
     if comparison_tensor is None:
         comparison_tensor = true_tensor
 
-    if args.ori_dim <= 3:
-        bidx = _select_plot_batch_index(ens_tensor)
-        ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
-        true_traj = true_tensor[:, bidx, :].detach().cpu()
-        compare_traj = comparison_tensor[:, bidx, :].detach().cpu()
-        obs_traj = observations[:, bidx, :].detach().cpu()
-
-        if args.dataset in {"doubling1d", "complex2d"}:
-            _plot_last_three_steps_ring(
-                args,
-                ens_traj,
-                true_traj,
-                obs_traj,
-                fig_name=fig_name,
-                step_offset=step_offset,
-            )
-        else:
-            _plot_last_three_steps_lowdim_generic(
-                ens_traj=ens_traj,
-                true_traj=true_traj,
-                observations=obs_traj,
-                fig_name=fig_name,
-                save_pdf=save_pdf,
-                step_offset=step_offset,
-            )
-
-        _plot_lowdim_traj_summary(
-            ens_traj=ens_traj,
-            ref_traj=compare_traj,
-            observations=obs_traj,
-            fig_name=fig_name,
-            save_pdf=save_pdf,
+    if plot_batch_indices is None:
+        nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))  # [T, B]
+        nan_counts = nan_per_step.sum(dim=0)
+        plot_bidx_list = _resolve_plot_batch_indices(
+            args=args,
+            batch_size=ens_tensor.shape[1],
+            nan_counts=nan_counts,
         )
+    else:
+        plot_bidx_list = []
+        for idx in plot_batch_indices:
+            i = int(idx)
+            if 0 <= i < ens_tensor.shape[1] and i not in plot_bidx_list:
+                plot_bidx_list.append(i)
+        if len(plot_bidx_list) == 0:
+            return
+
+    if args.ori_dim <= 3:
+        multi_bidx = len(plot_bidx_list) > 1 or global_index_naming
+        for bidx in plot_bidx_list:
+            ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
+            true_traj = true_tensor[:, bidx, :].detach().cpu()
+            compare_traj = comparison_tensor[:, bidx, :].detach().cpu()
+            obs_traj = observations[:, bidx, :].detach().cpu()
+            idx_tag = f"g{batch_start_index + bidx}" if global_index_naming else f"b{bidx}"
+            fig_name_b = f"{fig_name}_{idx_tag}" if multi_bidx else fig_name
+
+            if args.dataset in {"doubling1d", "complex2d"}:
+                _plot_last_three_steps_ring(
+                    args,
+                    ens_traj,
+                    true_traj,
+                    obs_traj,
+                    fig_name=fig_name_b,
+                    step_offset=step_offset,
+                )
+            else:
+                _plot_last_three_steps_lowdim_generic(
+                    ens_traj=ens_traj,
+                    true_traj=true_traj,
+                    observations=obs_traj,
+                    fig_name=fig_name_b,
+                    save_pdf=save_pdf,
+                    step_offset=step_offset,
+                )
+
+            _plot_lowdim_traj_summary(
+                ens_traj=ens_traj,
+                ref_traj=compare_traj,
+                observations=obs_traj,
+                fig_name=fig_name_b,
+                save_pdf=save_pdf,
+            )
         return
 
-    # High-dimensional fallback: keep existing plotting style.
-    time_idx_plot = -2
+    # High-dimensional fallback: use selected batch index/indices.
     num_dims_plot = 4
     dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
-
-    plot_particle_trajectories_with_histograms(
-        particles=ens_tensor[:, time_idx_plot, :, :],
-        true_traj=comparison_tensor[:, time_idx_plot, :],
-        observation=None,
-        dim_indices=dim_indices_plot,
-        start_time=0,
-        end_time=ens_tensor.shape[0],
-        mode='quantile',
-        save_fig=True,
-        save_pdf=save_pdf,
-        save_name=fig_name + "_hist",
-        hist_step=1,
-        fontsize=None,
-    )
-    plot_particle_trajectories(
-        particles=ens_tensor[:, time_idx_plot, :, :],
-        true_traj=comparison_tensor[:, time_idx_plot, :],
-        observation=observations[:, time_idx_plot, :],
-        cmap_name='bwr',
-        start_time=0,
-        end_time=ens_tensor.shape[0],
-        main_fig_size=(5, 2),
-        save_fig=True,
-        save_pdf=save_pdf,
-        save_name=fig_name + "_traj",
-        colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-        plot_vertical_colorbar=False,
-        plot_horizontal_colorbar=True,
-    )
+    multi_bidx = len(plot_bidx_list) > 1 or global_index_naming
+    for bidx in plot_bidx_list:
+        idx_tag = f"g{batch_start_index + bidx}" if global_index_naming else f"b{bidx}"
+        fig_name_b = f"{fig_name}_{idx_tag}" if multi_bidx else fig_name
+        plot_particle_trajectories_with_histograms(
+            particles=ens_tensor[:, bidx, :, :],
+            true_traj=comparison_tensor[:, bidx, :],
+            observation=None,
+            dim_indices=dim_indices_plot,
+            start_time=0,
+            end_time=ens_tensor.shape[0],
+            mode='quantile',
+            save_fig=True,
+            save_pdf=save_pdf,
+            save_name=fig_name_b + "_hist",
+            hist_step=1,
+            fontsize=None,
+        )
+        plot_particle_trajectories(
+            particles=ens_tensor[:, bidx, :, :],
+            true_traj=comparison_tensor[:, bidx, :],
+            observation=observations[:, bidx, :],
+            cmap_name='bwr',
+            start_time=0,
+            end_time=ens_tensor.shape[0],
+            main_fig_size=(5, 2),
+            save_fig=True,
+            save_pdf=save_pdf,
+            save_name=fig_name_b + "_traj",
+            colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
+            plot_vertical_colorbar=False,
+            plot_horizontal_colorbar=True,
+        )
 
 
 def _get_forward_fun(args):
@@ -1132,10 +1301,14 @@ def generate_and_cache_pf_results(
         all_pf_metrics['rcrps'] = torch.empty(0, device=args.device)
 
     # --- Which batch indices to visualize when saving figures ---
-    # (Matches your previous behavior of plotting the first two items if available.)
-    vis_indices: List[int] = [i for i in [0, 1] if i < batch_size]
+    # Controlled by args.test_plot_index (default [0], also supports "adaptive" and lists like [0,1]).
     can_plot_3d = int(getattr(args, 'ori_dim', 0)) >= 3
     can_plot_ring = int(getattr(args, 'ori_dim', 0)) in [1, 2]
+    plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
+    unresolved_global_indices = set(requested_global_indices)
+    batch_start_index = 0
+    pf_ring_cdf_datasets = {"doubling1d", "complex2d"}
+    pf_plot_ring_cdf = getattr(args, "dataset", None) in pf_ring_cdf_datasets
     if save_figure and can_plot_ring:
         print(f"[INFO] Using ring-mapped PF visualization for dataset='{args.dataset}' (ori_dim={args.ori_dim}).")
     if save_figure and (not can_plot_3d and not can_plot_ring):
@@ -1147,6 +1320,21 @@ def generate_and_cache_pf_results(
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
             batch_v = batch_v.to(device=args.device)  # shape: (T, B, D)
+            batch_nan_counts = torch.isnan(batch_v).any(dim=2).sum(dim=0)  # [B]
+            if plot_mode == "adaptive":
+                vis_indices = _resolve_plot_batch_indices(
+                    args=args,
+                    batch_size=batch_v.shape[1],
+                    nan_counts=batch_nan_counts,
+                )
+            else:
+                vis_indices = _resolve_global_plot_indices_for_batch(
+                    global_indices=requested_global_indices,
+                    batch_start_index=batch_start_index,
+                    batch_size=batch_v.shape[1],
+                )
+                for lidx in vis_indices:
+                    unresolved_global_indices.discard(batch_start_index + lidx)
 
             # --- Particle Filter Initialization ---
             pf_ens_v_a = batch_v[0].unsqueeze(1).repeat(1, args.pf_N, 1)  # (B, Np, D)
@@ -1229,6 +1417,7 @@ def generate_and_cache_pf_results(
 
                     # We plot per selected batch index so each figure gets the correct observation vector
                     for bidx in vis_indices:
+                        gidx = batch_start_index + bidx
                         if can_plot_3d:
                             # Prepare per-item tensors for the plotting helper (shape: (1, Np, 3))
                             prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :3].detach().cpu()
@@ -1238,7 +1427,7 @@ def generate_and_cache_pf_results(
                             hist_traj = batch_v[1:i+2, bidx:bidx+1, :3].detach().cpu()
 
                             # PRIOR (blue)
-                            prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
+                            prefix_prior = f"{base_prefix}_g{gidx}_PRIOR"
                             plot_and_test_point_clouds(
                                 args,
                                 prior_cloud_for_plot,             # (1, Np, 3)
@@ -1253,7 +1442,7 @@ def generate_and_cache_pf_results(
                             )
 
                             # POSTERIOR (red)
-                            prefix_post = f"{base_prefix}_b{bidx}_POST"
+                            prefix_post = f"{base_prefix}_g{gidx}_POST"
                             plot_and_test_point_clouds(
                                 args,
                                 posterior_cloud_for_plot,         # (1, Np, 3)
@@ -1273,7 +1462,7 @@ def generate_and_cache_pf_results(
                             hist_traj = batch_v[1:i+2, bidx:bidx+1, :].detach().cpu()
                             obs_x = obs_y_list[i + 1][bidx, 0].detach().cpu()
 
-                            prefix_prior = f"{base_prefix}_b{bidx}_PRIOR"
+                            prefix_prior = f"{base_prefix}_g{gidx}_PRIOR"
                             plot_and_test_point_clouds_ring(
                                 args,
                                 prior_cloud_for_plot,
@@ -1283,9 +1472,10 @@ def generate_and_cache_pf_results(
                                 observation=obs_x,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
+                                plot_cdf=pf_plot_ring_cdf,
                             )
 
-                            prefix_post = f"{base_prefix}_b{bidx}_POST"
+                            prefix_post = f"{base_prefix}_g{gidx}_POST"
                             plot_and_test_point_clouds_ring(
                                 args,
                                 posterior_cloud_for_plot,
@@ -1295,6 +1485,7 @@ def generate_and_cache_pf_results(
                                 observation=obs_x,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
+                                plot_cdf=pf_plot_ring_cdf,
                             )
 
             # --- Aggregate and Cache Batch Results ---
@@ -1317,6 +1508,14 @@ def generate_and_cache_pf_results(
                 all_pf_metrics['rcrps'] = torch.cat((all_pf_metrics['rcrps'], rcrps_val))
 
             print("update results")
+            batch_start_index += batch_v.shape[1]
+
+    if save_figure and plot_mode == "global" and len(unresolved_global_indices) > 0:
+        unresolved_sorted = sorted(list(unresolved_global_indices))
+        print(
+            f"Warning: some global test_plot_index values were not found in loader batches: "
+            f"{unresolved_sorted[:10]}{'...' if len(unresolved_sorted) > 10 else ''}"
+        )
 
     # --- Save All Results to Cache File ---
     print(f"Saving PF results to: {cache_filepath}")
@@ -1416,6 +1615,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         'rrmse': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
+        'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'pf_rmse': torch.empty(0, device=args.device),
@@ -1426,6 +1626,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     # NEW: analysis-step timing collectors
     assim_step_times = []              # per analysis step across batches
     assim_step_times_weighted = []     # replicated by #active trajectories
+    plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
+    unresolved_global_indices = set(requested_global_indices)
+    batch_start_index = 0
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -1451,10 +1654,16 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             
             # Precompute noisy observations for all times (independent of active_mask)
             obs_y_list = []
+            clean_h_list = []
             for i in range(len(batch_v)):
-                obs_y_step = H_fun(batch_v[i].unsqueeze(1))
-                obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
+                clean_h_step = H_fun(batch_v[i].unsqueeze(1))
+                obs_y_step = clean_h_step + args.sigma_y * torch.randn_like(clean_h_step, device=args.device)
                 obs_y_list.append(obs_y_step)
+                clean_h_list.append(clean_h_step.squeeze(1))
+
+            h_tensor = torch.stack(clean_h_list, dim=0)
+            snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
+            all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
 
             # Time loop
             for i in range(len(batch_v) - 1):
@@ -1598,8 +1807,47 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
             # Build observation tensor for plotting (unchanged)
             observations = _build_observation_plot_tensor(args, batch_v, obs_y_list)
+
+            if plot_figures and plot_mode == "global":
+                local_plot_indices = _resolve_global_plot_indices_for_batch(
+                    global_indices=requested_global_indices,
+                    batch_start_index=batch_start_index,
+                    batch_size=B,
+                )
+                for lidx in local_plot_indices:
+                    unresolved_global_indices.discard(batch_start_index + lidx)
+
+                if len(local_plot_indices) > 0:
+                    ens_plot = ens_tensor
+                    true_plot = batch_v
+                    compare_plot = batch_v
+                    obs_plot = observations
+
+                    if args.pf_verification:
+                        true_plot = true_plot[1:]
+                        compare_plot = cached_pf_data[batch_ind]['means']
+                        ens_plot = ens_plot[1:]
+                        obs_plot = obs_plot[1:]
+                        step_offset = 1
+                    else:
+                        step_offset = 0
+
+                    _plot_test_visualizations(
+                        args=args,
+                        ens_tensor=ens_plot,
+                        true_tensor=true_plot,
+                        comparison_tensor=compare_plot,
+                        observations=obs_plot,
+                        fig_name=fig_name,
+                        save_pdf=save_pdf,
+                        step_offset=step_offset,
+                        plot_batch_indices=local_plot_indices,
+                        batch_start_index=batch_start_index,
+                        global_index_naming=True,
+                    )
+            batch_start_index += B
     
-    if plot_figures:
+    if plot_figures and plot_mode == "adaptive":
         ens_plot = ens_tensor
         true_plot = batch_v
         compare_plot = batch_v
@@ -1625,6 +1873,12 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             fig_name=fig_name,
             save_pdf=save_pdf,
             step_offset=step_offset,
+        )
+    elif plot_figures and len(unresolved_global_indices) > 0:
+        unresolved_sorted = sorted(list(unresolved_global_indices))
+        print(
+            f"Warning: some global test_plot_index values were not found in loader batches: "
+            f"{unresolved_sorted[:10]}{'...' if len(unresolved_sorted) > 10 else ''}"
         )
 
     # Final metrics (RMV removed)
@@ -1661,6 +1915,14 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
+
+    snr_values = all_results['snr_var']
+    finite_snr_mask = torch.isfinite(snr_values)
+    if finite_snr_mask.any():
+        final_metrics['mean_snr_var'], final_metrics['std_snr_var'] = get_mean_std(snr_values[finite_snr_mask])
+    else:
+        final_metrics['mean_snr_var'] = float('nan')
+        final_metrics['std_snr_var'] = float('nan')
 
     # ---- NEW: compute analysis-step timing stats and attach to final_metrics ----
     if len(assim_step_times) > 0:
@@ -1713,6 +1975,9 @@ def print_test_results(results):
     # Percentage of non-NaN trajectories
     if 'no_nan_percent' in results:
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
+
+    if 'mean_snr_var' in results and 'std_snr_var' in results:
+        print(f"SNR_var: {results['mean_snr_var']:.3f} ± {results['std_snr_var']:.3f}")
 
     # --- Timing outputs in milliseconds (ms) ---
 
@@ -1796,6 +2061,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         'rrmse': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
+        'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'pf_rmse': torch.empty(0, device=args.device),
@@ -1805,6 +2071,9 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     # NEW: timing collectors
     assim_step_times = []              # per-step durations across all batches
     assim_step_times_weighted = []     # per-trajectory-weighted durations
+    plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
+    unresolved_global_indices = set(requested_global_indices)
+    batch_start_index = 0
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -1830,10 +2099,16 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
             # Precompute noisy observations y_t for all t (shape aligned to H_fun outputs)
             obs_y_list = []
+            clean_h_list = []
             for i in range(len(batch_v)):
-                obs_y_step = H_fun(batch_v[i].unsqueeze(1))
-                obs_y_step += args.sigma_y * torch.randn_like(obs_y_step, device=args.device)
+                clean_h_step = H_fun(batch_v[i].unsqueeze(1))
+                obs_y_step = clean_h_step + args.sigma_y * torch.randn_like(clean_h_step, device=args.device)
                 obs_y_list.append(obs_y_step)
+                clean_h_list.append(clean_h_step.squeeze(1))
+
+            h_tensor = torch.stack(clean_h_list, dim=0)
+            snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
+            all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
 
             # Time loop
             for i in tqdm(range(len(batch_v) - 1), desc="Processing", unit="item"):
@@ -2010,36 +2285,76 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             
             # Build observation tensor for plotting (unchanged)
             observations = _build_observation_plot_tensor(args, batch_v, obs_y_list)
+            if plot_figures and plot_mode == "global":
+                local_plot_indices = _resolve_global_plot_indices_for_batch(
+                    global_indices=requested_global_indices,
+                    batch_start_index=batch_start_index,
+                    batch_size=B,
+                )
+                for lidx in local_plot_indices:
+                    unresolved_global_indices.discard(batch_start_index + lidx)
 
-    # Plotting (unchanged)
-    if plot_figures: 
-        time_idx_plot = -2
-        num_dims_plot = 4
-        dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
+                if len(local_plot_indices) > 0:
+                    ens_plot = ens_tensor
+                    true_plot = batch_v
+                    compare_plot = batch_v
+                    obs_plot = observations
+
+                    if args.pf_verification:
+                        true_plot = true_plot[1:]
+                        compare_plot = cached_pf_data[batch_ind]['means']
+                        ens_plot = ens_plot[1:]
+                        obs_plot = obs_plot[1:]
+                        step_offset = 1
+                    else:
+                        step_offset = 0
+
+                    _plot_test_visualizations(
+                        args=args,
+                        ens_tensor=ens_plot,
+                        true_tensor=true_plot,
+                        comparison_tensor=compare_plot,
+                        observations=obs_plot,
+                        fig_name=fig_name + "_classic",
+                        save_pdf=save_pdf,
+                        step_offset=step_offset,
+                        plot_batch_indices=local_plot_indices,
+                        batch_start_index=batch_start_index,
+                        global_index_naming=True,
+                    )
+            batch_start_index += B
+
+    if plot_figures and plot_mode == "adaptive":
+        ens_plot = ens_tensor
+        true_plot = batch_v
+        compare_plot = batch_v
+        obs_plot = observations
 
         if args.pf_verification:
-            batch_v = cached_pf_data[-1]['means']
-            ens_tensor = ens_tensor[1:]
-            observations = observations[1:]
+            true_plot = true_plot[1:]
+            compare_plot = cached_pf_data[-1]['means']
+            ens_plot = ens_plot[1:]
+            obs_plot = obs_plot[1:]
+            step_offset = 1
+        else:
+            step_offset = 0
 
-        plot_particle_trajectories_with_histograms(
-            particles=ens_tensor[:, time_idx_plot, :, :],
-            true_traj=batch_v[:, time_idx_plot, :],
-            observation=None,
-            dim_indices=dim_indices_plot,
-            start_time=0, end_time=ens_tensor.shape[0], mode='quantile',
-            save_fig=True, save_pdf=save_pdf, save_name=fig_name + "_hist_classic",
-            hist_step=1, fontsize=None)
-
-        plot_particle_trajectories(
-            particles=ens_tensor[:, time_idx_plot, :, :],
-            true_traj=batch_v[:, time_idx_plot, :],
-            observation=observations[:, time_idx_plot, :],
-            cmap_name='bwr', start_time=0, end_time=ens_tensor.shape[0],
-            main_fig_size=(5, 2), save_fig=True, save_pdf=save_pdf,
-            save_name=fig_name + "_traj_classic",
-            colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
-            plot_vertical_colorbar=False, plot_horizontal_colorbar=True)
+        _plot_test_visualizations(
+            args=args,
+            ens_tensor=ens_plot,
+            true_tensor=true_plot,
+            comparison_tensor=compare_plot,
+            observations=obs_plot,
+            fig_name=fig_name + "_classic",
+            save_pdf=save_pdf,
+            step_offset=step_offset,
+        )
+    elif plot_figures and len(unresolved_global_indices) > 0:
+        unresolved_sorted = sorted(list(unresolved_global_indices))
+        print(
+            f"Warning: some global test_plot_index values were not found in loader batches: "
+            f"{unresolved_sorted[:10]}{'...' if len(unresolved_sorted) > 10 else ''}"
+        )
 
     final_metrics = {}
     if all_results['rrmse'].numel() == 0:
@@ -2071,6 +2386,14 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
+
+    snr_values = all_results['snr_var']
+    finite_snr_mask = torch.isfinite(snr_values)
+    if finite_snr_mask.any():
+        final_metrics['mean_snr_var'], final_metrics['std_snr_var'] = get_mean_std(snr_values[finite_snr_mask])
+    else:
+        final_metrics['mean_snr_var'] = float('nan')
+        final_metrics['std_snr_var'] = float('nan')
 
     # ---- NEW: compute timing stats and attach to final_metrics ----
     # We compute (1) per-step mean/std and (2) trajectory-weighted mean/std.
@@ -2317,6 +2640,7 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         'rrmse': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
+        'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'w2_diff': torch.empty(0, device=args.device),
@@ -2410,6 +2734,10 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             # --- Process and Store Batch Results ---
             ens_tensor = torch.stack(ens_list, dim=0)
             gt_tensor = torch.stack(gt_list, dim=0)
+
+            # SNR_var per trajectory using clean observations h(v_j) = H v_j.
+            h_tensor = torch.einsum('tbd,bod->tbo', gt_tensor, H)
+            snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, sigma_y)
             
             # --- Metric Calculation for the Batch ---
             # Note: We compute mean over time steps (dim=0) first, then over batch items
@@ -2433,6 +2761,7 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
             all_results['cov_diff'] = torch.cat((all_results['cov_diff'], cov_diff_val))
             all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], rcov_diff_val))
             all_results['w2_diff'] = torch.cat((all_results['w2_diff'], w2_diff_val))
@@ -2492,6 +2821,14 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         final_metrics['min_m_norm'], final_metrics['max_m_norm'] = min_m_norm, max_m_norm
         final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
 
+    snr_values = all_results['snr_var']
+    finite_snr_mask = torch.isfinite(snr_values)
+    if finite_snr_mask.any():
+        final_metrics['mean_snr_var'], final_metrics['std_snr_var'] = get_mean_std(snr_values[finite_snr_mask])
+    else:
+        final_metrics['mean_snr_var'] = float('nan')
+        final_metrics['std_snr_var'] = float('nan')
+
     final_loc_tensor = loc_tensor_all_batches[0] if loc_tensor_all_batches is not None else torch.empty(1, device=args.device)
 
     final_metrics['loc_tensor'] = final_loc_tensor
@@ -2529,6 +2866,9 @@ def print_test_results_v2(results):
         
     if 'min_m_norm' in results and 'max_m_norm' in results:
         print(f"Min initial norm: {results['min_m_norm']:.2f}, Max initial norm: {results['max_m_norm']:.2f}")
+
+    if 'mean_snr_var' in results and 'std_snr_var' in results:
+        print(f"SNR_var: {results['mean_snr_var']:.3f} ± {results['std_snr_var']:.3f}")
     
 
 ### test gt uncertainty 

@@ -3,17 +3,16 @@
 cd ..
 
 python train.py \
-   # --dataset doubling1d \
-   --dataset complex2d \
+   --dataset doubling1d \
    --num_loader_workers 16 \
    --epochs 100 \
    --N 30 \
    --batch_size 512 \
-   --sigma_y 0.1 \
+   --sigma_y 0.2 \
    --seed 42 \
    --v EtE-LRes \
    --no_running_loss \
-   --loss_type nl2 \
+   --loss_type es \
    --no_localization \
    --es_p 1 \
    --save_epoch 10 \

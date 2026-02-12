@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Description: Batch submit Slurm jobs for train.py (via slurm_train.sh).
-# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LR, OBS_FN, WEIGHT_DECAY, SUFFIX).
+# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, USE_PF, LR, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX).
 # Output: Submits jobs via sbatch using exported environment variables.
 
 # Target Slurm script
@@ -50,8 +50,8 @@ compute_time_limit() {
 }
 
 # List of specific experiments to run
-# Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF LEARNING_RATE OBS_FN WEIGHT_DECAY SUFFIX"
-# Note: If a value is missing (end of string), it defaults to the DEF variables above.
+# Format: "DATASET EPOCHS N SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF LEARNING_RATE OBS_FN WEIGHT_DECAY ADAPTIVE_SIGMA_Y SUFFIX"
+# Note: ADAPTIVE_SIGMA_Y is required and must be explicitly set to true/false.
 # EXPERIMENTS=(
 #     "lorenz63 500 10 1.0 EtE-LRes pre_nll None true 1e-3"
 #     "lorenz63 500 10 1.0 CorrTerms pre_nll None true 1e-3"
@@ -71,21 +71,37 @@ compute_time_limit() {
 #     "lorenz63 500 10 1.0 CorrTerms es None true 1e-3 comp_ss"
 # )
 EXPERIMENTS=(
-    "lorenz63 1000 10 1.0 EtE-LRes es None true 1e-3 square_root 0"
-    "lorenz63 1000 10 1.0 EtE-LRes nl2 None true 1e-3 square_root 0"
-    "lorenz63 1000 10 1.0 CorrTerms es None true 1e-3 square_root 0.01"
-    "lorenz63 1000 10 1.0 CorrTerms nl2 None true 1e-3 square_root 0.01"
-    "lorenz63 1000 10 1.0 EtE-LRes es None true 1e-3 arctan 0"
-    "lorenz63 1000 10 1.0 EtE-LRes nl2 None true 1e-3 arctan 0"
-    "lorenz63 1000 10 1.0 CorrTerms es None true 1e-3 arctan 0.01"
-    "lorenz63 1000 10 1.0 CorrTerms nl2 None true 1e-3 arctan 0.01"
+    "lorenz63 1000 10 1.0 EtE-LRes es None true 1e-3 square_root 0 false None"
+    "lorenz63 1000 10 1.0 EtE-LRes nl2 None true 1e-3 square_root 0 false None"
+    "lorenz63 1000 10 1.0 CorrTerms es None true 1e-3 square_root 0.01 false None"
+    "lorenz63 1000 10 1.0 CorrTerms nl2 None true 1e-3 square_root 0.01 false None"
+    "lorenz63 1000 10 1.0 EtE-LRes es None true 1e-3 arctan 0 false None"
+    "lorenz63 1000 10 1.0 EtE-LRes nl2 None true 1e-3 arctan 0 false None"
+    "lorenz63 1000 10 1.0 CorrTerms es None true 1e-3 arctan 0.01 false None"
+    "lorenz63 1000 10 1.0 CorrTerms nl2 None true 1e-3 arctan 0.01 false None"
 )
+
+validate_adaptive_sigma_y() {
+    local v="$1"
+    case "$v" in
+        true|false) return 0 ;;
+        *)
+            echo "Error: ADAPTIVE_SIGMA_Y must be 'true' or 'false'. Got '$v'" >&2
+            return 1
+            ;;
+    esac
+}
 
 
 # Iterate and submit
 for exp in "${EXPERIMENTS[@]}"; do
     # Parse the string into variables
-    read -r dataset epochs n sigma_y version loss_type loss_weights use_pf learning_rate obs_fn weight_decay suffix <<< "$exp"
+    read -r dataset epochs n sigma_y version loss_type loss_weights use_pf learning_rate obs_fn weight_decay adaptive_sigma_y suffix <<< "$exp"
+
+    if ! validate_adaptive_sigma_y "$adaptive_sigma_y"; then
+        echo "Malformed experiment entry: $exp" >&2
+        exit 1
+    fi
 
     # Export variables to current shell environment so --export=ALL can pick them up.
     export DATASET=${dataset:-$DEF_DATASET}
@@ -99,6 +115,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     export LEARNING_RATE=${learning_rate:-$DEF_LR}
     export OBS_FN=${obs_fn:-$DEF_OBS_FN}
     export WEIGHT_DECAY=${weight_decay:-$DEF_WEIGHT_DECAY}
+    export ADAPTIVE_SIGMA_Y=$adaptive_sigma_y
     export SUFFIX=${suffix:-$DEF_SUFFIX}
     TIME_LIMIT=$(compute_time_limit "$EPOCHS")
 
@@ -108,7 +125,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         JOB_NAME="${JOB_NAME}-${SUFFIX}"
     fi
 
-    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, V=$VERSION, PF=$USE_PF, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY, Time=$TIME_LIMIT)"
+    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, V=$VERSION, PF=$USE_PF, LR=$LEARNING_RATE, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY, Adaptive=$ADAPTIVE_SIGMA_Y, Time=$TIME_LIMIT)"
 
     # Submit using --export=ALL
     sbatch -J "$JOB_NAME" \

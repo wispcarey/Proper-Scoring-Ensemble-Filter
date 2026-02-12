@@ -18,6 +18,7 @@ DATASET_INFO = {
         'train_traj_num': 8192,
         'sigma_ens': 1,
         'sigma_v': 1e-2,
+        'sigma_y': 2,
         'colorbar_range': None,
     },
     'rossler': {
@@ -59,6 +60,7 @@ DATASET_INFO = {
         'train_traj_num': 8192,
         'sigma_ens': 1,
         'sigma_v': 1e-2,
+        'sigma_y': 1,
         'colorbar_range': (-10,15),
     },
     'ks': {
@@ -78,6 +80,7 @@ DATASET_INFO = {
         'train_traj_num': 8192,
         'sigma_ens': 1,
         'sigma_v': 1e-2,
+        'sigma_y': 0.4,
         'colorbar_range': (-6,6)
     },
     'linear': {
@@ -152,7 +155,7 @@ DATASET_INFO = {
         'train_traj_num': 8192,
         'sigma_ens': 0.1,
         'sigma_v': 1e-2,
-        'sigma_y': 0.1,
+        'sigma_y': 0.2,
         'colorbar_range': None,
     },
     'complex2d': {
@@ -172,7 +175,7 @@ DATASET_INFO = {
         'train_traj_num': 8192,
         'sigma_ens': 0.1,
         'sigma_v': 1e-2,
-        'sigma_y': 0.1,
+        'sigma_y': 0.2,
         'colorbar_range': None,
     },
 }

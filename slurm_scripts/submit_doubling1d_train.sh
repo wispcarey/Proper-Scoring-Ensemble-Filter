@@ -3,7 +3,7 @@
 # Description: Batch submit Slurm jobs for low-dim train.py runs.
 # Input: List of
 # (EXP_SETTING EPOCHS N BATCH_SIZE SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF
-#  LEARNING_RATE OBS_FN WEIGHT_DECAY SUFFIX)
+#  LEARNING_RATE OBS_FN WEIGHT_DECAY ADAPTIVE_SIGMA_Y SUFFIX)
 # EXP_SETTING supports: 1d/2d (also backward-compatible with doubling1d/complex2d).
 
 SLURM_SCRIPT="slurm_doubling1d_train.sh"
@@ -71,21 +71,37 @@ compute_time_limit() {
 # Experiment list
 # Format:
 # "EXP_SETTING EPOCHS N BATCH_SIZE SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF
-#  LEARNING_RATE OBS_FN WEIGHT_DECAY SUFFIX"
+#  LEARNING_RATE OBS_FN WEIGHT_DECAY ADAPTIVE_SIGMA_Y SUFFIX"
 EXPERIMENTS=(
-    "1d 500 30 512 0.1 EtE-LRes es None true default default 0"
-    "1d 500 30 512 0.1 EtE-LRes nl2 None true default default 0"
-    "1d 500 30 512 0.1 CorrTerms es None true default default 0"
-    "1d 500 30 512 0.1 CorrTerms nl2 None true default default 0"
-    "2d 500 30 512 0.1 EtE-LRes es None true default default 0"
-    "2d 500 30 512 0.1 EtE-LRes nl2 None true default default 0"
-    "2d 500 30 512 0.1 CorrTerms es None true default default 0"
-    "2d 500 30 512 0.1 CorrTerms nl2 None true default default 0"
+    "1d 500 30 512 0.1 EtE-LRes es None true default default 0 false None"
+    "1d 500 30 512 0.1 EtE-LRes nl2 None true default default 0 false None"
+    "1d 500 30 512 0.1 CorrTerms es None true default default 0 false None"
+    "1d 500 30 512 0.1 CorrTerms nl2 None true default default 0 false None"
+    "2d 500 30 512 0.1 EtE-LRes es None true default default 0 false None"
+    "2d 500 30 512 0.1 EtE-LRes nl2 None true default default 0 false None"
+    "2d 500 30 512 0.1 CorrTerms es None true default default 0 false None"
+    "2d 500 30 512 0.1 CorrTerms nl2 None true default default 0 false None"
 )
+
+validate_adaptive_sigma_y() {
+    local v="$1"
+    case "$v" in
+        true|false) return 0 ;;
+        *)
+            echo "Error: ADAPTIVE_SIGMA_Y must be 'true' or 'false'. Got '$v'" >&2
+            return 1
+            ;;
+    esac
+}
 
 for exp in "${EXPERIMENTS[@]}"; do
     read -r exp_setting epochs n batch_size sigma_y version loss_type loss_weights use_pf \
-        learning_rate obs_fn weight_decay suffix <<< "$exp"
+        learning_rate obs_fn weight_decay adaptive_sigma_y suffix <<< "$exp"
+
+    if ! validate_adaptive_sigma_y "$adaptive_sigma_y"; then
+        echo "Malformed experiment entry: $exp" >&2
+        exit 1
+    fi
 
     if ! set_defaults_by_exp_setting "$exp_setting"; then
         exit 1
@@ -104,6 +120,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     export LEARNING_RATE=${learning_rate:-$DEF_LR}
     export OBS_FN=${obs_fn:-$DEF_OBS_FN}
     export WEIGHT_DECAY=${weight_decay:-$DEF_WEIGHT_DECAY}
+    export ADAPTIVE_SIGMA_Y=$adaptive_sigma_y
     export SUFFIX=${suffix:-$DEF_SUFFIX}
 
     TIME_LIMIT=$(compute_time_limit "$EPOCHS")
@@ -113,7 +130,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         JOB_NAME="${JOB_NAME}-${SUFFIX}"
     fi
 
-    echo "Submitting job: $JOB_NAME (DATASET=$DATASET, EPOCHS=$EPOCHS, SIGMA_Y=$SIGMA_Y, BATCH=$BATCH_SIZE, PF=$USE_PF, Time=$TIME_LIMIT)"
+    echo "Submitting job: $JOB_NAME (DATASET=$DATASET, EPOCHS=$EPOCHS, SIGMA_Y=$SIGMA_Y, BATCH=$BATCH_SIZE, PF=$USE_PF, LR=$LEARNING_RATE, Adaptive=$ADAPTIVE_SIGMA_Y, Time=$TIME_LIMIT)"
 
     sbatch -J "$JOB_NAME" \
         --time="$TIME_LIMIT" \

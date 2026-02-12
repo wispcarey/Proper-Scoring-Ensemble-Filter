@@ -14,7 +14,7 @@
 
 # Description: Slurm script for train.py with configurable parameters for low-dim datasets.
 # Input: Env vars EXP_SETTING, DATASET, EPOCHS, N, BATCH_SIZE, SIGMA_Y, VERSION, LOSS_TYPE,
-# LOSS_WEIGHTS, USE_PF, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, SUFFIX.
+# LOSS_WEIGHTS, USE_PF, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX.
 # Fixed in this script: NUM_LOADER_WORKERS=1, SEED=42, PF_N=1000000, TEST_STEPS=200,
 # USE_LOCALIZATION=false, USE_RUNNING_LOSS=false, USE_NORMAL_OUTPUT=false, SAVE_TEST_FIGURES=true.
 
@@ -46,6 +46,7 @@ USE_PF=${USE_PF:-"true"}
 LEARNING_RATE=${LEARNING_RATE:-"default"}
 OBS_FN=${OBS_FN:-"default"}
 WEIGHT_DECAY=${WEIGHT_DECAY:-"0"}
+ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"}
 SUFFIX=${SUFFIX:-""}
 
 if [ "$DATASET" = "doubling1d" ]; then
@@ -69,8 +70,14 @@ fi
 LOCALIZATION_FLAG="--no_localization"
 RUNNING_LOSS_FLAG="--no_running_loss"
 SAVE_TEST_FIGURES_FLAG="--save_test_figures"
+ADAPTIVE_SIGMA_Y_FLAG=""
+case "${ADAPTIVE_SIGMA_Y,,}" in
+    true|1|yes|y)
+        ADAPTIVE_SIGMA_Y_FLAG="--adaptive_sigma_y"
+        ;;
+esac
 
-echo "Config: EXP_SETTING=$EXP_SETTING, DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, BATCH_SIZE=$BATCH_SIZE, SIGMA_Y=$SIGMA_Y, PF=$USE_PF, PF_N=$PF_N, TEST_STEPS=$TEST_STEPS, LR=$LEARNING_RATE, OBS_FN=$OBS_FN, WD=$WEIGHT_DECAY, SUFFIX='$SUFFIX'"
+echo "Config: EXP_SETTING=$EXP_SETTING, DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, BATCH_SIZE=$BATCH_SIZE, SIGMA_Y=$SIGMA_Y, PF=$USE_PF, PF_N=$PF_N, TEST_STEPS=$TEST_STEPS, LR=$LEARNING_RATE, OBS_FN=$OBS_FN, WD=$WEIGHT_DECAY, Adaptive=$ADAPTIVE_SIGMA_Y, SUFFIX='$SUFFIX'"
 
 # Load modules
 module load cuda/12.2
@@ -86,6 +93,7 @@ python train.py \
     --N "$N" \
     --batch_size "$BATCH_SIZE" \
     --sigma_y "$SIGMA_Y" \
+    $ADAPTIVE_SIGMA_Y_FLAG \
     --seed "$SEED" \
     --v "$VERSION" \
     --learning_rate "$LEARNING_RATE" \
