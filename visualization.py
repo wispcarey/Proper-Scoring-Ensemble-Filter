@@ -1115,7 +1115,7 @@ def plot_and_test_point_clouds_ring(
             # Small ensembles: plot all points directly.
             ax.scatter(
                 xy_plot[:, 0], xy_plot[:, 1],
-                s=10, alpha=0.55, c=point_color, edgecolors='none', label='Ensemble'
+                s=50, alpha=0.55, c=point_color, edgecolors='none', label='Ensemble'
             )
         else:
             # Large ensembles: density view is clearer.
