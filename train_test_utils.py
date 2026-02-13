@@ -293,7 +293,17 @@ def _get_lowdim_snapshot_indices(total_steps: int, start_step: int = 100, num_sl
     return selected
 
 
-def _plot_last_three_steps_ring(args, ens_traj, true_traj, observations, fig_name, step_offset: int = 0):
+def _plot_last_three_steps_ring(
+    args,
+    ens_traj,
+    true_traj,
+    observations,
+    fig_name,
+    step_offset: int = 0,
+    plot_history: bool = False,
+    legend_in_figure: bool = True,
+    point_color: str = "red",
+):
     """Use ring-mapped visualization for selected 3 low-dim slices."""
     T = ens_traj.shape[0]
     selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
@@ -307,24 +317,44 @@ def _plot_last_three_steps_ring(args, ens_traj, true_traj, observations, fig_nam
             tensor=ens_traj[t_idx : t_idx + 1],   # [1, N, d]
             num_samples_plot=min(ens_traj.shape[1], 10000),
             prefix=f"{fig_name}_slice_step{step_label}",
-            point_color="red",
+            point_color=point_color,
             observation=obs_input,
             true_state=true_traj[t_idx],
-            plot_history=False,
+            plot_history=plot_history,
             plot_indices=[0],
             history_traj=history_traj,
+            legend_in_figure=legend_in_figure,
         )
 
 
-def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig_name, save_pdf=False, step_offset: int = 0):
+def _plot_last_three_steps_lowdim_generic(
+    ens_traj,
+    true_traj,
+    observations,
+    fig_name,
+    save_pdf=False,
+    step_offset: int = 0,
+    legend_in_figure: bool = True,
+    ens_color: str = 'tab:red',
+):
     """Plot ensemble/true/obs snapshots for selected 3 steps (dim <= 3, non-ring datasets)."""
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.lines import Line2D
 
     T, _, D = ens_traj.shape
+    ens_color = str(ens_color or 'tab:red')
+    ens_color_lower = ens_color.lower()
+    density_cmap = 'Blues' if 'blue' in ens_color_lower else 'Reds'
     density_threshold = 1000
     selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
     if len(selected_steps) == 0:
         return
+    legend_labels = []
+
+    def _add_label(label: str) -> None:
+        if label not in legend_labels:
+            legend_labels.append(label)
 
     if D == 3:
         fig = plt.figure(figsize=(6 * len(selected_steps), 5))
@@ -335,15 +365,19 @@ def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig
             ens_t = ens_t[valid]
 
             if ens_t.shape[0] > 0:
-                ax.scatter(ens_t[:, 0], ens_t[:, 1], ens_t[:, 2], s=7, alpha=0.35, c='tab:red', label='Ensemble')
+                ax.scatter(ens_t[:, 0], ens_t[:, 1], ens_t[:, 2], s=7, alpha=0.35, c=ens_color, label='Ensemble')
+                _add_label('Ensemble')
             if torch.isfinite(true_traj[t_idx, :3]).all():
                 ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1], true_traj[t_idx, 2],
                            marker='x', s=80, c='black', linewidth=1.6, label='True')
+                _add_label('True')
             if torch.isfinite(observations[t_idx, :3]).all():
                 ax.scatter(observations[t_idx, 0], observations[t_idx, 1], observations[t_idx, 2],
                            marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
-            ax.set_title(f"step={step_label}")
-            if col == 1:
+                _add_label('Obs')
+            if legend_in_figure:
+                ax.set_title(f"step={step_label}")
+            if legend_in_figure and col == 1:
                 ax.legend(loc='best', fontsize=8)
         fig.tight_layout()
     else:
@@ -359,7 +393,8 @@ def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig
             if D == 2:
                 if ens_t.shape[0] > 0:
                     if ens_t.shape[0] < density_threshold:
-                        ax.scatter(ens_t[:, 0], ens_t[:, 1], s=12, alpha=0.45, c='tab:red', label='Ensemble')
+                        ax.scatter(ens_t[:, 0], ens_t[:, 1], s=12, alpha=0.45, c=ens_color, label='Ensemble')
+                        _add_label('Ensemble')
                     else:
                         ax.hexbin(
                             ens_t[:, 0].numpy(),
@@ -367,31 +402,40 @@ def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig
                             gridsize=45,
                             bins='log',
                             mincnt=1,
-                            cmap='Reds',
+                            cmap=density_cmap,
                             linewidths=0.0,
                             alpha=0.9,
                         )
+                        _add_label('Ensemble density')
                 if torch.isfinite(true_traj[t_idx, :2]).all():
                     ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1],
                                marker='x', s=80, c='black', linewidth=1.6, label='True')
+                    _add_label('True')
                 if torch.isfinite(observations[t_idx, :2]).all():
                     ax.scatter(observations[t_idx, 0], observations[t_idx, 1],
                                marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
-                ax.set_xlabel("dim0")
-                ax.set_ylabel("dim1")
+                    _add_label('Obs')
+                if legend_in_figure:
+                    ax.set_xlabel("dim0")
+                    ax.set_ylabel("dim1")
                 ax.set_aspect('equal', adjustable='box')
             else:  # D == 1
                 if ens_t.shape[0] > 0:
-                    ax.scatter(ens_t[:, 0], torch.zeros_like(ens_t[:, 0]), s=8, alpha=0.35, c='tab:red', label='Ensemble')
+                    ax.scatter(ens_t[:, 0], torch.zeros_like(ens_t[:, 0]), s=8, alpha=0.35, c=ens_color, label='Ensemble')
+                    _add_label('Ensemble')
                 if torch.isfinite(true_traj[t_idx, 0]).all():
                     ax.scatter(true_traj[t_idx, 0], 0.0, marker='x', s=80, c='black', linewidth=1.6, label='True')
+                    _add_label('True')
                 if torch.isfinite(observations[t_idx, 0]).all():
                     ax.scatter(observations[t_idx, 0], 0.0, marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
-                ax.set_xlabel("dim0")
-                ax.set_yticks([])
+                    _add_label('Obs')
+                if legend_in_figure:
+                    ax.set_xlabel("dim0")
+                    ax.set_yticks([])
 
-            ax.set_title(f"step={step_label}")
-            if ax is axes[0]:
+            if legend_in_figure:
+                ax.set_title(f"step={step_label}")
+            if legend_in_figure and ax is axes[0]:
                 ax.legend(loc='best', fontsize=8)
         fig.tight_layout()
 
@@ -400,10 +444,47 @@ def _plot_last_three_steps_lowdim_generic(ens_traj, true_traj, observations, fig
         fig.savefig(f"{fig_name}_slice_steps.pdf", bbox_inches='tight')
     plt.close(fig)
 
+    if not legend_in_figure and len(legend_labels) > 0:
+        handles = []
+        labels = []
+        for label in legend_labels:
+            if label == 'Ensemble':
+                handles.append(Line2D([0], [0], marker='o', linestyle='None',
+                                      markerfacecolor=ens_color, markeredgecolor='none', markersize=7))
+            elif label == 'Ensemble density':
+                handles.append(mpatches.Patch(facecolor=ens_color, alpha=0.9, edgecolor='none'))
+            elif label == 'True':
+                handles.append(Line2D([0], [0], marker='x', linestyle='None', color='black', markersize=7))
+            elif label == 'Obs':
+                handles.append(Line2D([0], [0], marker='*', linestyle='None',
+                                      markerfacecolor='orange', markeredgecolor='black', markersize=11))
+            else:
+                continue
+            labels.append(label)
 
-def _plot_lowdim_traj_summary(ens_traj, ref_traj, observations, fig_name, save_pdf=False):
+        if len(handles) > 0:
+            fig_leg, ax_leg = plt.subplots(figsize=(max(4.5, 2.2 * len(handles)), 1.35))
+            ax_leg.axis('off')
+            ax_leg.legend(handles, labels, loc='center', ncol=len(handles), frameon=True, fontsize=10)
+            fig_leg.tight_layout(pad=0.1)
+            fig_leg.savefig(f"{fig_name}_slice_steps_legend.png", dpi=150, bbox_inches='tight')
+            if save_pdf:
+                fig_leg.savefig(f"{fig_name}_slice_steps_legend.pdf", bbox_inches='tight')
+            plt.close(fig_leg)
+
+
+def _plot_lowdim_traj_summary(
+    ens_traj,
+    ref_traj,
+    observations,
+    fig_name,
+    save_pdf=False,
+    legend_in_figure: bool = True,
+    ens_color: str = 'tab:red',
+):
     """Plot trajectory-level summaries for dim <= 3 against a reference trajectory."""
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     D = ref_traj.shape[-1]
     dim_indices = list(range(D))
@@ -421,20 +502,25 @@ def _plot_lowdim_traj_summary(ens_traj, ref_traj, observations, fig_name, save_p
         save_name=fig_name + "_trajdims",
         hist_step=1,
         fontsize=16,
+        legend_in_figure=legend_in_figure,
+        ensemble_color=ens_color,
     )
 
     ens_mean = ens_traj.mean(dim=1)
+    legend_labels = ['Reference', 'Ensemble mean']
     if D == 3:
         fig = plt.figure(figsize=(6, 5))
         ax = fig.add_subplot(111, projection='3d')
         ax.plot(ref_traj[:, 0], ref_traj[:, 1], ref_traj[:, 2], c='black', linewidth=1.6, label='Reference')
-        ax.plot(ens_mean[:, 0], ens_mean[:, 1], ens_mean[:, 2], c='tab:red', linewidth=1.2, label='Ensemble mean')
+        ax.plot(ens_mean[:, 0], ens_mean[:, 1], ens_mean[:, 2], c=ens_color, linewidth=1.2, label='Ensemble mean')
         valid_obs = torch.isfinite(observations[:, :3]).all(dim=1)
         if valid_obs.any():
             obs = observations[valid_obs, :3]
             ax.scatter(obs[:, 0], obs[:, 1], obs[:, 2], c='orange', s=10, alpha=0.8, label='Obs')
-        ax.set_title("Trajectory 3D View")
-        ax.legend(loc='best', fontsize=8)
+            legend_labels.append('Obs')
+        if legend_in_figure:
+            ax.set_title("Trajectory 3D View")
+            ax.legend(loc='best', fontsize=8)
         fig.tight_layout()
         fig.savefig(f"{fig_name}_traj3d.png", dpi=150, bbox_inches='tight')
         if save_pdf:
@@ -443,20 +529,50 @@ def _plot_lowdim_traj_summary(ens_traj, ref_traj, observations, fig_name, save_p
     elif D == 2:
         fig, ax = plt.subplots(figsize=(5, 5))
         ax.plot(ref_traj[:, 0], ref_traj[:, 1], c='black', linewidth=1.6, label='Reference')
-        ax.plot(ens_mean[:, 0], ens_mean[:, 1], c='tab:red', linewidth=1.2, label='Ensemble mean')
+        ax.plot(ens_mean[:, 0], ens_mean[:, 1], c=ens_color, linewidth=1.2, label='Ensemble mean')
         valid_obs = torch.isfinite(observations[:, :2]).all(dim=1)
         if valid_obs.any():
             obs = observations[valid_obs, :2]
             ax.scatter(obs[:, 0], obs[:, 1], c='orange', s=12, alpha=0.8, label='Obs')
-        ax.set_xlabel("dim0")
-        ax.set_ylabel("dim1")
-        ax.set_title("Trajectory 2D View")
-        ax.legend(loc='best', fontsize=8)
+            legend_labels.append('Obs')
+        if legend_in_figure:
+            ax.set_xlabel("dim0")
+            ax.set_ylabel("dim1")
+            ax.set_title("Trajectory 2D View")
+            ax.legend(loc='best', fontsize=8)
         fig.tight_layout()
         fig.savefig(f"{fig_name}_traj2d.png", dpi=150, bbox_inches='tight')
         if save_pdf:
             fig.savefig(f"{fig_name}_traj2d.pdf", bbox_inches='tight')
         plt.close(fig)
+
+    if not legend_in_figure and D in [2, 3]:
+        handles = []
+        labels = []
+        seen = set()
+        for label in legend_labels:
+            if label in seen:
+                continue
+            seen.add(label)
+            if label == 'Reference':
+                handles.append(Line2D([0], [0], color='black', linewidth=1.6))
+            elif label == 'Ensemble mean':
+                handles.append(Line2D([0], [0], color=ens_color, linewidth=1.2))
+            elif label == 'Obs':
+                handles.append(Line2D([0], [0], marker='o', linestyle='None',
+                                      markerfacecolor='orange', markeredgecolor='none', markersize=7))
+            else:
+                continue
+            labels.append(label)
+        if len(handles) > 0:
+            fig_leg, ax_leg = plt.subplots(figsize=(max(4.5, 2.2 * len(handles)), 1.35))
+            ax_leg.axis('off')
+            ax_leg.legend(handles, labels, loc='center', ncol=len(handles), frameon=True, fontsize=10)
+            fig_leg.tight_layout(pad=0.1)
+            fig_leg.savefig(f"{fig_name}_traj_summary_legend.png", dpi=150, bbox_inches='tight')
+            if save_pdf:
+                fig_leg.savefig(f"{fig_name}_traj_summary_legend.pdf", bbox_inches='tight')
+            plt.close(fig_leg)
 
 
 def _plot_test_visualizations(
@@ -471,6 +587,8 @@ def _plot_test_visualizations(
     plot_batch_indices: Optional[List[int]] = None,
     batch_start_index: int = 0,
     global_index_naming: bool = False,
+    ens_color: str = 'tab:red',
+    ring_plot_history: bool = False,
 ):
     """Dispatch visualization strategy by state dimension.
 
@@ -503,6 +621,7 @@ def _plot_test_visualizations(
 
     if args.ori_dim <= 3:
         multi_bidx = len(plot_bidx_list) > 1 or global_index_naming
+        ring_point_color = "blue" if "blue" in str(ens_color).lower() else "red"
         for bidx in plot_bidx_list:
             ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
             true_traj = true_tensor[:, bidx, :].detach().cpu()
@@ -519,6 +638,9 @@ def _plot_test_visualizations(
                     obs_traj,
                     fig_name=fig_name_b,
                     step_offset=step_offset,
+                    plot_history=ring_plot_history,
+                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                    point_color=ring_point_color,
                 )
             else:
                 _plot_last_three_steps_lowdim_generic(
@@ -528,6 +650,8 @@ def _plot_test_visualizations(
                     fig_name=fig_name_b,
                     save_pdf=save_pdf,
                     step_offset=step_offset,
+                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                    ens_color=ens_color,
                 )
 
             _plot_lowdim_traj_summary(
@@ -536,6 +660,8 @@ def _plot_test_visualizations(
                 observations=obs_traj,
                 fig_name=fig_name_b,
                 save_pdf=save_pdf,
+                legend_in_figure=getattr(args, "legend_in_figure", False),
+                ens_color=ens_color,
             )
         return
 
@@ -559,6 +685,8 @@ def _plot_test_visualizations(
             save_name=fig_name_b + "_hist",
             hist_step=1,
             fontsize=None,
+            legend_in_figure=getattr(args, "legend_in_figure", False),
+            ensemble_color=ens_color,
         )
         plot_particle_trajectories(
             particles=ens_tensor[:, bidx, :, :],
@@ -574,6 +702,7 @@ def _plot_test_visualizations(
             colorbar_range=args.colorbar_range if hasattr(args, 'colorbar_range') else None,
             plot_vertical_colorbar=False,
             plot_horizontal_colorbar=True,
+            legend_in_figure=getattr(args, "legend_in_figure", False),
         )
 
 
@@ -1249,6 +1378,7 @@ def generate_and_cache_pf_results(
     - Plots TWO figures per selected batch index and time step when `save_figure=True`:
         (1) Prior (blue points) + black history trajectory + orange observation star
         (2) Posterior (red points) + black history trajectory + orange observation star
+      For ring datasets ('doubling1d', 'complex2d'), it also saves no-history counterparts.
 
     If calculate_crps is False, CRPS keys are omitted from the output.
 
@@ -1309,6 +1439,7 @@ def generate_and_cache_pf_results(
     batch_start_index = 0
     pf_ring_cdf_datasets = {"doubling1d", "complex2d"}
     pf_plot_ring_cdf = getattr(args, "dataset", None) in pf_ring_cdf_datasets
+    pf_plot_ring_dual_history = getattr(args, "dataset", None) in pf_ring_cdf_datasets
     if save_figure and can_plot_ring:
         print(f"[INFO] Using ring-mapped PF visualization for dataset='{args.dataset}' (ori_dim={args.ori_dim}).")
     if save_figure and (not can_plot_3d and not can_plot_ring):
@@ -1439,6 +1570,7 @@ def generate_and_cache_pf_results(
                                 num_repeats=1,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
+                                legend_in_figure=getattr(args, "legend_in_figure", False),
                             )
 
                             # POSTERIOR (red)
@@ -1454,6 +1586,7 @@ def generate_and_cache_pf_results(
                                 num_repeats=1,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
+                                legend_in_figure=getattr(args, "legend_in_figure", False),
                             )
                         elif can_plot_ring:
                             # Use full state for ring mapping (1D/2D).
@@ -1470,10 +1603,28 @@ def generate_and_cache_pf_results(
                                 prefix=prefix_prior,
                                 point_color="blue",
                                 observation=obs_x,
+                                true_state=true_state_ti1[bidx].detach().cpu(),
+                                plot_history=True,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
                                 plot_cdf=pf_plot_ring_cdf,
+                                legend_in_figure=getattr(args, "legend_in_figure", False),
                             )
+                            if pf_plot_ring_dual_history:
+                                plot_and_test_point_clouds_ring(
+                                    args,
+                                    prior_cloud_for_plot,
+                                    num_samples_plot=100000,
+                                    prefix=f"{prefix_prior}_nohist",
+                                    point_color="blue",
+                                    observation=obs_x,
+                                    true_state=true_state_ti1[bidx].detach().cpu(),
+                                    plot_history=False,
+                                    plot_indices=[0],
+                                    history_traj=hist_traj,
+                                    plot_cdf=pf_plot_ring_cdf,
+                                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                                )
 
                             prefix_post = f"{base_prefix}_g{gidx}_POST"
                             plot_and_test_point_clouds_ring(
@@ -1483,10 +1634,28 @@ def generate_and_cache_pf_results(
                                 prefix=prefix_post,
                                 point_color="red",
                                 observation=obs_x,
+                                true_state=true_state_ti1[bidx].detach().cpu(),
+                                plot_history=True,
                                 plot_indices=[0],
                                 history_traj=hist_traj,
                                 plot_cdf=pf_plot_ring_cdf,
+                                legend_in_figure=getattr(args, "legend_in_figure", False),
                             )
+                            if pf_plot_ring_dual_history:
+                                plot_and_test_point_clouds_ring(
+                                    args,
+                                    posterior_cloud_for_plot,
+                                    num_samples_plot=100000,
+                                    prefix=f"{prefix_post}_nohist",
+                                    point_color="red",
+                                    observation=obs_x,
+                                    true_state=true_state_ti1[bidx].detach().cpu(),
+                                    plot_history=False,
+                                    plot_indices=[0],
+                                    history_traj=hist_traj,
+                                    plot_cdf=pf_plot_ring_cdf,
+                                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                                )
 
             # --- Aggregate and Cache Batch Results ---
             all_pf_results_to_cache.append({
@@ -1629,6 +1798,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
+    plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -1650,6 +1820,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
             ens_list = [ens_v_a]
+            if plot_prior_enabled:
+                ens_f_list = [torch.full_like(ens_v_a, float('nan'))]  # no prior at t=0
             loc_records = []
             
             # Precompute noisy observations for all times (independent of active_mask)
@@ -1670,6 +1842,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 # Early bail: if no active trajectories remain, append a NaN step to keep time length and continue
                 if not active_mask.any():
                     ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if plot_prior_enabled:
+                        ens_f_list.append(torch.full_like(ens_v_a, float('nan')))
                     continue  # keep T length for plotting/metrics
 
                 # -------- Forecast step (not timed here) --------
@@ -1680,6 +1854,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 if nan_now.any():
                     active_mask = active_mask & (~nan_now)
                     ens_v_f[~active_mask] = torch.nan
+                if plot_prior_enabled:
+                    ens_f_list.append(ens_v_f)
 
                 # Active indices
                 idx_active = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
@@ -1774,6 +1950,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
             # Stack ensembles over time: [T, B, N, d]
             ens_tensor = torch.stack(ens_list)
+            ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
             
             # Metrics (RMV removed; NaNs are handled later by masks)
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
@@ -1844,7 +2021,25 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                         plot_batch_indices=local_plot_indices,
                         batch_start_index=batch_start_index,
                         global_index_naming=True,
+                        ens_color='tab:red',
+                        ring_plot_history=False,
                     )
+                    if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                        _plot_test_visualizations(
+                            args=args,
+                            ens_tensor=ens_prior_tensor[1:],
+                            true_tensor=batch_v[1:],
+                            comparison_tensor=batch_v[1:],
+                            observations=observations[1:],
+                            fig_name=fig_name + "_prior",
+                            save_pdf=save_pdf,
+                            step_offset=1,
+                            plot_batch_indices=local_plot_indices,
+                            batch_start_index=batch_start_index,
+                            global_index_naming=True,
+                            ens_color='tab:blue',
+                            ring_plot_history=False,
+                        )
             batch_start_index += B
     
     if plot_figures and plot_mode == "adaptive":
@@ -1873,7 +2068,22 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             fig_name=fig_name,
             save_pdf=save_pdf,
             step_offset=step_offset,
+            ens_color='tab:red',
+            ring_plot_history=False,
         )
+        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+            _plot_test_visualizations(
+                args=args,
+                ens_tensor=ens_prior_tensor[1:],
+                true_tensor=batch_v[1:],
+                comparison_tensor=batch_v[1:],
+                observations=observations[1:],
+                fig_name=fig_name + "_prior",
+                save_pdf=save_pdf,
+                step_offset=1,
+                ens_color='tab:blue',
+                ring_plot_history=False,
+            )
     elif plot_figures and len(unresolved_global_indices) > 0:
         unresolved_sorted = sorted(list(unresolved_global_indices))
         print(
@@ -2074,6 +2284,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
+    plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -2095,6 +2306,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 ens_v_a[~active_mask] = torch.nan
 
             ens_list = [ens_v_a]
+            if plot_prior_enabled:
+                ens_f_list = [torch.full_like(ens_v_a, float('nan'))]  # no prior at t=0
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
 
             # Precompute noisy observations y_t for all t (shape aligned to H_fun outputs)
@@ -2115,6 +2328,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 # Early exit if no active trajectories remain
                 if not active_mask.any():
                     ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if plot_prior_enabled:
+                        ens_f_list.append(torch.full_like(ens_v_a, float('nan')))
                     # Record a zero-duration placeholder for clarity? No: skip to avoid bias
                     continue
 
@@ -2134,6 +2349,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 if nan_now.any():
                     active_mask = active_mask & (~nan_now)
                     ens_v_f[~active_mask] = torch.nan
+                if plot_prior_enabled:
+                    ens_f_list.append(ens_v_f)
 
                 # Shapes
                 B_shape, N_ens, D_state = ens_v_f.shape
@@ -2266,6 +2483,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
             # Stack ensembles over time: [T, B, N, d]
             ens_tensor = torch.stack(ens_list)
+            ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
 
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
@@ -2321,7 +2539,25 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                         plot_batch_indices=local_plot_indices,
                         batch_start_index=batch_start_index,
                         global_index_naming=True,
+                        ens_color='tab:red',
+                        ring_plot_history=False,
                     )
+                    if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                        _plot_test_visualizations(
+                            args=args,
+                            ens_tensor=ens_prior_tensor[1:],
+                            true_tensor=batch_v[1:],
+                            comparison_tensor=batch_v[1:],
+                            observations=observations[1:],
+                            fig_name=fig_name + "_classic_prior",
+                            save_pdf=save_pdf,
+                            step_offset=1,
+                            plot_batch_indices=local_plot_indices,
+                            batch_start_index=batch_start_index,
+                            global_index_naming=True,
+                            ens_color='tab:blue',
+                            ring_plot_history=False,
+                        )
             batch_start_index += B
 
     if plot_figures and plot_mode == "adaptive":
@@ -2348,7 +2584,22 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             fig_name=fig_name + "_classic",
             save_pdf=save_pdf,
             step_offset=step_offset,
+            ens_color='tab:red',
+            ring_plot_history=False,
         )
+        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+            _plot_test_visualizations(
+                args=args,
+                ens_tensor=ens_prior_tensor[1:],
+                true_tensor=batch_v[1:],
+                comparison_tensor=batch_v[1:],
+                observations=observations[1:],
+                fig_name=fig_name + "_classic_prior",
+                save_pdf=save_pdf,
+                step_offset=1,
+                ens_color='tab:blue',
+                ring_plot_history=False,
+            )
     elif plot_figures and len(unresolved_global_indices) > 0:
         unresolved_sorted = sorted(list(unresolved_global_indices))
         print(
@@ -2790,7 +3041,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                                                     save_pdf=save_pdf,
                                                     save_name=fig_name + "_hist",
                                                     hist_step=1,
-                                                    fontsize=None)
+                                                    fontsize=None,
+                                                    legend_in_figure=getattr(args, "legend_in_figure", False))
 
     # --- Final Metrics Calculation ---
     final_metrics = {}

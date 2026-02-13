@@ -366,6 +366,9 @@ def get_parameters():
     parser.add_argument('--pf_save_figure', action='store_true', help='save_pf_visualization')
     parser.add_argument('--save_test_figures', action='store_true',
                         help='save visualization figures during test/evaluation')
+    parser.add_argument('--legend_in_figure', action='store_true',
+                        help='Keep legend/title/x-y labels inside each figure. '
+                             'If not set, figures omit them and save standalone legends.')
     parser.add_argument('--test_plot_index', type=parse_test_plot_index, default='0',
                         help="Global trajectory index selection for test/PF plotting: e.g. '0', '0,1', or 'adaptive'.")
     parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,

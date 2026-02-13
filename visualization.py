@@ -13,6 +13,69 @@ import os
 
 from argparse import Namespace 
 
+
+def _save_horizontal_legend_image(
+    prefix: str,
+    handles: List,
+    labels: List[str],
+    save_pdf: bool = False,
+    dpi: int = 200,
+    fontsize: int = 11,
+    frameon: bool = True,
+    scale: float = 1.45,
+) -> None:
+    """Save a standalone horizontal legend image "<prefix>_legend.(png|pdf)"."""
+    dedup_handles: List = []
+    dedup_labels: List[str] = []
+    seen = set()
+    for handle, label in zip(handles, labels):
+        if not label or label in seen:
+            continue
+        dedup_handles.append(handle)
+        dedup_labels.append(label)
+        seen.add(label)
+
+    if len(dedup_handles) == 0:
+        return
+
+    scale = float(max(scale, 0.5))
+    ncols = len(dedup_handles)
+    fig_w = max(4.5 * scale, 2.2 * ncols * scale)
+    fig_h = 1.35 * scale
+    scaled_fontsize = max(1, int(round(float(fontsize) * scale)))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    ax = fig.add_subplot(111)
+    ax.axis('off')
+    legend = ax.legend(
+        dedup_handles,
+        dedup_labels,
+        loc='center',
+        ncol=ncols,
+        fontsize=scaled_fontsize,
+        markerscale=scale,
+        handlelength=2.0 * scale,
+        handleheight=0.8 * scale,
+        borderpad=0.35 * scale,
+        columnspacing=1.2 * scale,
+        handletextpad=0.7 * scale,
+        labelspacing=0.4 * scale,
+        frameon=frameon,
+    )
+    legend_handle_list = getattr(legend, "legend_handles", None)
+    if legend_handle_list is None:
+        legend_handle_list = getattr(legend, "legendHandles", [])
+    for handle in legend_handle_list:
+        if isinstance(handle, Line2D):
+            handle.set_linewidth(max(1.0, handle.get_linewidth() * scale))
+            if handle.get_markersize() > 0:
+                handle.set_markersize(handle.get_markersize() * scale)
+
+    fig.tight_layout(pad=0.1)
+    fig.savefig(f"{prefix}_legend.png", dpi=dpi, bbox_inches='tight')
+    if save_pdf:
+        fig.savefig(f"{prefix}_legend.pdf", bbox_inches='tight')
+    plt.close(fig)
+
 def plot_particle_trajectories_with_histograms(
     particles: torch.Tensor,
     true_traj: torch.Tensor,
@@ -26,7 +89,9 @@ def plot_particle_trajectories_with_histograms(
     save_name: str = 'example_fig',
     hist_step: int = 1,
     fontsize: Optional[int] = 20,
-    figsize: Tuple[float, float] = (14, 4)
+    figsize: Tuple[float, float] = (14, 4),
+    legend_in_figure: bool = True,
+    ensemble_color: str = 'red',
 ):
     """
     Plots particle trajectories along specified dimensions with overlaid histograms
@@ -63,9 +128,15 @@ def plot_particle_trajectories_with_histograms(
             main plots (legend is unaffected). Defaults to 20.
         figsize (Tuple[float, float], optional): The size of the figure (width, height)
             in inches. Defaults to (13, 5).
+        legend_in_figure (bool, optional): Whether to keep the original in-figure
+            annotation style. If False, hides axis labels while keeping ticks and
+            uses standalone legend output.
     """
 
     J_p, N, d_p = particles.shape
+    ensemble_color = str(ensemble_color or 'red')
+    ensemble_color_lower = ensemble_color.lower()
+    spread_cmap_name = 'Blues' if 'blue' in ensemble_color_lower else 'Reds'
     J_t, d_t = true_traj.shape
     if observation is not None:
         J_o, d_o = observation.shape
@@ -141,7 +212,7 @@ def plot_particle_trajectories_with_histograms(
         if N > 0:
             particle_mean_slice = particles_cpu[plot_start_time:plot_end_time, :, dim_idx].mean(dim=1)
             line_mean, = ax.plot(time_steps_for_plot_np, particle_mean_slice.numpy(),
-                                 label='Ensemble Mean', color='red', linestyle='--', linewidth=1.5)
+                                 label='Ensemble Mean', color=ensemble_color, linestyle='--', linewidth=1.5)
             if 'Ensemble Mean' not in labels:
                 handles.append(line_mean)
                 labels.append('Ensemble Mean')
@@ -159,12 +230,12 @@ def plot_particle_trajectories_with_histograms(
                 ax.fill_between(time_steps_for_plot_np, 
                                lower_bound.numpy(), 
                                upper_bound.numpy(),
-                               alpha=0.3, color='red', 
+                               alpha=0.3, color=ensemble_color, 
                                label='Mean ± 1 STD')
                 
                 if 'Mean ± 1 STD' not in labels:
-                    red_fill_handle = mpatches.Patch(facecolor='red', alpha=0.3, edgecolor='red')
-                    handles.append(red_fill_handle)
+                    fill_handle = mpatches.Patch(facecolor=ensemble_color, alpha=0.3, edgecolor=ensemble_color)
+                    handles.append(fill_handle)
                     labels.append('Mean ± 1 STD')
                     
             elif mode == 'quantile':
@@ -183,12 +254,12 @@ def plot_particle_trajectories_with_histograms(
                 ax.fill_between(time_steps_for_plot_np, 
                                lower_bound.numpy(), 
                                upper_bound.numpy(),
-                               alpha=0.3, color='red', 
+                               alpha=0.3, color=ensemble_color, 
                                label='95% Confidence Interval')
                 
                 if '95% Confidence Interval' not in labels:
-                    red_fill_handle = mpatches.Patch(facecolor='red', alpha=0.3, edgecolor='red')
-                    handles.append(red_fill_handle)
+                    fill_handle = mpatches.Patch(facecolor=ensemble_color, alpha=0.3, edgecolor=ensemble_color)
+                    handles.append(fill_handle)
                     labels.append('95% Confidence Interval')
                     
             elif mode in ['width', 'color']:
@@ -232,15 +303,15 @@ def plot_particle_trajectories_with_histograms(
                         ax.fill_betweenx(bin_centers_torch.numpy(),
                                          (t_actual - hist_norm_torch).numpy(),
                                          (t_actual + hist_norm_torch).numpy(),
-                                         facecolor='orange', edgecolor='none', alpha=0.5,
+                                         facecolor=ensemble_color, edgecolor='none', alpha=0.5,
                                          label=current_label_for_spread)
                         if current_label_for_spread and 'Ensemble Spread' not in labels:
-                            handles.append(plt.Rectangle((0, 0), 1, 1, fc='orange', alpha=0.5))
+                            handles.append(plt.Rectangle((0, 0), 1, 1, fc=ensemble_color, alpha=0.5))
                             labels.append('Ensemble Spread')
                             ensemble_spread_labeled = True
 
                     elif mode == 'color':
-                        cmap = plt.colormaps.get_cmap('Oranges')
+                        cmap = plt.colormaps.get_cmap(spread_cmap_name)
                         bin_widths = bins[1:] - bins[:-1]
                         current_bin_masses = hist * bin_widths
                         norm_vals_torch = current_bin_masses / global_max_mass
@@ -259,7 +330,7 @@ def plot_particle_trajectories_with_histograms(
                                 labels.append('Ensemble Spread')
                                 ensemble_spread_labeled = True
 
-        if fontsize is not None:
+        if legend_in_figure and fontsize is not None:
             ax.set_xlabel('Time Step', fontsize=fontsize)
             ax.set_ylabel(f'Dimension {dim_idx} Values', fontsize=fontsize)
             ax.yaxis.set_label_position("left")
@@ -269,12 +340,13 @@ def plot_particle_trajectories_with_histograms(
             ax.grid(True, linestyle='--', alpha=0.7)
         else:
             ax.grid(True)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            ax.spines['bottom'].set_visible(True)
-            ax.spines['left'].set_visible(True)
+            if legend_in_figure:
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['bottom'].set_visible(True)
+                ax.spines['left'].set_visible(True)
 
         if plot_end_time > plot_start_time :
             ax.set_xlim(plot_start_time - 0.5, plot_end_time - 0.5)
@@ -314,32 +386,44 @@ def plot_particle_trajectories_with_histograms(
             elif label == 'Observation':
                 legend_handles.append(plt.Line2D([0], [0], marker='*', color='green', markersize=8, linestyle=''))
             elif label == 'Ensemble Mean':
-                legend_handles.append(plt.Line2D([0], [0], color='red', linestyle='--', linewidth=1.5))
+                legend_handles.append(plt.Line2D([0], [0], color=ensemble_color, linestyle='--', linewidth=1.5))
             elif label == 'Mean ± 1 STD':
-                legend_handles.append(mpatches.Patch(facecolor='red', alpha=0.3, edgecolor='red'))
+                legend_handles.append(mpatches.Patch(facecolor=ensemble_color, alpha=0.3, edgecolor=ensemble_color))
             elif label == '95% Confidence Interval':
-                legend_handles.append(mpatches.Patch(facecolor='red', alpha=0.3, edgecolor='red'))
+                legend_handles.append(mpatches.Patch(facecolor=ensemble_color, alpha=0.3, edgecolor=ensemble_color))
             elif label == 'Ensemble Spread':
                 if mode == 'width':
-                    legend_handles.append(plt.Rectangle((0, 0), 1, 1, fc='orange', alpha=0.5))
+                    legend_handles.append(plt.Rectangle((0, 0), 1, 1, fc=ensemble_color, alpha=0.5))
                 elif mode == 'color':
-                    cmap = plt.colormaps.get_cmap('Oranges')
+                    cmap = plt.colormaps.get_cmap(spread_cmap_name)
                     legend_handles.append(plt.Rectangle((0, 0), 1, 1, fc=cmap(0.5), alpha=0.7))
 
         if legend_handles:
-            fig_legend = plt.figure(figsize=(figsize[0], 0.5)) # Narrow height
-            ax_legend = fig_legend.add_subplot(111)
-            ax_legend.axis('off')
-            legend = ax_legend.legend(legend_handles, legend_labels, loc='center', ncol=len(legend_handles), fontsize=24, frameon=False)
-            fig_legend.tight_layout(pad=0.1) # Remove extra padding
-
             if save_fig:
-                plt.savefig(f"{save_name}_legend.png", dpi=150, bbox_inches='tight')
-                if save_pdf:
-                    plt.savefig(f"{save_name}_legend.pdf", bbox_inches='tight')
+                _save_horizontal_legend_image(
+                    prefix=save_name,
+                    handles=legend_handles,
+                    labels=legend_labels,
+                    save_pdf=save_pdf,
+                    dpi=150,
+                    fontsize=24,
+                    frameon=False,
+                )
             else:
+                fig_legend = plt.figure(figsize=(figsize[0], 0.5))
+                ax_legend = fig_legend.add_subplot(111)
+                ax_legend.axis('off')
+                ax_legend.legend(
+                    legend_handles,
+                    legend_labels,
+                    loc='center',
+                    ncol=len(legend_handles),
+                    fontsize=24,
+                    frameon=False,
+                )
+                fig_legend.tight_layout(pad=0.1)
                 plt.show()
-            plt.close(fig_legend)
+                plt.close(fig_legend)
         
         
 
@@ -357,7 +441,8 @@ def plot_particle_trajectories(
     colorbar_range: Optional[Tuple[float, float]] = None,
     colorbar_center: float = 0.0,
     plot_vertical_colorbar: bool = True,
-    plot_horizontal_colorbar: bool = False
+    plot_horizontal_colorbar: bool = False,
+    legend_in_figure: bool = True,
 ):
     """
     Visualizes particle trajectories, a true trajectory, an observation, their difference, and particle spread.
@@ -684,17 +769,13 @@ def plot_particle_trajectories(
 #     print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")
 
 def _save_separate_legend(prefix: str, include_obs: bool = False, dpi: int = 200) -> None:
-    """Create and save a standalone legend image with adaptive layout/figsize.
+    """Create and save a standalone horizontal legend image.
 
     Args:
         prefix (str): File prefix for the saved legend image "<prefix>_legend.png".
-        include_obs (bool): If True, include the Observation legend entry and layout as 2 rows.
-                            If False, omit Observation and layout as a single row.
+        include_obs (bool): If True, include the Observation legend entry.
         dpi (int): Dots per inch for the saved PNG.
     """
-    from matplotlib.lines import Line2D
-    import matplotlib.pyplot as plt
-
     # Proxy artists for legend entries
     handle_prior = Line2D([0], [0], marker='o', linestyle='None',
                           markerfacecolor='blue', markeredgecolor='none', markersize=8,
@@ -708,37 +789,22 @@ def _save_separate_legend(prefix: str, include_obs: bool = False, dpi: int = 200
     handle_traj = Line2D([0], [0], linestyle='-', color='black', linewidth=2,
                          label='History trajectory')
 
-    # Assemble handles/labels based on whether observation is included
+    # Assemble handles/labels based on whether observation is included.
     if include_obs:
         handles = [handle_prior, handle_posterior, handle_obs, handle_traj]
-        ncols = 2
-        nrows = 2  # 4 items → 2x2 grid for good balance and readability
     else:
         handles = [handle_prior, handle_posterior, handle_traj]
-        ncols = 3
-        nrows = 1  # 3 items → single row
 
     labels = [h.get_label() for h in handles]
-
-    # --- Adaptive figsize heuristic ---
-    # Width scales with column count; height scales with row count.
-    # Use slightly larger per-column width to accommodate longer labels.
-    per_col_w = 3.2   # inches per column
-    per_row_h = 1.35  # inches per row
-    pad_w = 0.3
-    pad_h = 0.2
-    fig_w = max(4.5, ncols * per_col_w + pad_w)
-    fig_h = max(1.2, nrows * per_row_h + pad_h)
-
-    fig = plt.figure(figsize=(fig_w, fig_h))
-    ax = fig.add_subplot(111)
-    ax.axis('off')
-
-    # Centered legend; frame on for standalone readability
-    ax.legend(handles, labels, ncol=ncols, loc='center', frameon=True)
-
-    fig.savefig(f"{prefix}_legend.png", dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+    _save_horizontal_legend_image(
+        prefix=prefix,
+        handles=handles,
+        labels=labels,
+        save_pdf=False,
+        dpi=dpi,
+        fontsize=11,
+        frameon=True,
+    )
 
 def plot_and_test_point_clouds(
     args: Namespace,
@@ -751,6 +817,7 @@ def plot_and_test_point_clouds(
     num_repeats: int = 10,
     plot_indices: Optional[List[int]] = None,
     history_traj: Optional[torch.Tensor] = None,
+    legend_in_figure: bool = True,
 ):
     """
     Plots point clouds and optional trajectories, tests for Gaussianity (HZ),
@@ -767,6 +834,7 @@ def plot_and_test_point_clouds(
         num_repeats (int): Repeated HZ tests for stability.
         plot_indices (Optional[List[int]]): Which batch items to plot; default all.
         history_traj (Optional[torch.Tensor]): (T, B, 3+) historical trajectory.
+        legend_in_figure (bool): If False, remove figure title and axis labels.
 
     Behavior changes:
         - Trajectory is plotted in BLACK (instead of red).
@@ -853,8 +921,9 @@ def plot_and_test_point_clouds(
             ax_adaptive.scatter(obs_np[0], obs_np[1], obs_np[2],
                                 marker='*', s=140, c='orange', edgecolors='black', linewidth=0.6, zorder=10)
 
-        ax_adaptive.set_xlabel("X-axis"); ax_adaptive.set_ylabel("Y-axis"); ax_adaptive.set_zlabel("Z-axis")
-        ax_adaptive.set_title(adaptive_title, fontsize=12)
+        if legend_in_figure:
+            ax_adaptive.set_xlabel("X-axis"); ax_adaptive.set_ylabel("Y-axis"); ax_adaptive.set_zlabel("Z-axis")
+            ax_adaptive.set_title(adaptive_title, fontsize=12)
         fig_adaptive.savefig(f"{prefix}_{i}_adaptive.png", bbox_inches='tight', dpi=150)
         plt.close(fig_adaptive)
 
@@ -893,8 +962,9 @@ def plot_and_test_point_clouds(
                 ax_fixed.scatter(obs_np[0], obs_np[1], obs_np[2],
                                  marker='*', s=140, c='orange', edgecolors='black', linewidth=0.6, zorder=10)
 
-            ax_fixed.set_xlabel("X-axis"); ax_fixed.set_ylabel("Y-axis"); ax_fixed.set_zlabel("Z-axis")
-            ax_fixed.set_title(fixed_title, fontsize=12)
+            if legend_in_figure:
+                ax_fixed.set_xlabel("X-axis"); ax_fixed.set_ylabel("Y-axis"); ax_fixed.set_zlabel("Z-axis")
+                ax_fixed.set_title(fixed_title, fontsize=12)
             ax_fixed.set_xlim(_limits['xlim']); ax_fixed.set_ylim(_limits['ylim']); ax_fixed.set_zlim(_limits['zlim'])
             fig_fixed.savefig(f"{prefix}_{i}_fixed.png", bbox_inches='tight', dpi=150)
             plt.close(fig_fixed)
@@ -1015,6 +1085,171 @@ def _smooth_histogram_pdf(pdf_vals: np.ndarray, bin_width: float, window_size: i
     return smoothed
 
 
+def _estimate_phase_pdf_curve_01(phase01: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate PDF curve on circular support [0, 1).
+    """
+    n_phase = int(phase01.size)
+    if n_phase < 500:
+        phase_grid = np.linspace(0.0, 1.0, 1000)
+        kde_std = _adaptive_kde_std(n_phase, base_std=0.01)
+        pdf_vals = _wrapped_kde_pdf_01(phase01, phase_grid, kde_std)
+    else:
+        n_bins = int(np.round(10.0 * float(n_phase) / 500.0))
+        n_bins = int(np.clip(n_bins, 10, 2000))
+        hist, edges = np.histogram(phase01, bins=n_bins, range=(0.0, 1.0), density=True)
+        phase_grid = 0.5 * (edges[:-1] + edges[1:])
+        pdf_vals = _smooth_histogram_pdf(
+            hist,
+            bin_width=(edges[1] - edges[0]) if edges.size >= 2 else 1.0,
+            window_size=9,
+        )
+
+    pdf_vals = np.nan_to_num(pdf_vals, nan=0.0, posinf=0.0, neginf=0.0)
+    return phase_grid, pdf_vals
+
+
+def _draw_ring_pdf_fill(
+    ax: plt.Axes,
+    phase_grid: np.ndarray,
+    pdf_vals: np.ndarray,
+    fill_color: str,
+    alpha: float = 0.22,
+    label: str = "Phase density",
+) -> float:
+    """
+    Draw ring PDF as a filled band between unit circle and outer PDF radius.
+    Returns the max outer radius.
+    """
+    if phase_grid.size == 0 or pdf_vals.size == 0:
+        return 1.0
+
+    theta_curve = 2.0 * np.pi * np.mod(phase_grid, 1.0)
+    pdf_safe = np.nan_to_num(pdf_vals, nan=0.0, posinf=0.0, neginf=0.0)
+    pdf_safe = np.maximum(pdf_safe, 0.0)
+    radius_outer = np.sqrt(1.0 + pdf_safe / np.pi)
+
+    theta_wrap = np.concatenate([theta_curve, np.array([theta_curve[0] + 2.0 * np.pi])])
+    outer_wrap = np.concatenate([radius_outer, np.array([radius_outer[0]])])
+    x_outer = outer_wrap * np.cos(theta_wrap)
+    y_outer = outer_wrap * np.sin(theta_wrap)
+    x_inner = np.cos(theta_wrap)
+    y_inner = np.sin(theta_wrap)
+
+    poly_x = np.concatenate([x_outer, x_inner[::-1]])
+    poly_y = np.concatenate([y_outer, y_inner[::-1]])
+    ax.fill(poly_x, poly_y, color=fill_color, alpha=alpha, edgecolor='none', linewidth=0.0, label=label)
+
+    return float(np.max(radius_outer))
+
+
+def _save_ring_pdf_on_ring(
+    args: Namespace,
+    prefix: str,
+    cloud_idx: int,
+    point_color: str,
+    phase01: np.ndarray,
+    phase_grid: np.ndarray,
+    pdf_vals: np.ndarray,
+    plot_history: bool,
+    history_traj: Optional[torch.Tensor],
+    obs_x: Optional[float],
+    true_xy: Optional[np.ndarray],
+    legend_in_figure: bool = True,
+) -> List[str]:
+    """
+    Save phase PDF mapped onto a ring (angle in [0, 2*pi], positive density outward).
+    """
+    n_phase = int(phase01.size)
+    fig, ax = plt.subplots(figsize=(7, 7))
+    legend_labels_used: List[str] = []
+    point_color_norm = str(point_color).lower().strip()
+    if point_color_norm == "blue":
+        density_label = "predictive density"
+    elif point_color_norm == "red":
+        density_label = "filtering density"
+    else:
+        density_label = "phase density"
+
+    def _add_label(label: str) -> None:
+        if label not in legend_labels_used:
+            legend_labels_used.append(label)
+
+    phi = np.linspace(0.0, 2.0 * np.pi, 400)
+    ax.plot(np.cos(phi), np.sin(phi), color='gray', linewidth=1.0, alpha=0.8, label='Unit circle')
+    _add_label('Unit circle')
+
+    _draw_ring_pdf_fill(
+        ax=ax,
+        phase_grid=phase_grid,
+        pdf_vals=pdf_vals,
+        fill_color=point_color,
+        alpha=0.22,
+        label=density_label,
+    )
+    _add_label(density_label)
+
+    history_used = False
+    if n_phase < 500 and phase01.size > 0:
+        theta_samples = 2.0 * np.pi * np.mod(phase01, 1.0)
+        ax.scatter(
+            np.cos(theta_samples),
+            np.sin(theta_samples),
+            s=50,
+            alpha=0.55,
+            c=point_color,
+            edgecolors='none',
+            label='Samples',
+        )
+        _add_label('Samples')
+
+        if plot_history and history_traj is not None:
+            traj = history_traj[:, cloud_idx, :]
+            traj_xy = _map_state_to_ring_xy(traj).detach().cpu().numpy()
+            ax.plot(
+                traj_xy[:, 0],
+                traj_xy[:, 1],
+                color='black',
+                linewidth=1.5,
+                label='History trajectory',
+            )
+            history_used = True
+            _add_label('History trajectory')
+
+    if obs_x is not None:
+        obs_x_clip = float(np.clip(obs_x, -1.2, 1.2))
+        ax.axvline(obs_x_clip, color='orange', linestyle='--', linewidth=2.0, alpha=0.7, label='Observation')
+        _add_label('Observation')
+
+    if true_xy is not None:
+        ax.scatter(
+            true_xy[0],
+            true_xy[1],
+            marker='*',
+            s=220,
+            c='orange',
+            edgecolors='black',
+            linewidth=0.6,
+            zorder=11,
+            label='True state',
+        )
+        _add_label('True state')
+
+    mode_tag = "hist" if history_used else "nohist"
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim(-2.0, 2.0)
+    ax.set_ylim(-2.0, 2.0)
+    if legend_in_figure:
+        ax.set_xlabel("ring-x")
+        ax.set_ylabel("ring-y")
+        ax.set_title(f"{args.dataset} phase PDF on ring, cloud {cloud_idx} ({mode_tag})")
+        ax.legend(loc='upper right', fontsize=9, frameon=True)
+
+    fig.savefig(f"{prefix}_{cloud_idx}_ring_pdf_on_ring_{mode_tag}.png", bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    return legend_labels_used
+
+
 def plot_and_test_point_clouds_ring(
     args: Namespace,
     tensor: torch.Tensor,
@@ -1027,14 +1262,15 @@ def plot_and_test_point_clouds_ring(
     plot_indices: Optional[List[int]] = None,
     history_traj: Optional[torch.Tensor] = None,
     plot_cdf: bool = True,
+    legend_in_figure: bool = True,
 ):
     """
     Visualize 1D/2D point clouds on a unit circle using 2D density estimation.
 
     - For 1D: state x is mapped by theta=2*pi*x.
     - For 2D: state (u,v) is mapped by theta=atan2(v,u).
-    - Observation is interpreted as circle x-coordinate and plotted at (obs_x, 0).
-    - True state is mapped to ring and plotted with a black "x" marker if provided.
+    - Observation is interpreted as circle x-coordinate and shown as a vertical line.
+    - True state is mapped to ring and plotted with an orange star marker if provided.
     - History trajectory is optional and controlled by `plot_history`.
     - If plotted ensemble size < 1000, draw all points directly (scatter).
       Otherwise use 2D hexbin density.
@@ -1046,6 +1282,9 @@ def plot_and_test_point_clouds_ring(
       * N >= 500: histogram-based PDF with adaptive bins:
         bins = min(2000, round(10 * N / 500)), so N=500 -> 10.
         Then applies moving-average smoothing.
+      * For all N, also saves a "PDF on ring" view:
+        map [0,1) -> [0,2*pi], and draw positive density outward.
+        History is shown only when N < 500 and `plot_history=True`.
     """
     if tensor.is_cuda:
         tensor = tensor.cpu()
@@ -1076,6 +1315,12 @@ def plot_and_test_point_clouds_ring(
     point_color = (point_color or "").lower().strip()
     if point_color not in {"red", "blue"}:
         point_color = "blue"
+    if point_color == "blue":
+        density_label = "predictive density"
+    elif point_color == "red":
+        density_label = "filtering density"
+    else:
+        density_label = "phase density"
 
     if plot_indices is None:
         indices_to_process = list(range(B))
@@ -1094,8 +1339,39 @@ def plot_and_test_point_clouds_ring(
             if obs_np.size > 0:
                 obs_x = float(obs_np[0])
 
+    legend_labels_used: List[str] = []
+
+    def _add_label(label: str) -> None:
+        if label not in legend_labels_used:
+            legend_labels_used.append(label)
+
     for i in indices_to_process:
         full_points = tensor[i, :, :]  # (N, D)
+        phase01 = np.array([])
+        phase_grid = np.array([])
+        pdf_vals = np.array([])
+        if plot_cdf:
+            phase01 = _map_state_to_ring_phase01(full_points).detach().cpu().numpy()
+            phase01 = phase01[np.isfinite(phase01)]
+            if phase01.size > 0:
+                phase_grid, pdf_vals = _estimate_phase_pdf_curve_01(phase01)
+
+        true_xy = None
+        if true_state is not None:
+            if isinstance(true_state, torch.Tensor):
+                ts = true_state.detach().cpu()
+            else:
+                ts = torch.as_tensor(true_state)
+
+            if ts.ndim == 1:
+                if ts.numel() >= D:
+                    true_xy = _map_state_to_ring_xy(ts[:D].reshape(1, D)).numpy()[0]
+            elif ts.ndim == 2:
+                if ts.shape[0] == B and ts.shape[1] >= D:
+                    true_xy = _map_state_to_ring_xy(ts[i, :D].reshape(1, D)).numpy()[0]
+                elif ts.shape[1] >= D:
+                    true_xy = _map_state_to_ring_xy(ts[0, :D].reshape(1, D)).numpy()[0]
+
         n_to_plot = min(N, num_samples_plot)
         density_threshold = 1000
         if n_to_plot < density_threshold:
@@ -1110,6 +1386,7 @@ def plot_and_test_point_clouds_ring(
         # Unit circle reference
         phi = np.linspace(0.0, 2.0 * np.pi, 400)
         ax.plot(np.cos(phi), np.sin(phi), color='gray', linewidth=1.0, alpha=0.8, label='Unit circle')
+        _add_label('Unit circle')
 
         if xy_plot.shape[0] < density_threshold:
             # Small ensembles: plot all points directly.
@@ -1117,13 +1394,14 @@ def plot_and_test_point_clouds_ring(
                 xy_plot[:, 0], xy_plot[:, 1],
                 s=50, alpha=0.55, c=point_color, edgecolors='none', label='Ensemble'
             )
+            _add_label('Ensemble')
         else:
             # Large ensembles: density view is clearer.
             cmap = 'Reds' if point_color == 'red' else 'Blues'
             hb = ax.hexbin(
                 xy_plot[:, 0], xy_plot[:, 1],
                 gridsize=60,
-                extent=(-1.25, 1.25, -1.25, 1.25),
+                extent=(-2.0, 2.0, -2.0, 2.0),
                 mincnt=1,
                 bins='log',
                 cmap=cmap,
@@ -1131,7 +1409,9 @@ def plot_and_test_point_clouds_ring(
                 alpha=0.95,
             )
             cbar = fig.colorbar(hb, ax=ax, shrink=0.82, pad=0.02)
-            cbar.set_label("log10(count)")
+            if legend_in_figure:
+                cbar.set_label("log10(count)")
+            _add_label('Ensemble density')
 
             # Optional sparse overlay to show geometry without overplotting.
             n_overlay = min(1500, xy_plot.shape[0])
@@ -1142,102 +1422,195 @@ def plot_and_test_point_clouds_ring(
                     s=2, alpha=0.12, c=point_color, edgecolors='none'
                 )
 
+        # Overlay phase PDF as a filled ring band (for both scatter and density modes).
+        if phase01.size > 0 and phase_grid.size > 0 and pdf_vals.size > 0:
+            _draw_ring_pdf_fill(
+                ax=ax,
+                phase_grid=phase_grid,
+                pdf_vals=pdf_vals,
+                fill_color=point_color,
+                alpha=0.22,
+                label=density_label,
+            )
+            _add_label(density_label)
+
         # History trajectory (mapped to ring)
         if plot_history and history_traj is not None:
             traj = history_traj[:, i, :]  # (T, D)
             traj_xy = _map_state_to_ring_xy(traj).numpy()
             ax.plot(traj_xy[:, 0], traj_xy[:, 1], color='black', linewidth=1.5, label='History trajectory')
+            _add_label('History trajectory')
 
-        # Observation as circle x-coordinate
+        # Observation as vertical line on the ring-x axis.
         if obs_x is not None:
             obs_x_clip = float(np.clip(obs_x, -1.2, 1.2))
-            ax.scatter(obs_x_clip, 0.0, marker='*', s=160, c='orange', edgecolors='black',
-                       linewidth=0.6, zorder=10, label='Observation x-coordinate')
-            ax.axvline(obs_x_clip, color='orange', linestyle='--', linewidth=1.0, alpha=0.7)
+            ax.axvline(obs_x_clip, color='orange', linestyle='--', linewidth=2.0, alpha=0.7, label='Observation')
+            _add_label('Observation')
 
-        # True state mapped to ring (if provided)
-        if true_state is not None:
-            if isinstance(true_state, torch.Tensor):
-                ts = true_state.detach().cpu()
-            else:
-                ts = torch.as_tensor(true_state)
-
-            true_xy = None
-            if ts.ndim == 1:
-                if ts.numel() >= D:
-                    true_xy = _map_state_to_ring_xy(ts[:D].reshape(1, D)).numpy()[0]
-            elif ts.ndim == 2:
-                if ts.shape[0] == B and ts.shape[1] >= D:
-                    true_xy = _map_state_to_ring_xy(ts[i, :D].reshape(1, D)).numpy()[0]
-                elif ts.shape[1] >= D:
-                    true_xy = _map_state_to_ring_xy(ts[0, :D].reshape(1, D)).numpy()[0]
-
-            if true_xy is not None:
-                ax.scatter(
-                    true_xy[0], true_xy[1],
-                    marker='x', s=90, c='black', linewidth=1.8, zorder=11, label='True state'
-                )
+        # True state mapped to ring (orange star).
+        if true_xy is not None:
+            ax.scatter(
+                true_xy[0], true_xy[1],
+                marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11, label='True state'
+            )
+            _add_label('True state')
 
         ax.set_aspect('equal', adjustable='box')
-        ax.set_xlim(-1.25, 1.25)
-        ax.set_ylim(-1.25, 1.25)
-        ax.set_xlabel("ring-x")
-        ax.set_ylabel("ring-y")
-        mode_str = "scatter" if xy_plot.shape[0] < density_threshold else "hexbin density"
-        ax.set_title(f"{args.dataset} (ring map, {mode_str}), cloud {i}")
-        ax.legend(loc='upper right', fontsize=9, frameon=True)
+        ax.set_xlim(-2.0, 2.0)
+        ax.set_ylim(-2.0, 2.0)
+        if legend_in_figure:
+            ax.set_xlabel("ring-x")
+            ax.set_ylabel("ring-y")
+            mode_str = "scatter" if xy_plot.shape[0] < density_threshold else "hexbin density"
+            ax.set_title(f"{args.dataset} (ring map, {mode_str}), cloud {i}")
+            ax.legend(loc='upper right', fontsize=9, frameon=True)
 
         fig.savefig(f"{prefix}_{i}_ring.png", bbox_inches='tight', dpi=150)
         plt.close(fig)
 
         if plot_cdf:
             # Empirical CDF on normalized phase in [0, 1), using the full cloud.
-            phase01 = _map_state_to_ring_phase01(full_points).detach().cpu().numpy()
-            phase01 = phase01[np.isfinite(phase01)]
             if phase01.size > 0:
                 phase_sorted = np.sort(phase01)
                 cdf = np.arange(1, phase_sorted.size + 1, dtype=np.float64) / float(phase_sorted.size)
+                n_phase = int(phase_sorted.size)
 
                 fig_cdf, ax_cdf = plt.subplots(figsize=(7, 4.2))
-                ax_cdf.step(phase_sorted, cdf, where='post', color=point_color, linewidth=1.6)
+                ax_cdf.step(
+                    phase_sorted,
+                    cdf,
+                    where='post',
+                    color=point_color,
+                    linewidth=1.6,
+                    label='Empirical CDF',
+                )
+                _add_label('Empirical CDF')
+                if n_phase < 500:
+                    ax_cdf.scatter(
+                        phase_sorted,
+                        np.zeros_like(phase_sorted),
+                        s=50,
+                        alpha=0.55,
+                        c=point_color,
+                        edgecolors='none',
+                        label='Samples',
+                    )
+                    _add_label('Samples')
+                    if legend_in_figure:
+                        ax_cdf.legend(loc='lower right', fontsize=8, frameon=True)
                 ax_cdf.set_xlim(0.0, 1.0)
                 ax_cdf.set_ylim(0.0, 1.0)
-                ax_cdf.set_xlabel("phase = angle / (2*pi)")
-                ax_cdf.set_ylabel("empirical CDF")
-                ax_cdf.set_title(f"{args.dataset} empirical CDF, cloud {i}")
+                if legend_in_figure:
+                    ax_cdf.set_xlabel("phase = angle / (2*pi)")
+                    ax_cdf.set_ylabel("empirical CDF")
+                    ax_cdf.set_title(f"{args.dataset} empirical CDF, cloud {i}")
                 ax_cdf.grid(True, linestyle='--', alpha=0.35)
                 fig_cdf.tight_layout()
                 fig_cdf.savefig(f"{prefix}_{i}_ring_cdf.png", bbox_inches='tight', dpi=150)
                 plt.close(fig_cdf)
 
                 # PDF on [0, 1): KDE for small N, histogram PDF for large N.
-                n_phase = int(phase01.size)
+                phase_grid, pdf_vals = _estimate_phase_pdf_curve_01(phase01)
                 fig_pdf, ax_pdf = plt.subplots(figsize=(7, 4.2))
                 if n_phase < 500:
-                    grid = np.linspace(0.0, 1.0, 1000)
-                    kde_std = _adaptive_kde_std(n_phase, base_std=0.01)
-                    pdf_vals = _wrapped_kde_pdf_01(phase01, grid, kde_std)
-                    ax_pdf.plot(grid, pdf_vals, color=point_color, linewidth=1.8)
-                    ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
-                else:
-                    n_bins = int(np.round(10.0 * float(n_phase) / 500.0))
-                    n_bins = int(np.clip(n_bins, 10, 2000))
-                    hist, edges = np.histogram(phase01, bins=n_bins, range=(0.0, 1.0), density=True)
-                    centers = 0.5 * (edges[:-1] + edges[1:])
-                    smoothed_hist = _smooth_histogram_pdf(
-                        hist,
-                        bin_width=(edges[1] - edges[0]) if edges.size >= 2 else 1.0,
-                        window_size=9,
+                    ax_pdf.plot(phase_grid, pdf_vals, color=point_color, linewidth=1.8, label='Phase PDF')
+                    _add_label('Phase PDF')
+                    ax_pdf.scatter(
+                        np.mod(phase01, 1.0),
+                        np.zeros_like(phase01),
+                        s=50,
+                        alpha=0.55,
+                        c=point_color,
+                        edgecolors='none',
+                        label='Samples',
                     )
-                    ax_pdf.plot(centers, smoothed_hist, color=point_color, linewidth=1.6)
-                    ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
+                    _add_label('Samples')
+                    if legend_in_figure:
+                        ax_pdf.legend(loc='upper right', fontsize=8, frameon=True)
+                        ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
+                else:
+                    ax_pdf.plot(phase_grid, pdf_vals, color=point_color, linewidth=1.6, label='Phase PDF')
+                    _add_label('Phase PDF')
+                    if legend_in_figure:
+                        ax_pdf.set_title(f"{args.dataset} phase PDF, cloud {i}")
 
                 ax_pdf.set_xlim(0.0, 1.0)
-                ax_pdf.set_xlabel("phase = angle / (2*pi)")
-                ax_pdf.set_ylabel("PDF")
+                if legend_in_figure:
+                    ax_pdf.set_xlabel("phase = angle / (2*pi)")
+                    ax_pdf.set_ylabel("PDF")
                 ax_pdf.grid(True, linestyle='--', alpha=0.35)
                 fig_pdf.tight_layout()
                 fig_pdf.savefig(f"{prefix}_{i}_ring_pdf.png", bbox_inches='tight', dpi=150)
                 plt.close(fig_pdf)
+
+                ring_pdf_labels = _save_ring_pdf_on_ring(
+                    args=args,
+                    prefix=prefix,
+                    cloud_idx=i,
+                    point_color=point_color,
+                    phase01=phase01,
+                    phase_grid=phase_grid,
+                    pdf_vals=pdf_vals,
+                    plot_history=plot_history,
+                    history_traj=history_traj,
+                    obs_x=obs_x,
+                    true_xy=true_xy,
+                    legend_in_figure=legend_in_figure,
+                )
+                for lbl in ring_pdf_labels:
+                    _add_label(lbl)
+
+    if not legend_in_figure and len(legend_labels_used) > 0:
+        legend_handles: List = []
+        legend_labels: List[str] = []
+        seen_labels = set()
+        def _append_legend(handle, label: str) -> None:
+            if label in seen_labels:
+                return
+            legend_handles.append(handle)
+            legend_labels.append(label)
+            seen_labels.add(label)
+
+        for label in legend_labels_used:
+            if label in {'Unit circle', 'Empirical CDF', 'Samples', 'Phase PDF'}:
+                continue
+            if label == 'Ensemble':
+                _append_legend(
+                    Line2D([0], [0], marker='o', linestyle='None',
+                           markerfacecolor=point_color, markeredgecolor='none', markersize=8),
+                    label
+                )
+            elif label == 'Ensemble density':
+                density_color = 'tab:red' if point_color == 'red' else 'tab:blue'
+                _append_legend(
+                    mpatches.Patch(facecolor=density_color, alpha=0.9, edgecolor='none'),
+                    label
+                )
+            elif label == 'History trajectory':
+                _append_legend(Line2D([0], [0], color='black', linewidth=1.5), label)
+            elif label == 'Observation':
+                _append_legend(Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0), label)
+            elif label == 'True state':
+                _append_legend(
+                    Line2D([0], [0], marker='*', linestyle='None',
+                           markerfacecolor='orange', markeredgecolor='black', markersize=16),
+                    label
+                )
+            elif label in {'predictive density', 'filtering density', 'phase density'}:
+                # handled by fixed dual-color entries below
+                continue
+
+        _append_legend(mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none'), 'predictive density')
+        _append_legend(mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none'), 'filtering density')
+
+        _save_horizontal_legend_image(
+            prefix=prefix,
+            handles=legend_handles,
+            labels=legend_labels,
+            save_pdf=False,
+            dpi=150,
+            fontsize=11,
+            frameon=True,
+        )
 
     print(f"Processed {len(indices_to_process)} ring-mapped point clouds with prefix '{prefix}'.")
