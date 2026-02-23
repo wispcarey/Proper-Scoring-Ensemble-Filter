@@ -1,7 +1,6 @@
 import torch
 import numpy as np
-from typing import Optional, List, Tuple
-import pingouin as pg
+from typing import Optional, List, Tuple, Dict, Any
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -14,6 +13,17 @@ import os
 from argparse import Namespace 
 
 
+PF_3D_SUPPORTED_DATASETS = {"lorenz63", "lorenz96", "ks"}
+PF_MAX_SCATTER_POINTS = 50000
+PF_FIXED_RANGES_3D = {
+    # Typical Lorenz-63 attractor envelope is about x in [-20, 20], y in [-27, 27], z in [0, 48.5].
+    # We keep a slightly larger plotting box for robustness.
+    "lorenz63": {"xlim": (-22.0, 22.0), "ylim": (-30.0, 30.0), "zlim": (0.0, 52.0)},
+    "lorenz96": {"xlim": (-15.0, 15.0), "ylim": (-15.0, 15.0), "zlim": (-15.0, 15.0)},
+    "ks": {"xlim": (-6.0, 6.0), "ylim": (-6.0, 6.0), "zlim": (-6.0, 6.0)},
+}
+
+
 def _save_horizontal_legend_image(
     prefix: str,
     handles: List,
@@ -23,6 +33,7 @@ def _save_horizontal_legend_image(
     fontsize: int = 11,
     frameon: bool = True,
     scale: float = 1.45,
+    pad_inches: float = 0.02,
 ) -> None:
     """Save a standalone horizontal legend image "<prefix>_legend.(png|pdf)"."""
     dedup_handles: List = []
@@ -70,10 +81,10 @@ def _save_horizontal_legend_image(
             if handle.get_markersize() > 0:
                 handle.set_markersize(handle.get_markersize() * scale)
 
-    fig.tight_layout(pad=0.1)
-    fig.savefig(f"{prefix}_legend.png", dpi=dpi, bbox_inches='tight')
+    fig.tight_layout(pad=0.02)
+    fig.savefig(f"{prefix}_legend.png", dpi=dpi, bbox_inches='tight', pad_inches=pad_inches)
     if save_pdf:
-        fig.savefig(f"{prefix}_legend.pdf", bbox_inches='tight')
+        fig.savefig(f"{prefix}_legend.pdf", bbox_inches='tight', pad_inches=pad_inches)
     plt.close(fig)
 
 def plot_particle_trajectories_with_histograms(
@@ -768,15 +779,16 @@ def plot_particle_trajectories(
 #     plot_types_str = "2 plots (adaptive/fixed)" if _limits is not None else "1 plot (adaptive)"
 #     print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")
 
-def _save_separate_legend(prefix: str, include_obs: bool = False, dpi: int = 200) -> None:
-    """Create and save a standalone horizontal legend image.
-
-    Args:
-        prefix (str): File prefix for the saved legend image "<prefix>_legend.png".
-        include_obs (bool): If True, include the Observation legend entry.
-        dpi (int): Dots per inch for the saved PNG.
-    """
-    # Proxy artists for legend entries
+def _save_separate_legend(
+    prefix: str,
+    include_prior: bool = True,
+    include_posterior: bool = True,
+    include_obs: bool = False,
+    include_history: bool = True,
+    include_true_state: bool = True,
+    dpi: int = 200,
+) -> None:
+    """Create and save a standalone horizontal legend image."""
     handle_prior = Line2D([0], [0], marker='o', linestyle='None',
                           markerfacecolor='blue', markeredgecolor='none', markersize=8,
                           label='Predictive (prior) distribution')
@@ -788,12 +800,21 @@ def _save_separate_legend(prefix: str, include_obs: bool = False, dpi: int = 200
                         label='Observation')
     handle_traj = Line2D([0], [0], linestyle='-', color='black', linewidth=2,
                          label='History trajectory')
+    handle_true = Line2D([0], [0], marker='*', linestyle='None',
+                         markerfacecolor='orange', markeredgecolor='black', markersize=14,
+                         label='True state')
 
-    # Assemble handles/labels based on whether observation is included.
+    handles = []
+    if include_prior:
+        handles.append(handle_prior)
+    if include_posterior:
+        handles.append(handle_posterior)
     if include_obs:
-        handles = [handle_prior, handle_posterior, handle_obs, handle_traj]
-    else:
-        handles = [handle_prior, handle_posterior, handle_traj]
+        handles.append(handle_obs)
+    if include_history:
+        handles.append(handle_traj)
+    if include_true_state:
+        handles.append(handle_true)
 
     labels = [h.get_label() for h in handles]
     _save_horizontal_legend_image(
@@ -806,181 +827,605 @@ def _save_separate_legend(prefix: str, include_obs: bool = False, dpi: int = 200
         frameon=True,
     )
 
+
+def _sample_points(points: torch.Tensor, sample_size: int) -> torch.Tensor:
+    """Randomly sample up to `sample_size` points without replacement."""
+    n = points.shape[0]
+    if sample_size <= 0 or sample_size >= n:
+        return points
+    idx = torch.randperm(n)[:sample_size]
+    return points[idx]
+
+
+def _prepare_scatter_points(points: torch.Tensor, max_points: int = PF_MAX_SCATTER_POINTS) -> Tuple[torch.Tensor, bool]:
+    """Downsample points for scatter rendering and return whether downsampling happened."""
+    n = points.shape[0]
+    if max_points <= 0 or n <= max_points:
+        return points, False
+    idx = torch.randperm(n)[:max_points]
+    return points[idx], True
+
+
+def _adaptive_scatter_style(
+    n_points: int,
+    is_3d: bool = False,
+    downsampled: bool = False,
+) -> Tuple[float, float]:
+    """Choose scatter marker size/alpha based on plotted count."""
+    n = max(int(n_points), 1)
+    if n <= 2000:
+        size, alpha = (9.0 if not is_3d else 8.0, 0.38 if not is_3d else 0.34)
+    elif n <= 20000:
+        size, alpha = (5.0 if not is_3d else 4.5, 0.22 if not is_3d else 0.20)
+    else:
+        size, alpha = (2.2 if not is_3d else 2.0, 0.11 if not is_3d else 0.10)
+
+    if downsampled:
+        # Requested style tweak for hard-capped scatter (<=50k):
+        # slightly larger markers and slightly lower opacity.
+        size *= 1.25
+        alpha *= 0.8
+    return float(size), float(alpha)
+
+
+def _compute_axis_limits(values: np.ndarray, pad_ratio: float = 0.06) -> Tuple[float, float]:
+    """Compute robust plotting limits with padding."""
+    finite_vals = values[np.isfinite(values)]
+    if finite_vals.size == 0:
+        return (-1.0, 1.0)
+    v_min = float(np.min(finite_vals))
+    v_max = float(np.max(finite_vals))
+    span = v_max - v_min
+    if span <= 1e-12:
+        delta = max(1.0, abs(v_max) * 0.1 + 1e-3)
+        return (v_min - delta, v_max + delta)
+    pad = max(span * pad_ratio, 1e-6)
+    return (v_min - pad, v_max + pad)
+
+
+def _adaptive_projection_kde_std(n_samples: int, base_std: float) -> float:
+    """
+    Adaptive isotropic KDE std for low-sample 2D projections.
+    - Uses `base_std` at n=200.
+    - Smooths more when n is smaller.
+    """
+    n = max(int(n_samples), 1)
+    std = float(base_std) * np.sqrt(200.0 / float(n))
+    return float(np.clip(std, 0.65 * float(base_std), 2.8 * float(base_std)))
+
+
+def _isotropic_kde_2d(
+    xy: np.ndarray,
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+    std: float,
+    grid_size: int = 120,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Simple isotropic Gaussian KDE on a 2D grid (numpy-only)."""
+    n_grid = max(40, int(grid_size))
+    xg = np.linspace(float(xlim[0]), float(xlim[1]), n_grid, dtype=np.float64)
+    yg = np.linspace(float(ylim[0]), float(ylim[1]), n_grid, dtype=np.float64)
+    xx, yy = np.meshgrid(xg, yg)
+
+    samples = np.asarray(xy, dtype=np.float64)
+    samples = samples[np.isfinite(samples).all(axis=1)]
+    if samples.size == 0:
+        return xx, yy, np.zeros_like(xx)
+
+    std = float(max(std, 1e-6))
+    dx = (xx[None, :, :] - samples[:, 0][:, None, None]) / std
+    dy = (yy[None, :, :] - samples[:, 1][:, None, None]) / std
+    kernel = np.exp(-0.5 * (dx * dx + dy * dy))
+    density = np.mean(kernel, axis=0) / (2.0 * np.pi * std * std)
+    return xx, yy, density
+
+
+def _empirical_1d_w2(x: np.ndarray, y: np.ndarray) -> float:
+    """Approximate 1D Wasserstein-2 distance between empirical samples."""
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+    if x.size == 0 or y.size == 0:
+        return float("nan")
+    x_sorted = np.sort(x.astype(np.float64))
+    y_sorted = np.sort(y.astype(np.float64))
+    n_q = int(max(x_sorted.size, y_sorted.size))
+    if n_q <= 1:
+        return float(abs(x_sorted[0] - y_sorted[0]))
+    q = np.linspace(0.0, 1.0, n_q, dtype=np.float64)
+    px = np.linspace(0.0, 1.0, x_sorted.size, dtype=np.float64)
+    py = np.linspace(0.0, 1.0, y_sorted.size, dtype=np.float64)
+    x_q = np.interp(q, px, x_sorted)
+    y_q = np.interp(q, py, y_sorted)
+    return float(np.sqrt(np.mean((x_q - y_q) ** 2)))
+
+
+def _sliced_w2_distance(
+    samples_a: np.ndarray,
+    samples_b: np.ndarray,
+    num_directions: int = 50,
+    rng: Optional[np.random.Generator] = None,
+) -> float:
+    """Compute sliced Wasserstein-2 distance in R^d using random projections."""
+    if rng is None:
+        rng = np.random.default_rng()
+    a = np.asarray(samples_a, dtype=np.float64)
+    b = np.asarray(samples_b, dtype=np.float64)
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
+        raise ValueError("Sliced W2 expects two 2D arrays with matching feature dimensions.")
+    d = a.shape[1]
+    if d <= 0:
+        return float("nan")
+    k = max(1, int(num_directions))
+    dirs = rng.normal(size=(k, d))
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+    dirs = dirs / np.clip(norms, 1e-12, None)
+
+    proj_a = a @ dirs.T
+    proj_b = b @ dirs.T
+    w2_list = []
+    for j in range(k):
+        w2_j = _empirical_1d_w2(proj_a[:, j], proj_b[:, j])
+        if np.isfinite(w2_j):
+            w2_list.append(w2_j)
+    if len(w2_list) == 0:
+        return float("nan")
+    return float(np.mean(w2_list))
+
+
+def _fitted_gaussian_swd_ratio(
+    points: np.ndarray,
+    num_directions: int = 50,
+    num_reference_samples: int = 1000000,
+) -> Tuple[float, float, float]:
+    """Return (ratio, swd(points, gaussian), swd(gaussian, gaussian baseline))."""
+    pts = np.asarray(points, dtype=np.float64)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return (float("nan"), float("nan"), float("nan"))
+
+    d = pts.shape[1]
+    mean = np.mean(pts, axis=0)
+    cov = np.cov(pts, rowvar=False)
+    cov = np.asarray(cov, dtype=np.float64)
+    if cov.ndim == 0:
+        cov = np.eye(d, dtype=np.float64) * float(cov)
+    cov = 0.5 * (cov + cov.T)
+
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvals = np.clip(eigvals, 1e-8, None)
+    cov_psd = eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+    n_ref = max(2000, int(num_reference_samples))
+    n_pts = min(pts.shape[0], n_ref)
+    rng = np.random.default_rng()
+
+    if pts.shape[0] > n_pts:
+        sub_idx = rng.choice(pts.shape[0], size=n_pts, replace=False)
+        pts_eval = pts[sub_idx]
+    else:
+        pts_eval = pts
+
+    gauss_ref = rng.multivariate_normal(mean, cov_psd, size=n_ref)
+    gauss_a = rng.multivariate_normal(mean, cov_psd, size=n_ref)
+    gauss_b = rng.multivariate_normal(mean, cov_psd, size=n_ref)
+
+    swd_data = _sliced_w2_distance(pts_eval, gauss_ref, num_directions=num_directions, rng=rng)
+    swd_base = _sliced_w2_distance(gauss_a, gauss_b, num_directions=num_directions, rng=rng)
+    if not np.isfinite(swd_data) or not np.isfinite(swd_base) or abs(swd_base) < 1e-12:
+        return (float("nan"), swd_data, swd_base)
+    return (float(swd_data / swd_base), swd_data, swd_base)
+
+
+def _resolve_true_state_xyz(
+    true_state: Optional[torch.Tensor],
+    batch_idx: int,
+    batch_size: int,
+) -> Optional[np.ndarray]:
+    """Resolve true state for one batch item into a 3D numpy vector."""
+    if true_state is None:
+        return None
+    if isinstance(true_state, torch.Tensor):
+        ts = true_state.detach().cpu()
+    else:
+        ts = torch.as_tensor(true_state)
+
+    out = None
+    if ts.ndim == 1:
+        if ts.numel() >= 3:
+            out = ts[:3]
+    elif ts.ndim == 2:
+        if ts.shape[0] == batch_size and ts.shape[1] >= 3:
+            out = ts[batch_idx, :3]
+        elif ts.shape[1] >= 3:
+            out = ts[0, :3]
+    if out is None:
+        return None
+    return out.numpy()
+
+
+def _plot_pf_projection_2d(
+    ax,
+    points: np.ndarray,
+    point_color: str,
+    point_label: str,
+    dim_x: int,
+    dim_y: int,
+    marker_size: float,
+    marker_alpha: float,
+    true_xyz: Optional[np.ndarray] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    legend_in_figure: bool = True,
+    dataset: Optional[str] = None,
+    kde_threshold: int = 200,
+) -> None:
+    """Plot a single PF distribution in one 2D projection with scatter."""
+    xy = points[:, [dim_x, dim_y]]
+
+    if xlim is None:
+        xlim = _compute_axis_limits(xy[:, 0])
+    if ylim is None:
+        ylim = _compute_axis_limits(xy[:, 1])
+
+    n_plot = int(xy.shape[0])
+    use_small_n_kde = (
+        str(dataset or "").lower() == "lorenz63"
+        and n_plot > 2
+        and n_plot < int(kde_threshold)
+    )
+    scatter_size = float(marker_size * (1.7 if use_small_n_kde else 1.0))
+    scatter_alpha = float(min(0.98, marker_alpha * (1.25 if use_small_n_kde else 1.0)))
+
+    if use_small_n_kde:
+        x_span = max(float(xlim[1]) - float(xlim[0]), 1e-6)
+        y_span = max(float(ylim[1]) - float(ylim[0]), 1e-6)
+        scale = np.sqrt(0.5 * (x_span * x_span + y_span * y_span))
+        base_std = max(1e-6, 0.03 * scale)
+        kde_std = _adaptive_projection_kde_std(n_plot, base_std=base_std)
+        xx, yy, density = _isotropic_kde_2d(xy=xy, xlim=xlim, ylim=ylim, std=kde_std, grid_size=120)
+        finite_density = density[np.isfinite(density)]
+        if finite_density.size > 0:
+            max_density = float(np.max(finite_density))
+            if max_density > 0:
+                contour_levels = np.array([0.22, 0.45, 0.70], dtype=np.float64) * max_density
+                contour_levels = np.unique(contour_levels[contour_levels > 1e-12])
+                if contour_levels.size >= 1:
+                    ax.contour(
+                        xx,
+                        yy,
+                        density,
+                        levels=contour_levels,
+                        colors=point_color,
+                        linewidths=1.2,
+                        alpha=0.7,
+                    )
+                fill_levels = np.concatenate(([0.0], contour_levels, [max_density * 1.001]))
+                fill_levels = np.unique(fill_levels)
+                if fill_levels.size >= 2:
+                    cmap_name = "Reds" if "red" in point_color.lower() else "Blues"
+                    ax.contourf(
+                        xx,
+                        yy,
+                        density,
+                        levels=fill_levels,
+                        cmap=cmap_name,
+                        alpha=0.18,
+                    )
+
+    ax.scatter(
+        xy[:, 0], xy[:, 1],
+        s=scatter_size, alpha=scatter_alpha, c=point_color, edgecolors='none',
+        label=point_label,
+    )
+
+    if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
+        ax.scatter(
+            true_xyz[dim_x], true_xyz[dim_y],
+            marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11,
+            label='True state',
+        )
+
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    if legend_in_figure:
+        ax.legend(loc='best', fontsize=8, frameon=True)
+
+
 def plot_and_test_point_clouds(
     args: Namespace,
-    tensor: torch.Tensor,
+    prior_tensor: torch.Tensor,
+    posterior_tensor: torch.Tensor,
     num_samples_plot: int,
-    num_samples_test: int,
     prefix: str,
-    point_color: str,                          # NEW: "red" or "blue"
-    observation: Optional[torch.Tensor] = None,# NEW: 3D vector for the orange star
-    num_repeats: int = 10,
+    num_swd_reference_samples: int = 1000000,
+    num_swd_directions: int = 50,
     plot_indices: Optional[List[int]] = None,
     history_traj: Optional[torch.Tensor] = None,
+    true_state: Optional[torch.Tensor] = None,
     legend_in_figure: bool = True,
 ):
     """
-    Plots point clouds and optional trajectories, tests for Gaussianity (HZ),
-    and saves a separate legend image.
-
-    Args:
-        args (Namespace): Has fields like `dataset` and `dt`.
-        tensor (torch.Tensor): (B, N, 3+) point cloud (only first 3 dims used).
-        num_samples_plot (int): Number of points to sample for PLOTTING.
-        num_samples_test (int): Number of points to sample for HZ TEST.
-        prefix (str): Base filename prefix for saved images.
-        point_color (str): Color for the CURRENT cloud: "red" or "blue".
-        observation (Optional[torch.Tensor]): 3D vector for orange star marker.
-        num_repeats (int): Repeated HZ tests for stability.
-        plot_indices (Optional[List[int]]): Which batch items to plot; default all.
-        history_traj (Optional[torch.Tensor]): (T, B, 3+) historical trajectory.
-        legend_in_figure (bool): If False, remove figure title and axis labels.
-
-    Behavior changes:
-        - Trajectory is plotted in BLACK (instead of red).
-        - Current cloud is plotted entirely in `point_color` ("red" or "blue").
-        - Observation, if provided, is plotted as an ORANGE star.
-        - No in-figure legend; a standalone 2-row legend image is saved as "<prefix>_legend.png".
+    PF-specific visualization for 3D datasets:
+    - One adaptive-range projection set: (x,y), (y,z), (x,z)
+    - One fixed-range projection set: (x,y), (y,z), (x,z)
+    - One fixed-range 3D scatter
+    - Gaussianity score via SWD ratio against fitted Gaussian
+    - No observation marker
+    - History is shown only in 3D
     """
-    # --- Validate and move to CPU if needed ---
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
+    dataset = str(getattr(args, "dataset", "")).lower()
+    if dataset not in PF_3D_SUPPORTED_DATASETS:
+        raise ValueError(
+            f"PF 3D plotter supports only {sorted(PF_3D_SUPPORTED_DATASETS)}, got dataset='{dataset}'."
+        )
+
+    if prior_tensor.is_cuda:
+        prior_tensor = prior_tensor.cpu()
+    if posterior_tensor.is_cuda:
+        posterior_tensor = posterior_tensor.cpu()
     if history_traj is not None and history_traj.is_cuda:
         history_traj = history_traj.cpu()
-    if observation is not None and observation.is_cuda:
-        observation = observation.cpu()
+    if true_state is not None and isinstance(true_state, torch.Tensor) and true_state.is_cuda:
+        true_state = true_state.cpu()
 
-    B, N, D = tensor.shape
-    assert D >= 3, f"Input tensor must have at least 3 dims, got {tensor.shape}"
-    tensor = tensor[..., :3]
+    if prior_tensor.ndim != 3 or posterior_tensor.ndim != 3:
+        raise ValueError(
+            f"Expected prior/posterior shape (B, N, D), got {tuple(prior_tensor.shape)} and {tuple(posterior_tensor.shape)}."
+        )
+
+    Bp, _, Dp = prior_tensor.shape
+    Bq, _, Dq = posterior_tensor.shape
+    if Bp != Bq:
+        raise ValueError(f"Batch mismatch between prior and posterior: {Bp} vs {Bq}.")
+    if Dp < 3 or Dq < 3:
+        raise ValueError(f"PF 3D plotter expects at least 3 dims, got D={Dp} and D={Dq}.")
+    if Dp != Dq:
+        raise ValueError(f"State dim mismatch between prior and posterior: {Dp} vs {Dq}.")
+
+    prior_tensor = prior_tensor[..., :3]
+    posterior_tensor = posterior_tensor[..., :3]
+    B = Bp
 
     if history_traj is not None:
-        T_h, B_h, D_h = history_traj.shape
-        if B_h != B or D_h < 3:
-            print("Warning: history_traj shape is incompatible. Trajectory will be ignored.")
+        if history_traj.ndim != 3:
+            print("Warning: history_traj must be (T, B, D). Ignoring trajectory.")
             history_traj = None
+        else:
+            _, Bh, Dh = history_traj.shape
+            if Bh != B or Dh < 3:
+                print("Warning: history_traj shape is incompatible. Ignoring trajectory.")
+                history_traj = None
+            else:
+                history_traj = history_traj[..., :3]
 
-    # Sanitize `point_color`
-    point_color = (point_color or "").lower().strip()
-    if point_color not in {"red", "blue"}:
-        print("Warning: point_color should be 'red' or 'blue'. Default to 'blue'.")
-        point_color = "blue"
-
-    # Indices to process
     if plot_indices is None:
         indices_to_process = list(range(B))
     else:
         indices_to_process = [idx for idx in plot_indices if 0 <= idx < B]
 
-    if num_samples_test > N:
-        num_samples_test = N
+    if len(indices_to_process) == 0:
+        print("Warning: no valid plot indices were provided.")
+        return []
 
-    # --- Iterate over selected clouds ---
+    distance_records: List[Dict[str, Any]] = []
+
+    fixed_limits = PF_FIXED_RANGES_3D[dataset]
+    projection_specs = [
+        ("xy", 0, 1, "x", "y", fixed_limits["xlim"], fixed_limits["ylim"]),
+        ("yz", 1, 2, "y", "z", fixed_limits["ylim"], fixed_limits["zlim"]),
+        ("xz", 0, 2, "x", "z", fixed_limits["xlim"], fixed_limits["zlim"]),
+    ]
+
     for i in indices_to_process:
-        full_points_tensor = tensor[i, :, :]
+        prior_full = prior_tensor[i, :, :]
+        post_full = posterior_tensor[i, :, :]
+        true_xyz = _resolve_true_state_xyz(true_state=true_state, batch_idx=i, batch_size=B)
 
-        # 1) --- HZ TEST (multivariate normality) ---
-        hz_str = ""
-        if num_samples_test < 3 + 1:  # D is 3 after slicing
-            hz_str = "HZ Test: Skipped (sample size too small)"
-        else:
-            p_values, normal_flags = [], []
-            for _ in range(num_repeats):
-                test_indices = torch.randperm(N)[:num_samples_test]
-                points_for_test = full_points_tensor[test_indices, :].numpy()
-                hz_results = pg.multivariate_normality(points_for_test, alpha=0.05)
-                p_values.append(hz_results.pval)
-                normal_flags.append(bool(hz_results.normal))
-            avg_pval = float(np.mean(p_values))
-            normal_percentage = float(np.mean(normal_flags) * 100.0)
-            hz_str = f"HZ: {normal_percentage:.0f}% Normal ({num_repeats} runs, avg p-val={avg_pval:.3f})"
+        prior_for_vis = _sample_points(prior_full, num_samples_plot)
+        post_for_vis = _sample_points(post_full, num_samples_plot)
+        prior_vis_ds, prior_downsampled = _prepare_scatter_points(prior_for_vis, max_points=PF_MAX_SCATTER_POINTS)
+        post_vis_ds, post_downsampled = _prepare_scatter_points(post_for_vis, max_points=PF_MAX_SCATTER_POINTS)
+        prior_plot = prior_vis_ds.numpy()
+        post_plot = post_vis_ds.numpy()
+        prior_marker_size_2d, prior_marker_alpha_2d = _adaptive_scatter_style(
+            n_points=prior_plot.shape[0],
+            is_3d=False,
+            downsampled=prior_downsampled,
+        )
+        post_marker_size_2d, post_marker_alpha_2d = _adaptive_scatter_style(
+            n_points=post_plot.shape[0],
+            is_3d=False,
+            downsampled=post_downsampled,
+        )
+        prior_marker_size_3d, prior_marker_alpha_3d = _adaptive_scatter_style(
+            n_points=prior_plot.shape[0],
+            is_3d=True,
+            downsampled=prior_downsampled,
+        )
+        post_marker_size_3d, post_marker_alpha_3d = _adaptive_scatter_style(
+            n_points=post_plot.shape[0],
+            is_3d=True,
+            downsampled=post_downsampled,
+        )
 
-        # 2) --- SAMPLE FOR PLOTTING ---
-        n_to_plot = min(N, num_samples_plot)
-        plot_indices_for_vis = torch.randperm(N)[:n_to_plot]
-        points_to_plot = full_points_tensor[plot_indices_for_vis, :].numpy()
+        swd_ratio_prior, swd_data_prior, swd_base_prior = _fitted_gaussian_swd_ratio(
+            points=prior_full.numpy(),
+            num_directions=num_swd_directions,
+            num_reference_samples=num_swd_reference_samples,
+        )
+        swd_ratio_post, swd_data_post, swd_base_post = _fitted_gaussian_swd_ratio(
+            points=post_full.numpy(),
+            num_directions=num_swd_directions,
+            num_reference_samples=num_swd_reference_samples,
+        )
+        prior_ratio_str = f"{swd_ratio_prior:.3f}" if np.isfinite(swd_ratio_prior) else "nan"
+        post_ratio_str = f"{swd_ratio_post:.3f}" if np.isfinite(swd_ratio_post) else "nan"
+        mode_specs = [
+            (
+                "prior",
+                prior_plot,
+                "blue",
+                "Predictive (prior) distribution",
+                prior_ratio_str,
+                prior_marker_size_2d,
+                prior_marker_alpha_2d,
+                prior_marker_size_3d,
+                prior_marker_alpha_3d,
+            ),
+            (
+                "post",
+                post_plot,
+                "red",
+                "Filtering (posterior) distribution",
+                post_ratio_str,
+                post_marker_size_2d,
+                post_marker_alpha_2d,
+                post_marker_size_3d,
+                post_marker_alpha_3d,
+            ),
+        ]
 
-        # 3) --- PLOT 1: Adaptive axes (always) ---
-        adaptive_title = f"Cloud {i} (Test on {num_samples_test} points)\n{hz_str}"
-        fig_adaptive = plt.figure(figsize=(8, 8))
-        ax_adaptive = fig_adaptive.add_subplot(111, projection='3d')
+        for mode_tag, mode_points, mode_color, mode_label, mode_ratio, size_2d, alpha_2d, size_3d, alpha_3d in mode_specs:
+            # A) Adaptive 2D projections + SWD ratio in title.
+            for plane_tag, dim_x, dim_y, x_label, y_label, _, _ in projection_specs:
+                fig, ax = plt.subplots(figsize=(7.2, 6.2))
+                _plot_pf_projection_2d(
+                    ax=ax,
+                    points=mode_points,
+                    point_color=mode_color,
+                    point_label=mode_label,
+                    dim_x=dim_x,
+                    dim_y=dim_y,
+                    marker_size=size_2d,
+                    marker_alpha=alpha_2d,
+                    true_xyz=true_xyz,
+                    xlim=None,
+                    ylim=None,
+                    legend_in_figure=legend_in_figure,
+                    dataset=dataset,
+                )
+                if legend_in_figure:
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_title(
+                        f"{dataset} {mode_tag} {plane_tag} (adaptive) | SWD ratio={mode_ratio}",
+                        fontsize=11,
+                    )
+                else:
+                    ax.set_xlabel("")
+                    ax.set_ylabel("")
+                    ax.set_title("")
+                fig.savefig(f"{prefix}_{i}_{mode_tag}_adaptive_{plane_tag}.png", bbox_inches='tight', dpi=150)
+                plt.close(fig)
 
-        # Current cloud (color-controlled)
-        ax_adaptive.scatter(points_to_plot[:, 0], points_to_plot[:, 1], points_to_plot[:, 2],
-                            s=5, alpha=0.7, c=point_color, edgecolors='none', zorder=0)
+            # B1) Fixed-range 2D projections.
+            for plane_tag, dim_x, dim_y, x_label, y_label, xlim_fixed, ylim_fixed in projection_specs:
+                fig, ax = plt.subplots(figsize=(7.2, 6.2))
+                _plot_pf_projection_2d(
+                    ax=ax,
+                    points=mode_points,
+                    point_color=mode_color,
+                    point_label=mode_label,
+                    dim_x=dim_x,
+                    dim_y=dim_y,
+                    marker_size=size_2d,
+                    marker_alpha=alpha_2d,
+                    true_xyz=true_xyz,
+                    xlim=xlim_fixed,
+                    ylim=ylim_fixed,
+                    legend_in_figure=legend_in_figure,
+                    dataset=dataset,
+                )
+                if legend_in_figure:
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_title(f"{dataset} {mode_tag} {plane_tag} (fixed range)", fontsize=11)
+                else:
+                    ax.set_xlabel("")
+                    ax.set_ylabel("")
+                    ax.set_title("")
+                fig.savefig(f"{prefix}_{i}_{mode_tag}_fixed_{plane_tag}.png", bbox_inches='tight', dpi=150)
+                plt.close(fig)
 
-        # History trajectory in black (if available)
-        # if history_traj is not None:
-        #     traj_to_plot = history_traj[:, i, :3].numpy()
-        #     ax_adaptive.plot(traj_to_plot[:, 0], traj_to_plot[:, 1], traj_to_plot[:, 2],
-        #                      color='black', linewidth=1.5, zorder=10)
-
-        # Observation (orange star), if provided
-        if observation is not None:
-            obs_np = observation[:3].numpy() if isinstance(observation, torch.Tensor) else np.asarray(observation)[:3]
-            ax_adaptive.scatter(obs_np[0], obs_np[1], obs_np[2],
-                                marker='*', s=140, c='orange', edgecolors='black', linewidth=0.6, zorder=10)
-
-        if legend_in_figure:
-            ax_adaptive.set_xlabel("X-axis"); ax_adaptive.set_ylabel("Y-axis"); ax_adaptive.set_zlabel("Z-axis")
-            ax_adaptive.set_title(adaptive_title, fontsize=12)
-        fig_adaptive.savefig(f"{prefix}_{i}_adaptive.png", bbox_inches='tight', dpi=150)
-        plt.close(fig_adaptive)
-
-        # 4) --- PLOT 2: Fixed axes (dataset-conditional) ---
-        if args.dataset == 'lorenz63':
-            _limits = {'xlim': (-25, 25), 'ylim': (-35, 35), 'zlim': (0, 60)}
-        elif args.dataset == 'rossler':
-            _limits = {'xlim': (-15, 15), 'ylim': (-15, 15), 'zlim': (0, 30)}
-        elif args.dataset == 'lorenz96':
-            _limits = {'xlim': (-13, 13), 'ylim': (-13, 13), 'zlim': (-13, 13)}
-        else:
-            _limits = None
-
-        if _limits is not None:
-            # Guard against None history_traj in title
-            steps = len(history_traj) if history_traj is not None else 0
-            total_T = round(float(getattr(args, "dt", 1.0)) * steps * 100) / 100.0
-            fixed_title = rf"{args.dataset}: $\Delta t$ = {getattr(args, 'dt', 1.0)}, time step = {steps}, T = {total_T:.2f}"
-
-            fig_fixed = plt.figure(figsize=(8, 8))
-            ax_fixed = fig_fixed.add_subplot(111, projection='3d')
-
-            # Current cloud (color-controlled)
-            ax_fixed.scatter(points_to_plot[:, 0], points_to_plot[:, 1], points_to_plot[:, 2],
-                             s=5, alpha=0.7, c=point_color, edgecolors='none', zorder=0)
-
-            # Trajectory in black (if available)
+            # B2) Fixed-range 3D scatter.
+            fig3d = plt.figure(figsize=(8, 8))
+            ax3d = fig3d.add_subplot(111, projection='3d')
+            ax3d.scatter(
+                mode_points[:, 0], mode_points[:, 1], mode_points[:, 2],
+                s=size_3d, alpha=alpha_3d, c=mode_color, edgecolors='none',
+                label=mode_label,
+            )
             if history_traj is not None:
-                traj_to_plot = history_traj[:, i, :3].numpy()
-                ax_fixed.plot(traj_to_plot[:, 0], traj_to_plot[:, 1], traj_to_plot[:, 2],
-                              color='black', linewidth=1.5, zorder=10)
+                traj = history_traj[:, i, :].numpy()
+                ax3d.plot(traj[:, 0], traj[:, 1], traj[:, 2], color='black', linewidth=1.5, label='History trajectory')
+            if true_xyz is not None and np.all(np.isfinite(true_xyz[:3])):
+                ax3d.scatter(
+                    true_xyz[0], true_xyz[1], true_xyz[2],
+                    marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11, label='True state',
+                )
 
-            # Observation (orange star), if provided
-            if observation is not None:
-                obs_np = observation[:3].numpy() if isinstance(observation, torch.Tensor) else np.asarray(observation)[:3]
-                ax_fixed.scatter(obs_np[0], obs_np[1], obs_np[2],
-                                 marker='*', s=140, c='orange', edgecolors='black', linewidth=0.6, zorder=10)
-
+            ax3d.set_xlim(fixed_limits["xlim"])
+            ax3d.set_ylim(fixed_limits["ylim"])
+            ax3d.set_zlim(fixed_limits["zlim"])
             if legend_in_figure:
-                ax_fixed.set_xlabel("X-axis"); ax_fixed.set_ylabel("Y-axis"); ax_fixed.set_zlabel("Z-axis")
-                ax_fixed.set_title(fixed_title, fontsize=12)
-            ax_fixed.set_xlim(_limits['xlim']); ax_fixed.set_ylim(_limits['ylim']); ax_fixed.set_zlim(_limits['zlim'])
-            fig_fixed.savefig(f"{prefix}_{i}_fixed.png", bbox_inches='tight', dpi=150)
-            plt.close(fig_fixed)
+                ax3d.set_xlabel("x")
+                ax3d.set_ylabel("y")
+                ax3d.set_zlabel("z")
+                steps = len(history_traj) if history_traj is not None else 0
+                total_T = round(float(getattr(args, "dt", 1.0)) * steps * 100) / 100.0
+                ax3d.set_title(
+                    rf"{dataset} {mode_tag}: $\Delta t$={getattr(args, 'dt', 1.0)}, step={steps}, T={total_T:.2f} | SWD ratio={mode_ratio}",
+                    fontsize=11,
+                )
+                ax3d.legend(loc='best', fontsize=8, frameon=True)
+            else:
+                ax3d.set_title("")
+                ax3d.set_xlabel("")
+                ax3d.set_ylabel("")
+                ax3d.set_zlabel("")
+            fig3d.savefig(f"{prefix}_{i}_{mode_tag}_fixed_3d.png", bbox_inches='tight', dpi=150)
+            plt.close(fig3d)
 
-    # 5) --- Save a separate legend image (2 rows) ---
-    legend_dir = os.path.dirname(prefix) or "."
-    legend_prefix = os.path.join(legend_dir, str(getattr(args, "dataset", "")))
-    if observation is not None:
-        _save_separate_legend(legend_prefix, include_obs=True)
-    else:
-        _save_separate_legend(legend_prefix, include_obs=False)
+        print(
+            f"[PF Plot] cloud={i}, "
+            f"prior: SWD(data,gauss)={swd_data_prior:.6f}, SWD(baseline)={swd_base_prior:.6f}, ratio={prior_ratio_str}; "
+            f"post: SWD(data,gauss)={swd_data_post:.6f}, SWD(baseline)={swd_base_post:.6f}, ratio={post_ratio_str}"
+        )
+        distance_records.append(
+            {
+                "cloud_index": int(i),
+                "prior_swd_ratio": float(swd_ratio_prior),
+                "prior_swd_data": float(swd_data_prior),
+                "prior_swd_baseline": float(swd_base_prior),
+                "post_swd_ratio": float(swd_ratio_post),
+                "post_swd_data": float(swd_data_post),
+                "post_swd_baseline": float(swd_base_post),
+            }
+        )
 
-    # 6) --- Final summary print ---
-    num_processed = len(indices_to_process)
-    plot_types_str = "2 plots (adaptive/fixed)" if _limits is not None else "1 plot (adaptive)"
-    print(f"Processed {num_processed} point clouds, saving {plot_types_str} for each with prefix '{prefix}'.")
+    if not legend_in_figure:
+        legend_dir = os.path.dirname(prefix) or "."
+        legend_prefix_prior = os.path.join(legend_dir, f"{dataset}_prior")
+        legend_prefix_post = os.path.join(legend_dir, f"{dataset}_post")
+        _save_separate_legend(
+            legend_prefix_prior,
+            include_prior=True,
+            include_posterior=False,
+            include_obs=False,
+            include_history=(history_traj is not None),
+            include_true_state=(true_state is not None),
+        )
+        _save_separate_legend(
+            legend_prefix_post,
+            include_prior=False,
+            include_posterior=True,
+            include_obs=False,
+            include_history=(history_traj is not None),
+            include_true_state=(true_state is not None),
+        )
+
+    print(f"Processed {len(indices_to_process)} PF point-cloud pairs with prefix '{prefix}'.")
+    return distance_records
 
 
 def _map_state_to_ring_xy(points: torch.Tensor) -> torch.Tensor:
@@ -1560,51 +2005,24 @@ def plot_and_test_point_clouds_ring(
                 for lbl in ring_pdf_labels:
                     _add_label(lbl)
 
-    if not legend_in_figure and len(legend_labels_used) > 0:
-        legend_handles: List = []
-        legend_labels: List[str] = []
-        seen_labels = set()
-        def _append_legend(handle, label: str) -> None:
-            if label in seen_labels:
-                return
-            legend_handles.append(handle)
-            legend_labels.append(label)
-            seen_labels.add(label)
+    if not legend_in_figure:
+        density_color = 'red' if point_color == 'red' else 'blue'
+        legend_handles: List = [
+            Line2D([0], [0], marker='o', linestyle='None',
+                   markerfacecolor=point_color, markeredgecolor='none', markersize=8),
+            Line2D([0], [0], marker='*', linestyle='None',
+                   markerfacecolor='orange', markeredgecolor='black', markersize=16),
+            Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0),
+            mpatches.Patch(facecolor=density_color, alpha=0.22, edgecolor='none'),
+        ]
+        legend_labels: List[str] = ['Ensemble', 'True state', 'Observation', 'Density']
 
-        for label in legend_labels_used:
-            if label in {'Unit circle', 'Empirical CDF', 'Samples', 'Phase PDF'}:
-                continue
-            if label == 'Ensemble':
-                _append_legend(
-                    Line2D([0], [0], marker='o', linestyle='None',
-                           markerfacecolor=point_color, markeredgecolor='none', markersize=8),
-                    label
-                )
-            elif label == 'Ensemble density':
-                density_color = 'tab:red' if point_color == 'red' else 'tab:blue'
-                _append_legend(
-                    mpatches.Patch(facecolor=density_color, alpha=0.9, edgecolor='none'),
-                    label
-                )
-            elif label == 'History trajectory':
-                _append_legend(Line2D([0], [0], color='black', linewidth=1.5), label)
-            elif label == 'Observation':
-                _append_legend(Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0), label)
-            elif label == 'True state':
-                _append_legend(
-                    Line2D([0], [0], marker='*', linestyle='None',
-                           markerfacecolor='orange', markeredgecolor='black', markersize=16),
-                    label
-                )
-            elif label in {'predictive density', 'filtering density', 'phase density'}:
-                # handled by fixed dual-color entries below
-                continue
-
-        _append_legend(mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none'), 'predictive density')
-        _append_legend(mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none'), 'filtering density')
+        legend_dir = os.path.dirname(prefix) or "."
+        legend_name = "post_density" if point_color == "red" else "prior_density"
+        legend_prefix = os.path.join(legend_dir, legend_name)
 
         _save_horizontal_legend_image(
-            prefix=prefix,
+            prefix=legend_prefix,
             handles=legend_handles,
             labels=legend_labels,
             save_pdf=False,

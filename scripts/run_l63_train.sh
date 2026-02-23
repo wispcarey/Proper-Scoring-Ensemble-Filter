@@ -14,8 +14,7 @@ python train.py \
    --loss_type es \
    --es_p 1 \
    --test_steps 500 \
-   --pf_verification \
-   --pf_N 100000 \
    --sigma_reg None \
    --save_epoch 10 \
-   --obs_fn identity
+   --obs_fn square \
+   --save_test_figures

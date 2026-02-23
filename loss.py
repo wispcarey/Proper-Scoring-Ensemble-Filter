@@ -121,6 +121,238 @@ def compute_kernel_es(ens_states, true_states, sigma=None):
     kernel_es_val = -term1_ef_k_xy + 0.5 * term2_ef_k_xx_prime_avg
     return kernel_es_val
 
+def compute_root_mean_variance(ens_states, unbiased=False, eps=1e-8):
+    """
+    Computes root mean variance (RMV) of an ensemble.
+
+    RMV_t,b = sqrt( mean_d Var_n[ X_t,b,n,d ] )
+
+    Args:
+        ens_states (torch.Tensor): Ensemble predictions. Shape: [T, B, N, D].
+        unbiased (bool): Use unbiased variance estimate across ensemble members.
+        eps (float): Numerical floor before sqrt.
+
+    Returns:
+        torch.Tensor: RMV per (T, B). Shape: [T, B].
+    """
+    if ens_states.ndim != 4:
+        raise ValueError(f"ens_states must have shape [T, B, N, D], got {tuple(ens_states.shape)}")
+
+    T, B, N, _ = ens_states.shape
+    if N <= 1:
+        return torch.zeros(T, B, device=ens_states.device, dtype=ens_states.dtype)
+
+    ens_var = torch.var(ens_states, dim=2, unbiased=unbiased)  # [T, B, D]
+    mean_var = torch.mean(ens_var, dim=-1)                     # [T, B]
+    return torch.sqrt(torch.clamp(mean_var, min=eps))
+
+
+def compute_spread_error_ratio(ens_states, true_states, unbiased=False, eps=1e-8):
+    """
+    Computes spread-error ratio (SER) per (T, B).
+
+    SER_t,b = RMV_t,b / RMSE_t,b,
+    where RMSE_t,b is based on ensemble mean error against truth.
+
+    Args:
+        ens_states (torch.Tensor): Ensemble predictions. Shape: [T, B, N, D].
+        true_states (torch.Tensor): Ground truth. Shape: [T, B, D].
+        unbiased (bool): Use unbiased variance estimate for RMV.
+        eps (float): Numerical stabilizer.
+
+    Returns:
+        torch.Tensor: SER per (T, B). Shape: [T, B].
+    """
+    if ens_states.ndim != 4 or true_states.ndim != 3:
+        raise ValueError(
+            f"Expected ens_states [T,B,N,D] and true_states [T,B,D], got "
+            f"{tuple(ens_states.shape)} and {tuple(true_states.shape)}"
+        )
+
+    spread = compute_root_mean_variance(ens_states, unbiased=unbiased, eps=eps)  # [T, B]
+    ens_mean = torch.mean(ens_states, dim=2)                                      # [T, B, D]
+    err = torch.sqrt(torch.mean((ens_mean - true_states) ** 2, dim=-1) + eps)     # [T, B]
+    return spread / (err + eps)
+
+
+def sample_projection_directions(state_dim, num_projections, device=None, dtype=None, seed=None):
+    """
+    Sample fixed projection directions on the unit sphere for rank-hist evaluation.
+
+    Args:
+        state_dim (int): State dimension D.
+        num_projections (int): Number of projection directions P.
+        device: Torch device for returned tensor.
+        dtype: Torch dtype for returned tensor.
+        seed (int or None): Optional deterministic seed.
+
+    Returns:
+        torch.Tensor: Projection directions with shape [P, D].
+    """
+    if state_dim <= 0:
+        raise ValueError(f"state_dim must be positive, got {state_dim}")
+    if num_projections <= 0:
+        raise ValueError(f"num_projections must be positive, got {num_projections}")
+
+    if dtype is None:
+        dtype = torch.float32
+    if device is None:
+        device = torch.device("cpu")
+
+    if state_dim == 1:
+        return torch.ones((num_projections, 1), device=device, dtype=dtype)
+
+    cpu_gen = None
+    if seed is not None:
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(int(seed))
+
+    dirs_cpu = torch.randn((num_projections, state_dim), generator=cpu_gen, device="cpu", dtype=torch.float32)
+    dirs_cpu = dirs_cpu / torch.clamp(torch.norm(dirs_cpu, dim=1, keepdim=True), min=1e-12)
+    return dirs_cpu.to(device=device, dtype=dtype)
+
+
+def compute_ensemble_rank_histogram(
+    ens_states,
+    true_states,
+    projection_directions=None,
+    num_projections=8,
+    tie_break="random",
+    seed=0,
+):
+    """
+    Compute rank histogram statistics for ensemble calibration checks.
+
+    Procedure:
+    1. Project high-dimensional ensemble and truth to 1D using fixed directions.
+    2. Compute rank r = # {x_n < y} in each projected sample (with tie handling).
+    3. Aggregate counts over all (time, batch, projection). Rank bins are 0..N.
+
+    Args:
+        ens_states (torch.Tensor): Ensemble predictions [T, B, N, D].
+        true_states (torch.Tensor): Truth [T, B, D].
+        projection_directions (torch.Tensor or None): [P, D]. If None, sampled internally.
+        num_projections (int): Used only when projection_directions is None.
+        tie_break (str): "random" or "midpoint" for ties.
+        seed (int): RNG seed for random tie-breaking and direction sampling.
+
+    Returns:
+        dict with keys:
+            - counts: Tensor [N+1] (CPU, int64)
+            - probabilities: Tensor [N+1] (CPU, float32)
+            - total_samples: int
+            - num_bins: int
+            - num_projections: int
+            - uniform_l1: float
+            - uniform_l2: float
+            - chi2: float
+    """
+    if ens_states.ndim != 4 or true_states.ndim != 3:
+        raise ValueError(
+            f"Expected ens_states [T,B,N,D] and true_states [T,B,D], got "
+            f"{tuple(ens_states.shape)} and {tuple(true_states.shape)}"
+        )
+    if tie_break not in {"random", "midpoint"}:
+        raise ValueError(f"tie_break must be 'random' or 'midpoint', got '{tie_break}'")
+
+    T, B, N, D = ens_states.shape
+    if true_states.shape != (T, B, D):
+        raise ValueError(
+            f"Shape mismatch: ens_states is {(T, B, N, D)} but true_states is {tuple(true_states.shape)}"
+        )
+
+    if projection_directions is None:
+        projection_directions = sample_projection_directions(
+            state_dim=D,
+            num_projections=num_projections,
+            device=ens_states.device,
+            dtype=ens_states.dtype,
+            seed=seed,
+        )
+    else:
+        if projection_directions.ndim != 2 or projection_directions.shape[1] != D:
+            raise ValueError(
+                f"projection_directions must have shape [P, {D}], got {tuple(projection_directions.shape)}"
+            )
+        projection_directions = projection_directions.to(device=ens_states.device, dtype=ens_states.dtype)
+        projection_directions = projection_directions / torch.clamp(
+            torch.norm(projection_directions, dim=1, keepdim=True),
+            min=1e-12,
+        )
+
+    P = int(projection_directions.shape[0])
+
+    # Keep only finite samples before projection.
+    finite_mask = torch.isfinite(true_states).all(dim=-1) & torch.isfinite(ens_states).all(dim=(2, 3))  # [T, B]
+    if not finite_mask.any():
+        empty_counts = torch.zeros(N + 1, dtype=torch.int64)
+        empty_probs = torch.full((N + 1,), float("nan"), dtype=torch.float32)
+        return {
+            "counts": empty_counts,
+            "probabilities": empty_probs,
+            "total_samples": 0,
+            "num_bins": int(N + 1),
+            "num_projections": P,
+            "uniform_l1": float("nan"),
+            "uniform_l2": float("nan"),
+            "chi2": float("nan"),
+        }
+
+    ens_valid = ens_states[finite_mask]    # [K, N, D]
+    true_valid = true_states[finite_mask]  # [K, D]
+    K = ens_valid.shape[0]
+
+    tie_gen = None
+    if tie_break == "random":
+        tie_gen = torch.Generator(device="cpu")
+        tie_gen.manual_seed(int(seed))
+
+    counts = torch.zeros(N + 1, device=ens_states.device, dtype=torch.int64)
+
+    for p in range(P):
+        direction = projection_directions[p]                  # [D]
+        ens_1d = torch.matmul(ens_valid, direction)          # [K, N]
+        true_1d = torch.matmul(true_valid, direction)        # [K]
+        true_col = true_1d.unsqueeze(1)                      # [K, 1]
+
+        rank_low = torch.sum(ens_1d < true_col, dim=1)       # [K]
+        rank_high = torch.sum(ens_1d <= true_col, dim=1)     # [K]
+
+        if tie_break == "random":
+            span = (rank_high - rank_low).to(torch.float32)  # [K], includes 0 when no tie
+            rand_cpu = torch.rand((K,), generator=tie_gen, device="cpu", dtype=torch.float32)
+            offset = torch.floor(rand_cpu * (span.cpu() + 1.0)).to(torch.long).to(rank_low.device)
+            ranks = rank_low + offset
+        else:
+            ranks = torch.div(rank_low + rank_high, 2, rounding_mode="floor")
+
+        counts += torch.bincount(ranks, minlength=N + 1)
+
+    total_samples = int(counts.sum().item())
+    probs = counts.to(torch.float32) / max(total_samples, 1)
+    uniform = torch.full_like(probs, 1.0 / float(N + 1))
+
+    if total_samples <= 0:
+        uniform_l1 = float("nan")
+        uniform_l2 = float("nan")
+        chi2 = float("nan")
+    else:
+        uniform_l1 = float(torch.sum(torch.abs(probs - uniform)).item())
+        uniform_l2 = float(torch.sqrt(torch.mean((probs - uniform) ** 2)).item())
+        expected = float(total_samples) / float(N + 1)
+        chi2 = float(torch.sum((counts.to(torch.float32) - expected) ** 2 / max(expected, 1e-12)).item())
+
+    return {
+        "counts": counts.detach().cpu(),
+        "probabilities": probs.detach().cpu(),
+        "total_samples": total_samples,
+        "num_bins": int(N + 1),
+        "num_projections": P,
+        "uniform_l1": uniform_l1,
+        "uniform_l2": uniform_l2,
+        "chi2": chi2,
+    }
+
 #######################################################
 # related to the weighted particle filter loss functions
 
@@ -242,7 +474,9 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
     Inputs:
         ens_tensor: [T, B, N, D]
         batch_v: [T, B, D]
-        loss_type: 'l2', 'rmse', 'es', 'kes', 'wpf_ed', 'wpf_fmmd', 'wpf_ammd', 'nll'
+        loss_type: 'l2', 'rmse', 'rmv', 'ser', 'spread_error_ratio',
+                   'rank_uniform_l1', 'rank_uniform_l2', 'rank_chi2',
+                   'es', 'kes', 'wpf_ed', 'wpf_fmmd', 'wpf_ammd', 'nll'
         additional_inputs: (dict)
             - For WPF: 'target_ens', 'ens_weights', 'target_weights', 'sigma'
             - For NLL: 'obs_map', 'sigma_y', 'true_obs', 'ens_weights' (optional)
@@ -330,6 +564,30 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
     elif loss_type == 'rmse':
         ens_mean_timed = torch.mean(ens_states_timed, dim=2)
         loss_values_per_element = torch.sqrt(torch.sum((ens_mean_timed - true_states_timed) ** 2, dim=2) + 1e-8)
+
+    elif loss_type == 'rmv':
+        loss_values_per_element = compute_root_mean_variance(ens_states_timed)
+
+    elif loss_type in ['ser', 'spread_error_ratio']:
+        loss_values_per_element = compute_spread_error_ratio(ens_states_timed, true_states_timed)
+
+    elif loss_type in ['rank_uniform_l1', 'rank_uniform_l2', 'rank_chi2']:
+        rank_cfg = additional_inputs if isinstance(additional_inputs, dict) else {}
+        rank_stats = compute_ensemble_rank_histogram(
+            ens_states=ens_states_timed,
+            true_states=true_states_timed,
+            projection_directions=rank_cfg.get('projection_directions', None),
+            num_projections=int(rank_cfg.get('num_projections', 8)),
+            tie_break=str(rank_cfg.get('tie_break', 'random')).lower(),
+            seed=int(rank_cfg.get('seed', 0)),
+        )
+        if loss_type == 'rank_uniform_l1':
+            rank_metric = rank_stats['uniform_l1']
+        elif loss_type == 'rank_uniform_l2':
+            rank_metric = rank_stats['uniform_l2']
+        else:
+            rank_metric = rank_stats['chi2']
+        return torch.as_tensor(rank_metric, device=batch_v.device, dtype=ens_tensor.dtype)
     
     elif loss_type == 'es':
         loss_values_per_element = compute_es(ens_states_timed, true_states_timed, norm_p=norm_p)

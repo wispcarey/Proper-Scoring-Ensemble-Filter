@@ -161,32 +161,66 @@ if __name__ == "__main__":
               f"Method: {args.v}")
     
         # --- Retrieve Optimal Parameters ---
+        default_infl = 1.0
+        default_loc_radius = None
+        infl = default_infl
+        loc_radius = default_loc_radius
+
         if BENCHMARK_SOURCE == 'dapper':
-            sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args, source='dapper')
-            
-            # Select appropriate array based on sigma_y
-            if args.sigma_y == 1:
-                dapper_array = sigma_y_1_array
-            elif args.sigma_y == 0.7:
-                dapper_array = sigma_y_0_7_array
-            else:
-                raise NotImplementedError(f"Dapper benchmark not configured for sigma_y={args.sigma_y}")
-            
-            # Unpack array [best_loc_rad, best_infl, rmse, rrmse_mean]
-            if dapper_array.shape[0] > 0:
-                loc_radius = dapper_array[0, 0]
-                infl = dapper_array[0, 1]
-                rmse_baseline = dapper_array[0, 2]
-                rrmse_baseline = dapper_array[0, 3]
-                print(f"RMSE from DAPPER: {rmse_baseline:.3f}.")
-                print(f"RRMSE from DAPPER: {rrmse_baseline:.3f}.")
-            else:
-                print("Warning: No DAPPER benchmark found for this configuration.")
-                loc_radius, infl = None, None
+            try:
+                sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args, source='dapper')
+                
+                # Select appropriate array based on sigma_y
+                if np.isclose(args.sigma_y, 1.0):
+                    dapper_array = sigma_y_1_array
+                elif np.isclose(args.sigma_y, 0.7):
+                    dapper_array = sigma_y_0_7_array
+                else:
+                    dapper_array = np.empty((0, 4))
+                    print(f"Warning: DAPPER benchmark not configured for sigma_y={args.sigma_y}. "
+                          f"Falling back to default infl={default_infl}, loc={default_loc_radius}.")
+                
+                # Unpack array [best_loc_rad, best_infl, rmse, rrmse_mean]
+                if dapper_array.shape[0] > 0:
+                    loc_radius_candidate = dapper_array[0, 0]
+                    infl_candidate = dapper_array[0, 1]
+                    rmse_baseline = dapper_array[0, 2]
+                    rrmse_baseline = dapper_array[0, 3]
+
+                    if pd.notna(infl_candidate):
+                        infl = float(infl_candidate)
+                    if pd.notna(loc_radius_candidate):
+                        loc_radius = float(loc_radius_candidate)
+
+                    if pd.notna(rmse_baseline):
+                        print(f"RMSE from DAPPER: {rmse_baseline:.3f}.")
+                    if pd.notna(rrmse_baseline):
+                        print(f"RRMSE from DAPPER: {rrmse_baseline:.3f}.")
+                else:
+                    print(f"Warning: No DAPPER benchmark found for dataset={args.dataset}, "
+                          f"N={args.N}, sigma_y={args.sigma_y}. "
+                          f"Using default infl={default_infl}, loc={default_loc_radius}.")
+            except FileNotFoundError:
+                print(f"Warning: benchmark file for dataset={args.dataset} is missing. "
+                      f"Using default infl={default_infl}, loc={default_loc_radius}.")
+            except Exception as e:
+                print(f"Warning: failed to load DAPPER benchmark ({e}). "
+                      f"Using default infl={default_infl}, loc={default_loc_radius}.")
 
         elif BENCHMARK_SOURCE == 'torch':
-            infl, loc_radius = get_benchmarks(args, source='torch')
-            print(f"Loaded from Torch Grid Search -> Inflation: {infl}; Localization Radius: {loc_radius}")
+            try:
+                infl_loaded, loc_radius_loaded = get_benchmarks(args, source='torch')
+                if infl_loaded is not None and pd.notna(infl_loaded):
+                    infl = float(infl_loaded)
+                if loc_radius_loaded is not None and pd.notna(loc_radius_loaded):
+                    loc_radius = float(loc_radius_loaded)
+                print(f"Loaded from Torch Grid Search -> Inflation: {infl}; Localization Radius: {loc_radius}")
+            except FileNotFoundError:
+                print(f"Warning: torch benchmark file for dataset={args.dataset} is missing. "
+                      f"Using default infl={default_infl}, loc={default_loc_radius}.")
+            except Exception as e:
+                print(f"Warning: failed to load torch benchmark ({e}). "
+                      f"Using default infl={default_infl}, loc={default_loc_radius}.")
 
         print(f"Using Inflation: {infl}; Localization Radius: {loc_radius}")
         
@@ -197,8 +231,8 @@ if __name__ == "__main__":
             test_ClassicFilter(test_loader, 
                             args, 
                             H_info=H_info, 
-                            plot_figures=False, 
-                            # fig_name=f'{folder_name}/test_{args.N}', 
+                            plot_figures=args.save_test_figures,
+                            fig_name=f'{folder_name}/test_{args.N}_0',
                             infl=infl, 
                             loc_radius=loc_radius, 
                             # save_pdf=True

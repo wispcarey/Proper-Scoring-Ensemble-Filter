@@ -50,15 +50,15 @@ cd ..
 #     done
 # done
 
-# lorenz 96
-dataset="lorenz96"
-# methods=("EnKF" "ESRF" "iEnKS-PertObs" "iEnKS-Sqrt" "iEnKS-Order1") 
-methods=("EnKF" "LETKF") 
-# methods=("EnKF") 
+# doubling1d
+dataset="doubling1d"
+# methods=("EnKF" "ESRF" "iEnKS-PertObs" "iEnKS-Sqrt" "iEnKS-Order1")
+methods=("EnKF")
+# methods=("EnKF")
 
-sigma_y=1.0
+sigma_y=0.2
 # --- Evaluation Loop ---
-for N in 5 10 15 20 40 60 100; do
+for N in 100 300 1000; do
     for method in "${methods[@]}"; do
         echo "Running evaluation for N=$N and method=$method"
         python evaluate_benchmark.py \
@@ -68,8 +68,12 @@ for N in 5 10 15 20 40 60 100; do
             --sigma_y "$sigma_y" \
             --seed 42 \
             --v "$method" \
-            --obs_fn square_root \
-            --normal_output 
+            --obs_fn cos2pi \
+            --normal_output \
+            --pf_verification \
+            --pf_N 1000000 \
+            --no_localization \
+            --save_test_figures 
     done
 done
 
@@ -209,5 +213,4 @@ done
 #             --no_localization
 #     done
 # done
-
 

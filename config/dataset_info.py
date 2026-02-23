@@ -61,7 +61,7 @@ DATASET_INFO = {
         'sigma_ens': 1,
         'sigma_v': 1e-2,
         'sigma_y': 1,
-        'colorbar_range': (-10,15),
+        'colorbar_range': (-15,15),
     },
     'ks': {
         'dim': 128,

@@ -1,5 +1,8 @@
 import os
 
+# Force a non-GUI backend in headless runs (must be set before matplotlib imports).
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import torch
 import torch.nn as nn
 import time
@@ -18,10 +21,12 @@ if __name__ == "__main__":
     if args.cp_load_path == "no":
         # raise ValueError("The parameter cp_load_path is invalid.")
         folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}_{args.device}")
-        if not os.path.isdir(folder_name):
-            os.makedirs(folder_name)
     else:
         folder_name = os.path.dirname(args.cp_load_path)
+        if folder_name == "":
+            folder_name = "."
+
+    os.makedirs(folder_name, exist_ok=True)
     
     # redirect output
     with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
@@ -81,6 +86,15 @@ if __name__ == "__main__":
                 'std_rmse': test_results.get('std_rmse', float('nan')),
                 'mean_rrmse': test_results.get('mean_rrmse', float('nan')),
                 'std_rrmse': test_results.get('std_rrmse', float('nan')), 
+                'mean_rmv': test_results.get('mean_rmv', float('nan')),
+                'std_rmv': test_results.get('std_rmv', float('nan')),
+                'mean_spread_error_ratio': test_results.get('mean_spread_error_ratio', float('nan')),
+                'std_spread_error_ratio': test_results.get('std_spread_error_ratio', float('nan')),
+                'rank_freq_range': test_results.get('rank_freq_range', float('nan')),
+                'rank_uniform_l1': test_results.get('rank_uniform_l1', float('nan')),
+                'rank_uniform_l2': test_results.get('rank_uniform_l2', float('nan')),
+                'rank_chi2': test_results.get('rank_chi2', float('nan')),
+                'rank_total_samples': test_results.get('rank_total_samples', 0),
                 'mean_crps': test_results.get('mean_crps', float('nan')),
                 'std_crps': test_results.get('std_crps', float('nan')),
                 'mean_rcrps': test_results.get('mean_rcrps', float('nan')),

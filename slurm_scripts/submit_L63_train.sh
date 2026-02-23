@@ -71,18 +71,18 @@ compute_time_limit() {
 #     "lorenz63 500 10 1.0 CorrTerms es None true 1e-3 comp_ss"
 # )
 EXPERIMENTS=(
-    "lorenz63 1000 10 2.0 EtE-LRes es None true 1e-3 square_root 0 true None"
-    "lorenz63 1000 10 2.0 EtE-LRes nl2 None true 1e-3 square_root 0 true None"
-    "lorenz63 1000 10 2.0 CorrTerms es None true 1e-3 square_root 0.01 true None"
-    "lorenz63 1000 10 2.0 CorrTerms nl2 None true 1e-3 square_root 0.01 true None"
-    "lorenz63 1000 10 2.0 EtE-LRes es None true 1e-3 arctan 0 true None"
-    "lorenz63 1000 10 2.0 EtE-LRes nl2 None true 1e-3 arctan 0 true None"
-    "lorenz63 1000 10 2.0 CorrTerms es None true 1e-3 arctan 0.01 true None"
-    "lorenz63 1000 10 2.0 CorrTerms nl2 None true 1e-3 arctan 0.01 true None"
-    "lorenz63 1000 10 2.0 EtE-LRes es None true 1e-3 square 0 true None"
-    "lorenz63 1000 10 2.0 EtE-LRes nl2 None true 1e-3 square 0 true None"
-    "lorenz63 1000 10 2.0 CorrTerms es None true 1e-3 square 0.01 true None"
-    "lorenz63 1000 10 2.0 CorrTerms nl2 None true 1e-3 square 0.01 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes es None false 1e-3 square_root 0 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes nl2 None false 1e-3 square_root 0 true None"
+    "lorenz63 1000 10 2.0 CorrTerms es None false 1e-3 square_root 0.01 true None"
+    "lorenz63 1000 10 2.0 CorrTerms nl2 None false 1e-3 square_root 0.01 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes es None false 1e-3 arctan 0 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes nl2 None false 1e-3 arctan 0 true None"
+    "lorenz63 1000 10 2.0 CorrTerms es None false 1e-3 arctan 0.01 true None"
+    "lorenz63 1000 10 2.0 CorrTerms nl2 None false 1e-3 arctan 0.01 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes es None false 1e-3 square 0 true None"
+    "lorenz63 1000 10 2.0 EtE-LRes nl2 None false 1e-3 square 0 true None"
+    "lorenz63 1000 10 2.0 CorrTerms es None false 1e-3 square 0.01 true None"
+    "lorenz63 1000 10 2.0 CorrTerms nl2 None false 1e-3 square 0.01 true None"
 )
 
 validate_adaptive_sigma_y() {

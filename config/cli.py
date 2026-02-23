@@ -373,6 +373,12 @@ def get_parameters():
                         help="Global trajectory index selection for test/PF plotting: e.g. '0', '0,1', or 'adaptive'.")
     parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
                         help='the std of noise added to resampling in BPF')
+    parser.add_argument('--rank_num_projections', type=int, default=8,
+                        help='Number of fixed random projection directions for ensemble-rank evaluation.')
+    parser.add_argument('--rank_projection_seed', type=int_or_none_or_default, default=None,
+                        help='Seed for fixed projection directions in rank evaluation (None => fallback to --seed).')
+    parser.add_argument('--rank_tie_break', type=str, default='random', choices=['random', 'midpoint'],
+                        help='Tie handling in projected rank: random (recommended) or midpoint.')
 
 
     # others

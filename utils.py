@@ -1010,6 +1010,28 @@ def build_observation_operator(args):
         obs_custom_fn_path=getattr(args, 'obs_custom_fn_path', None),
     )
 
+
+def get_test_noise_generator(args):
+    """
+    Create a dedicated RNG stream for test observation noise.
+
+    This generator is only meant for noise used in:
+      true state -> noisy observation (y = H(x_true) + noise).
+    """
+    seed_val = getattr(args, 'test_random_seed', None)
+    if seed_val is None:
+        seed_raw = getattr(args, 'seed', None)
+        if seed_raw is not None and str(seed_raw).lower() != "none":
+            seed_val = int(seed_raw)
+        else:
+            seed_val = 123
+    else:
+        seed_val = int(seed_val)
+
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(seed_val)
+    return gen
+
 def get_dataloader(args, x0=None, test_only=False):
     if args.dataset.startswith('linear'):
         # A = torch.randn(args.ori_dim, args.ori_dim, dtype=torch.float32)

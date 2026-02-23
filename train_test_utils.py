@@ -1,29 +1,104 @@
 import numpy as np
 import time
 import os
+import csv
+import re
 from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import math
+from config.dataset_info import DATASET_INFO
 
 from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE, DoublingMap1D, ComplexSquareMap2D
 from utils import project_to_unit_circle
-from utils import AverageMeter, mystery_operator, get_mean_std
+from utils import AverageMeter, mystery_operator, get_mean_std, get_test_noise_generator
 from utils import post_process, mean0
 from visualization import (
     plot_particle_trajectories_with_histograms,
     plot_particle_trajectories,
     plot_and_test_point_clouds,
     plot_and_test_point_clouds_ring,
+    _isotropic_kde_2d,
+    _adaptive_projection_kde_std,
+    _compute_axis_limits,
 )
-from localization import dist2coeff, create_loc_mat
-from loss import compute_loss, compute_es, wasserstein2_multivariate_gaussian
+from localization import dist2coeff, create_loc_mat, pairwise_distances
+from loss import (
+    compute_loss,
+    compute_es,
+    compute_root_mean_variance,
+    compute_spread_error_ratio,
+    compute_ensemble_rank_histogram,
+    sample_projection_directions,
+    wasserstein2_multivariate_gaussian,
+)
 from networks import NaiveNetwork, SetTransformer, Simple_MLP, ConditionTransformerNetwork
 from benchmark_analysis import ensemble_kalman_filter_analysis, bootstrap_particle_filter_analysis
 from typing import Optional, List, Tuple, Dict, Any
 
 from tqdm.auto import tqdm
+
+L63_TEST_SNAPSHOT_STEPS = [100, 200, 300, 400, 500]
+L63_FIXED_LIMITS_3D = {
+    "xlim": (-22.0, 22.0),
+    "ylim": (-30.0, 30.0),
+    "zlim": (0.0, 52.0),
+}
+
+
+def _sample_true_obs_noise_like(ref_tensor: torch.Tensor, test_noise_gen: torch.Generator) -> torch.Tensor:
+    """Sample noise for true-observation generation from the dedicated test generator."""
+    noise = torch.randn(
+        ref_tensor.shape,
+        generator=test_noise_gen,
+        device='cpu',
+        dtype=torch.float32,
+    )
+    return noise.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+
+def _get_dataset_default_obs_fn(dataset: str) -> str:
+    """Get default obs_fn for dataset; fallback to identity."""
+    dataset_key = str(dataset or "").lower()
+    dataset_cfg = DATASET_INFO.get(dataset_key, {})
+    return str(dataset_cfg.get("obs_fn", "identity") or "identity").lower()
+
+
+def _resolve_obs_fn_for_pf_paths(args) -> str:
+    """Resolve effective obs_fn used by PF path naming."""
+    default_obs_fn = _get_dataset_default_obs_fn(getattr(args, "dataset", ""))
+    obs_fn = str(getattr(args, "obs_fn", "default") or "default").lower()
+    if obs_fn == "default":
+        return default_obs_fn
+    return obs_fn
+
+
+def _pf_obs_fn_suffix(args) -> str:
+    """
+    Return obs_fn suffix for PF files/folders.
+    - Default obs_fn for dataset => empty suffix.
+    - Non-default obs_fn => _{obs_fn}.
+    """
+    default_obs_fn = _get_dataset_default_obs_fn(getattr(args, "dataset", ""))
+    obs_fn = _resolve_obs_fn_for_pf_paths(args)
+    if obs_fn == default_obs_fn:
+        return ""
+    safe_obs_fn = re.sub(r"[^0-9a-zA-Z._-]+", "-", obs_fn).strip("-")
+    if safe_obs_fn == "":
+        return ""
+    return f"_{safe_obs_fn}"
+
+
+def _build_pf_cache_filename(args, batch_size: int, traj_len: int, avg: bool = False) -> str:
+    """Build PF cache filename with obs_fn suffix policy."""
+    obs_suffix = _pf_obs_fn_suffix(args)
+    base = (
+        f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}"
+    )
+    if avg:
+        return f"{base}_avg{obs_suffix}.pt"
+    return f"{base}_{args.seed}{obs_suffix}.pt"
 
 
 def _setup_mixed_precision(args):
@@ -174,6 +249,20 @@ def _select_plot_batch_index(ens_tensor: torch.Tensor) -> int:
     return int(torch.argmin(nan_counts).item())
 
 
+def _safe_int_seed(seed_like, default: int = 0) -> int:
+    """Convert seed-like value to int with a stable fallback."""
+    if seed_like is None:
+        return int(default)
+    if isinstance(seed_like, str):
+        sval = seed_like.strip().lower()
+        if sval in {"", "none", "null"}:
+            return int(default)
+    try:
+        return int(seed_like)
+    except Exception:
+        return int(default)
+
+
 def _resolve_plot_batch_indices(args, batch_size: int, nan_counts: Optional[torch.Tensor] = None) -> List[int]:
     """
     Resolve batch indices for plotting from args.test_plot_index.
@@ -264,8 +353,14 @@ def _resolve_global_plot_indices_for_batch(
     return local
 
 
-def _get_lowdim_snapshot_indices(total_steps: int, start_step: int = 100, num_slices: int = 3, step_offset: int = 0):
-    """Select equally spaced snapshot indices using 1-based step labels."""
+def _get_lowdim_snapshot_indices(
+    total_steps: int,
+    start_step: int = 100,
+    num_slices: int = 3,
+    step_offset: int = 0,
+    explicit_step_labels: Optional[List[int]] = None,
+):
+    """Select snapshot indices using 1-based step labels."""
     if total_steps <= 0:
         return []
 
@@ -274,10 +369,22 @@ def _get_lowdim_snapshot_indices(total_steps: int, start_step: int = 100, num_sl
     if min_label > max_label:
         min_label = max_label
 
-    if max_label - min_label + 1 >= num_slices:
-        labels = np.rint(np.linspace(min_label, max_label, num_slices)).astype(int).tolist()
+    if explicit_step_labels is not None and len(explicit_step_labels) > 0:
+        labels = []
+        for lbl in explicit_step_labels:
+            try:
+                lbl_i = int(lbl)
+            except (TypeError, ValueError):
+                continue
+            if min_label <= lbl_i <= max_label:
+                labels.append(lbl_i)
+        if len(labels) == 0:
+            labels = [max_label]
     else:
-        labels = list(range(min_label, max_label + 1))
+        if max_label - min_label + 1 >= num_slices:
+            labels = np.rint(np.linspace(min_label, max_label, num_slices)).astype(int).tolist()
+        else:
+            labels = list(range(min_label, max_label + 1))
 
     # De-duplicate while preserving order.
     dedup_labels = []
@@ -303,10 +410,17 @@ def _plot_last_three_steps_ring(
     plot_history: bool = False,
     legend_in_figure: bool = True,
     point_color: str = "red",
+    snapshot_steps: Optional[List[int]] = None,
 ):
     """Use ring-mapped visualization for selected 3 low-dim slices."""
     T = ens_traj.shape[0]
-    selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
+    selected_steps = _get_lowdim_snapshot_indices(
+        T,
+        start_step=100,
+        num_slices=3,
+        step_offset=step_offset,
+        explicit_step_labels=snapshot_steps,
+    )
     for t_idx, step_label in selected_steps:
         obs_t = observations[t_idx]
         obs_input = obs_t if torch.isfinite(obs_t.reshape(-1)[:1]).all() else None
@@ -336,8 +450,10 @@ def _plot_last_three_steps_lowdim_generic(
     step_offset: int = 0,
     legend_in_figure: bool = True,
     ens_color: str = 'tab:red',
+    dataset: Optional[str] = None,
+    snapshot_steps: Optional[List[int]] = None,
 ):
-    """Plot ensemble/true/obs snapshots for selected 3 steps (dim <= 3, non-ring datasets)."""
+    """Plot ensemble/true/obs snapshots for selected steps (dim <= 3, non-ring datasets)."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     from matplotlib.lines import Line2D
@@ -347,7 +463,13 @@ def _plot_last_three_steps_lowdim_generic(
     ens_color_lower = ens_color.lower()
     density_cmap = 'Blues' if 'blue' in ens_color_lower else 'Reds'
     density_threshold = 1000
-    selected_steps = _get_lowdim_snapshot_indices(T, start_step=100, num_slices=3, step_offset=step_offset)
+    selected_steps = _get_lowdim_snapshot_indices(
+        T,
+        start_step=100,
+        num_slices=3,
+        step_offset=step_offset,
+        explicit_step_labels=snapshot_steps,
+    )
     if len(selected_steps) == 0:
         return
     legend_labels = []
@@ -357,29 +479,143 @@ def _plot_last_three_steps_lowdim_generic(
             legend_labels.append(label)
 
     if D == 3:
-        fig = plt.figure(figsize=(6 * len(selected_steps), 5))
-        for col, (t_idx, step_label) in enumerate(selected_steps, start=1):
-            ax = fig.add_subplot(1, len(selected_steps), col, projection='3d')
+        dataset_key = str(dataset or "").lower()
+        projection_specs = [
+            ("xy", 0, 1, "x", "y"),
+            ("yz", 1, 2, "y", "z"),
+            ("xz", 0, 2, "x", "z"),
+        ]
+        kde_grid_size = 120
+        kde_max_points = 3000
+        rng = np.random.default_rng(0)
+
+        for t_idx, step_label in selected_steps:
+            fig, axes = plt.subplots(1, len(projection_specs), figsize=(12.0, 3.8), squeeze=False)
+            axes = axes[0]
             ens_t = ens_traj[t_idx]
             valid = torch.isfinite(ens_t).all(dim=1)
             ens_t = ens_t[valid]
+            ens_np = ens_t.numpy() if ens_t.shape[0] > 0 else None
 
-            if ens_t.shape[0] > 0:
-                ax.scatter(ens_t[:, 0], ens_t[:, 1], ens_t[:, 2], s=7, alpha=0.35, c=ens_color, label='Ensemble')
-                _add_label('Ensemble')
-            if torch.isfinite(true_traj[t_idx, :3]).all():
-                ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1], true_traj[t_idx, 2],
-                           marker='x', s=80, c='black', linewidth=1.6, label='True')
-                _add_label('True')
-            if torch.isfinite(observations[t_idx, :3]).all():
-                ax.scatter(observations[t_idx, 0], observations[t_idx, 1], observations[t_idx, 2],
-                           marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
-                _add_label('Obs')
+            has_true = torch.isfinite(true_traj[t_idx, :3]).all()
+            has_obs = torch.isfinite(observations[t_idx, :3]).all()
+            true_np = true_traj[t_idx, :3].numpy() if has_true else None
+            obs_np = observations[t_idx, :3].numpy() if has_obs else None
+
+            for pidx, (plane_tag, dim_x, dim_y, x_label, y_label) in enumerate(projection_specs):
+                ax = axes[pidx]
+
+                if dataset_key == "lorenz63":
+                    if plane_tag == "xy":
+                        xlim = L63_FIXED_LIMITS_3D["xlim"]
+                        ylim = L63_FIXED_LIMITS_3D["ylim"]
+                    elif plane_tag == "yz":
+                        xlim = L63_FIXED_LIMITS_3D["ylim"]
+                        ylim = L63_FIXED_LIMITS_3D["zlim"]
+                    else:
+                        xlim = L63_FIXED_LIMITS_3D["xlim"]
+                        ylim = L63_FIXED_LIMITS_3D["zlim"]
+                else:
+                    if ens_np is not None:
+                        xlim = _compute_axis_limits(ens_np[:, dim_x])
+                        ylim = _compute_axis_limits(ens_np[:, dim_y])
+                    else:
+                        xlim = (-1.0, 1.0)
+                        ylim = (-1.0, 1.0)
+
+                if ens_np is not None:
+                    xy = ens_np[:, [dim_x, dim_y]]
+                    if xy.shape[0] >= 3:
+                        xy_kde = xy
+                        if xy_kde.shape[0] > kde_max_points:
+                            idx = rng.choice(xy_kde.shape[0], size=kde_max_points, replace=False)
+                            xy_kde = xy_kde[idx]
+
+                        x_span = max(float(xlim[1]) - float(xlim[0]), 1e-6)
+                        y_span = max(float(ylim[1]) - float(ylim[0]), 1e-6)
+                        scale = np.sqrt(0.5 * (x_span * x_span + y_span * y_span))
+                        base_std = max(1e-6, 0.03 * scale)
+                        kde_std = _adaptive_projection_kde_std(xy_kde.shape[0], base_std=base_std)
+                        xx, yy, density = _isotropic_kde_2d(
+                            xy=xy_kde,
+                            xlim=xlim,
+                            ylim=ylim,
+                            std=kde_std,
+                            grid_size=kde_grid_size,
+                        )
+                        finite_density = density[np.isfinite(density)]
+                        if finite_density.size > 0:
+                            max_density = float(np.max(finite_density))
+                            if max_density > 0:
+                                contour_levels = np.array([0.22, 0.45, 0.70], dtype=np.float64) * max_density
+                                contour_levels = np.unique(contour_levels[contour_levels > 1e-12])
+                                fill_levels = np.concatenate(([0.0], contour_levels, [max_density * 1.001]))
+                                fill_levels = np.unique(fill_levels)
+                                if fill_levels.size >= 2:
+                                    cmap_name = 'Blues' if 'blue' in ens_color_lower else 'Reds'
+                                    ax.contourf(xx, yy, density, levels=fill_levels, cmap=cmap_name, alpha=0.18)
+                                    _add_label('KDE density')
+                                if contour_levels.size >= 1:
+                                    ax.contour(
+                                        xx,
+                                        yy,
+                                        density,
+                                        levels=contour_levels,
+                                        colors=ens_color,
+                                        linewidths=1.0,
+                                        alpha=0.7,
+                                    )
+
+                    ax.scatter(
+                        xy[:, 0],
+                        xy[:, 1],
+                        s=9,
+                        alpha=0.35,
+                        c=ens_color,
+                        edgecolors='none',
+                        label='Ensemble',
+                    )
+                    _add_label('Ensemble')
+
+                if true_np is not None:
+                    ax.scatter(
+                        true_np[dim_x],
+                        true_np[dim_y],
+                        marker='x',
+                        s=90,
+                        c='black',
+                        linewidth=1.6,
+                        label='True',
+                    )
+                    _add_label('True')
+
+                if obs_np is not None:
+                    ax.scatter(
+                        obs_np[dim_x],
+                        obs_np[dim_y],
+                        marker='*',
+                        s=120,
+                        c='orange',
+                        edgecolors='black',
+                        linewidth=0.5,
+                        label='Obs',
+                    )
+                    _add_label('Obs')
+
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+                if legend_in_figure:
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_title(f"{plane_tag} | step={step_label}")
+
             if legend_in_figure:
-                ax.set_title(f"step={step_label}")
-            if legend_in_figure and col == 1:
-                ax.legend(loc='best', fontsize=8)
-        fig.tight_layout()
+                axes[0].legend(loc='best', fontsize=8)
+            fig.tight_layout()
+            fig.savefig(f"{fig_name}_slice_step{step_label}.png", dpi=150, bbox_inches='tight')
+            if save_pdf:
+                fig.savefig(f"{fig_name}_slice_step{step_label}.pdf", bbox_inches='tight')
+            plt.close(fig)
     else:
         fig, axes = plt.subplots(1, len(selected_steps), figsize=(5 * len(selected_steps), 4))
         if len(selected_steps) == 1:
@@ -439,10 +675,11 @@ def _plot_last_three_steps_lowdim_generic(
                 ax.legend(loc='best', fontsize=8)
         fig.tight_layout()
 
-    fig.savefig(f"{fig_name}_slice_steps.png", dpi=150, bbox_inches='tight')
-    if save_pdf:
-        fig.savefig(f"{fig_name}_slice_steps.pdf", bbox_inches='tight')
-    plt.close(fig)
+    if D != 3:
+        fig.savefig(f"{fig_name}_slice_steps.png", dpi=150, bbox_inches='tight')
+        if save_pdf:
+            fig.savefig(f"{fig_name}_slice_steps.pdf", bbox_inches='tight')
+        plt.close(fig)
 
     if not legend_in_figure and len(legend_labels) > 0:
         handles = []
@@ -458,6 +695,8 @@ def _plot_last_three_steps_lowdim_generic(
             elif label == 'Obs':
                 handles.append(Line2D([0], [0], marker='*', linestyle='None',
                                       markerfacecolor='orange', markeredgecolor='black', markersize=11))
+            elif label == 'KDE density':
+                handles.append(mpatches.Patch(facecolor=ens_color, alpha=0.18, edgecolor='none'))
             else:
                 continue
             labels.append(label)
@@ -622,6 +861,10 @@ def _plot_test_visualizations(
     if args.ori_dim <= 3:
         multi_bidx = len(plot_bidx_list) > 1 or global_index_naming
         ring_point_color = "blue" if "blue" in str(ens_color).lower() else "red"
+        dataset_key = str(getattr(args, "dataset", "")).lower()
+        snapshot_steps = getattr(args, "test_snapshot_steps", None)
+        if snapshot_steps is None and dataset_key == "lorenz63":
+            snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
         for bidx in plot_bidx_list:
             ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
             true_traj = true_tensor[:, bidx, :].detach().cpu()
@@ -641,6 +884,7 @@ def _plot_test_visualizations(
                     plot_history=ring_plot_history,
                     legend_in_figure=getattr(args, "legend_in_figure", False),
                     point_color=ring_point_color,
+                    snapshot_steps=snapshot_steps,
                 )
             else:
                 _plot_last_three_steps_lowdim_generic(
@@ -652,6 +896,8 @@ def _plot_test_visualizations(
                     step_offset=step_offset,
                     legend_in_figure=getattr(args, "legend_in_figure", False),
                     ens_color=ens_color,
+                    dataset=dataset_key,
+                    snapshot_steps=snapshot_steps,
                 )
 
             _plot_lowdim_traj_summary(
@@ -1375,10 +1621,9 @@ def generate_and_cache_pf_results(
     NEW IN THIS VERSION:
     - Records BOTH prior (forecast) and posterior (analysis) ensemble statistics in the cache:
         {'prior_means', 'prior_covs', 'post_means', 'post_covs'}
-    - Plots TWO figures per selected batch index and time step when `save_figure=True`:
-        (1) Prior (blue points) + black history trajectory + orange observation star
-        (2) Posterior (red points) + black history trajectory + orange observation star
-      For ring datasets ('doubling1d', 'complex2d'), it also saves no-history counterparts.
+    - For 3D PF datasets, saves combined prior/posterior projection plots
+      (adaptive + fixed ranges, including a fixed-range 3D scatter).
+    - For ring datasets ('doubling1d', 'complex2d'), it also saves no-history counterparts.
 
     If calculate_crps is False, CRPS keys are omitted from the output.
 
@@ -1396,6 +1641,7 @@ def generate_and_cache_pf_results(
 
     # --- Model and Observation Initialization ---
     forward_fun = _get_forward_fun(args)
+    test_noise_gen = get_test_noise_generator(args)
 
     if H_info is None:
         H_fun, H = mystery_operator((args.ori_dim, args.obs_dim), args.device)
@@ -1407,8 +1653,15 @@ def generate_and_cache_pf_results(
     traj_len = first_batch_for_shape.shape[0]
     batch_size = first_batch_for_shape.shape[1]
     cache_dir = os.path.join('data', args.dataset)
-    cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_{args.seed}.pt"
+    obs_suffix = _pf_obs_fn_suffix(args)
+    cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=False)
     cache_filepath = os.path.join(cache_dir, cache_filename)
+    pf_vis_folder = f"save/{args.dataset}_pf_vis{obs_suffix}"
+    if obs_suffix:
+        print(
+            f"[PF cache naming] dataset={args.dataset}, obs_fn={_resolve_obs_fn_for_pf_paths(args)}, "
+            f"default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}, suffix='{obs_suffix}'"
+        )
 
     # --- Check for Existing Cache ---
     if check_disk and os.path.exists(cache_filepath):
@@ -1420,6 +1673,7 @@ def generate_and_cache_pf_results(
 
     print(f"Generating particle filter results and saving to: {cache_filepath}")
     all_pf_results_to_cache = []
+    pf_non_gaussian_records = []
 
     # --- Initialize Metric Dictionaries ---
     all_pf_metrics = {
@@ -1434,6 +1688,7 @@ def generate_and_cache_pf_results(
     # Controlled by args.test_plot_index (default [0], also supports "adaptive" and lists like [0,1]).
     can_plot_3d = int(getattr(args, 'ori_dim', 0)) >= 3
     can_plot_ring = int(getattr(args, 'ori_dim', 0)) in [1, 2]
+    track_pf_non_gaussian = str(getattr(args, "dataset", "")).lower() == "lorenz63"
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
@@ -1490,10 +1745,12 @@ def generate_and_cache_pf_results(
                 batch_crps_steps.append(crps_t0)
 
             # --- Generate Observations y_t ---
-            obs_y_list = [
-                H_fun(batch_v[i].unsqueeze(1)) + args.sigma_y * torch.randn_like(H_fun(batch_v[i].unsqueeze(1)))
-                for i in range(len(batch_v))
-            ]
+            obs_y_list = []
+            for i in range(len(batch_v)):
+                clean_h_step = H_fun(batch_v[i].unsqueeze(1))
+                obs_noise_step = _sample_true_obs_noise_like(clean_h_step, test_noise_gen)
+                obs_y_step = clean_h_step + args.sigma_y * obs_noise_step
+                obs_y_list.append(obs_y_step)
 
             # --- Main PF Assimilation Loop ---
             for i in range(len(batch_v) - 1):
@@ -1537,7 +1794,7 @@ def generate_and_cache_pf_results(
 
                 # -------- Visualization (PRIOR + POSTERIOR), both include observation --------
                 if i < 600 and save_figure and (can_plot_3d or can_plot_ring):
-                    save_folder = f'save/{args.dataset}_pf_vis'
+                    save_folder = pf_vis_folder
                     os.makedirs(save_folder, exist_ok=True)
 
                     # Use the same time step prefix, but suffix per batch index and type
@@ -1550,44 +1807,46 @@ def generate_and_cache_pf_results(
                     for bidx in vis_indices:
                         gidx = batch_start_index + bidx
                         if can_plot_3d:
-                            # Prepare per-item tensors for the plotting helper (shape: (1, Np, 3))
-                            prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :3].detach().cpu()
-                            posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :3].detach().cpu()
+                            # Prepare per-item tensors for the plotting helper (shape: (1, Np, D>=3))
+                            prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :].detach().cpu()
+                            posterior_cloud_for_plot = pf_ens_v_a[bidx:bidx+1, :, :].detach().cpu()
 
-                            # History trajectory for this item up to current step (shape: steps x 1 x 3)
-                            hist_traj = batch_v[1:i+2, bidx:bidx+1, :3].detach().cpu()
+                            # History trajectory for this item up to current step (shape: steps x 1 x D>=3)
+                            hist_traj = batch_v[1:i+2, bidx:bidx+1, :].detach().cpu()
 
-                            # PRIOR (blue)
-                            prefix_prior = f"{base_prefix}_g{gidx}_PRIOR"
-                            plot_and_test_point_clouds(
+                            # Prior + posterior in one set of projection plots.
+                            prefix_pair = f"{base_prefix}_g{gidx}"
+                            swd_records = plot_and_test_point_clouds(
                                 args,
-                                prior_cloud_for_plot,             # (1, Np, 3)
-                                num_samples_plot=100000,
-                                num_samples_test=1000,
-                                prefix=prefix_prior,
-                                point_color="blue",
-                                observation=None,
-                                num_repeats=1,
+                                prior_tensor=prior_cloud_for_plot,
+                                posterior_tensor=posterior_cloud_for_plot,
+                                num_samples_plot=1000000,
+                                prefix=prefix_pair,
+                                num_swd_reference_samples=getattr(args, "pf_plot_swd_samples", 1000000),
+                                num_swd_directions=getattr(args, "pf_plot_swd_directions", 50),
                                 plot_indices=[0],
                                 history_traj=hist_traj,
+                                true_state=true_state_ti1[bidx].detach().cpu(),
                                 legend_in_figure=getattr(args, "legend_in_figure", False),
                             )
-
-                            # POSTERIOR (red)
-                            prefix_post = f"{base_prefix}_g{gidx}_POST"
-                            plot_and_test_point_clouds(
-                                args,
-                                posterior_cloud_for_plot,         # (1, Np, 3)
-                                num_samples_plot=100000,
-                                num_samples_test=1000,
-                                prefix=prefix_post,
-                                point_color="red",
-                                observation=None,
-                                num_repeats=1,
-                                plot_indices=[0],
-                                history_traj=hist_traj,
-                                legend_in_figure=getattr(args, "legend_in_figure", False),
-                            )
+                            if track_pf_non_gaussian:
+                                for record in swd_records:
+                                    pf_non_gaussian_records.append(
+                                        {
+                                            "batch_index": int(batch_ind),
+                                            "global_index": int(gidx),
+                                            "local_index": int(bidx),
+                                            "step": int(i + 1),
+                                            "prefix": str(prefix_pair),
+                                            "cloud_index": int(record.get("cloud_index", 0)),
+                                            "prior_swd_ratio": float(record.get("prior_swd_ratio", float("nan"))),
+                                            "prior_swd_data": float(record.get("prior_swd_data", float("nan"))),
+                                            "prior_swd_baseline": float(record.get("prior_swd_baseline", float("nan"))),
+                                            "post_swd_ratio": float(record.get("post_swd_ratio", float("nan"))),
+                                            "post_swd_data": float(record.get("post_swd_data", float("nan"))),
+                                            "post_swd_baseline": float(record.get("post_swd_baseline", float("nan"))),
+                                        }
+                                    )
                         elif can_plot_ring:
                             # Use full state for ring mapping (1D/2D).
                             prior_cloud_for_plot     = pf_ens_v_f[bidx:bidx+1, :, :].detach().cpu()
@@ -1691,6 +1950,81 @@ def generate_and_cache_pf_results(
     os.makedirs(cache_dir, exist_ok=True)
     torch.save(all_pf_results_to_cache, cache_filepath)
 
+    if len(pf_non_gaussian_records) > 0:
+        distance_dir = pf_vis_folder
+        os.makedirs(distance_dir, exist_ok=True)
+        distance_prefix = (
+            f"{distance_dir}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_{args.seed}"
+            "_non_gaussian_distance"
+        )
+        detailed_pt = f"{distance_prefix}_detail.pt"
+        detailed_csv = f"{distance_prefix}_detail.csv"
+        summary_csv = f"{distance_prefix}_per_step_mean.csv"
+
+        torch.save(pf_non_gaussian_records, detailed_pt)
+        csv_fields = [
+            "batch_index", "global_index", "local_index", "step", "prefix", "cloud_index",
+            "prior_swd_ratio", "prior_swd_data", "prior_swd_baseline",
+            "post_swd_ratio", "post_swd_data", "post_swd_baseline",
+        ]
+        with open(detailed_csv, "w", newline="") as f_csv:
+            writer = csv.DictWriter(f_csv, fieldnames=csv_fields)
+            writer.writeheader()
+            for row in pf_non_gaussian_records:
+                writer.writerow(row)
+
+        step_groups: Dict[int, Dict[str, List[float]]] = {}
+        for row in pf_non_gaussian_records:
+            step = int(row["step"])
+            if step not in step_groups:
+                step_groups[step] = {
+                    "prior_swd_ratio": [],
+                    "prior_swd_data": [],
+                    "prior_swd_baseline": [],
+                    "post_swd_ratio": [],
+                    "post_swd_data": [],
+                    "post_swd_baseline": [],
+                }
+            for key in step_groups[step].keys():
+                val = float(row.get(key, float("nan")))
+                if np.isfinite(val):
+                    step_groups[step][key].append(val)
+
+        with open(summary_csv, "w", newline="") as f_summary:
+            writer = csv.DictWriter(
+                f_summary,
+                fieldnames=[
+                    "step",
+                    "prior_swd_ratio_mean",
+                    "prior_swd_data_mean",
+                    "prior_swd_baseline_mean",
+                    "post_swd_ratio_mean",
+                    "post_swd_data_mean",
+                    "post_swd_baseline_mean",
+                    "num_records",
+                ],
+            )
+            writer.writeheader()
+            for step in sorted(step_groups.keys()):
+                group = step_groups[step]
+                writer.writerow(
+                    {
+                        "step": int(step),
+                        "prior_swd_ratio_mean": float(np.mean(group["prior_swd_ratio"])) if len(group["prior_swd_ratio"]) > 0 else float("nan"),
+                        "prior_swd_data_mean": float(np.mean(group["prior_swd_data"])) if len(group["prior_swd_data"]) > 0 else float("nan"),
+                        "prior_swd_baseline_mean": float(np.mean(group["prior_swd_baseline"])) if len(group["prior_swd_baseline"]) > 0 else float("nan"),
+                        "post_swd_ratio_mean": float(np.mean(group["post_swd_ratio"])) if len(group["post_swd_ratio"]) > 0 else float("nan"),
+                        "post_swd_data_mean": float(np.mean(group["post_swd_data"])) if len(group["post_swd_data"]) > 0 else float("nan"),
+                        "post_swd_baseline_mean": float(np.mean(group["post_swd_baseline"])) if len(group["post_swd_baseline"]) > 0 else float("nan"),
+                        "num_records": int(len(group["post_swd_ratio"])),
+                    }
+                )
+
+        print(
+            "[PF non-Gaussian] Saved SWD distance records: "
+            f"{detailed_pt}, {detailed_csv}, {summary_csv}"
+        )
+
     # --- Final Metrics Calculation (posterior-based) ---
     if all_pf_metrics['rrmse'].numel() == 0:
         return {}
@@ -1742,6 +2076,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
     model, infl_model, local_model, st_model1, st_model2 = model_list
     m = args.N
+    test_noise_gen = get_test_noise_generator(args)
     
     # Select forward function
     forward_fun = _get_forward_fun(args)
@@ -1766,7 +2101,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         batch_size = first_batch_for_shape.shape[1]
         
         cache_dir = os.path.join('data', args.dataset)
-        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_avg.pt"
+        cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
         if os.path.exists(cache_filepath):
@@ -1775,13 +2110,16 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         else:
             raise FileNotFoundError(
                 f"Required particle filter cache file not found at: {cache_filepath}. "
+                f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
                 f"Please run generate_and_cache_pf_results() first."
             )
 
-    # Aggregated results (RMV removed)
+    # Aggregated results
     all_results = {
         'rmse': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
+        'rmv': torch.empty(0, device=args.device),
+        'spread_error_ratio': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
@@ -1799,6 +2137,24 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
     plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
+
+    # Rank-hist configuration: fixed projection directions for the whole test run.
+    rank_num_projections = max(1, int(getattr(args, "rank_num_projections", 8)))
+    rank_seed_default = _safe_int_seed(getattr(args, "seed", None), default=0)
+    rank_projection_seed = _safe_int_seed(
+        getattr(args, "rank_projection_seed", None),
+        default=rank_seed_default,
+    )
+    rank_tie_break = str(getattr(args, "rank_tie_break", "random")).lower()
+    rank_projection_dirs = sample_projection_directions(
+        state_dim=int(args.ori_dim),
+        num_projections=rank_num_projections,
+        device=args.device,
+        dtype=torch.float32,
+        seed=rank_projection_seed,
+    )
+    rank_counts_total = torch.zeros(int(args.N) + 1, dtype=torch.int64)
+    rank_total_samples = 0
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -1829,9 +2185,25 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             clean_h_list = []
             for i in range(len(batch_v)):
                 clean_h_step = H_fun(batch_v[i].unsqueeze(1))
-                obs_y_step = clean_h_step + args.sigma_y * torch.randn_like(clean_h_step, device=args.device)
+                obs_noise_step = _sample_true_obs_noise_like(clean_h_step, test_noise_gen)
+                obs_y_step = clean_h_step + args.sigma_y * obs_noise_step
                 obs_y_list.append(obs_y_step)
                 clean_h_list.append(clean_h_step.squeeze(1))
+
+            d_state_batch = int(batch_v.shape[-1])
+            d_obs_batch = int(obs_y_list[0].shape[-1]) if len(obs_y_list) > 0 else int(args.obs_dim)
+            (
+                coords_state_runtime,
+                coords_obs_runtime,
+                loc_domain_runtime,
+                loc_lvy_runtime,
+                loc_lyy_runtime,
+            ) = _build_runtime_localization_geometry(
+                args=args,
+                d_state=d_state_batch,
+                d_obs=d_obs_batch,
+                dtype=batch_v.dtype,
+            )
 
             h_tensor = torch.stack(clean_h_list, dim=0)
             snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
@@ -1952,16 +2324,31 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             ens_tensor = torch.stack(ens_list)
             ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
             
-            # Metrics (RMV removed; NaNs are handled later by masks)
+            # Metrics (NaNs are handled later by masks)
             crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
+            rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
+            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+
+            rank_stats_batch = compute_ensemble_rank_histogram(
+                ens_states=ens_tensor,
+                true_states=batch_v,
+                projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
+                num_projections=rank_num_projections,
+                tie_break=rank_tie_break,
+                seed=rank_projection_seed + batch_ind,
+            )
+            rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
+            rank_total_samples += int(rank_stats_batch["total_samples"])
             
             # Aggregate metrics
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
+            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
+            all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
@@ -2091,12 +2478,14 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             f"{unresolved_sorted[:10]}{'...' if len(unresolved_sorted) > 10 else ''}"
         )
 
-    # Final metrics (RMV removed)
+    # Final metrics
     final_metrics = {}
     
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse',
-                        'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
+                        'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
+                        'mean_spread_error_ratio', 'std_spread_error_ratio',
+                        'mean_crps', 'std_crps',
                         'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
                         'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
                         'mean_pf_rrmse', 'std_pf_rrmse']
@@ -2108,7 +2497,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         
         if not valid_B_mask.any():
             metrics_keys = ['mean_rmse', 'std_rmse',
-                            'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
+                            'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
+                            'mean_spread_error_ratio', 'std_spread_error_ratio',
+                            'mean_crps', 'std_crps',
                             'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
                             'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
                             'mean_pf_rrmse', 'std_pf_rrmse']
@@ -2117,6 +2508,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         else:
             final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
             final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
+            final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
+            final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
+                all_results['spread_error_ratio'][valid_B_mask]
+            )
             final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
             final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
@@ -2133,6 +2528,33 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     else:
         final_metrics['mean_snr_var'] = float('nan')
         final_metrics['std_snr_var'] = float('nan')
+
+    if rank_total_samples > 0:
+        rank_probs = rank_counts_total.to(torch.float64) / float(rank_total_samples)
+        rank_uniform = torch.full_like(rank_probs, 1.0 / float(rank_counts_total.numel()))
+        rank_l1 = torch.sum(torch.abs(rank_probs - rank_uniform))
+        rank_l2 = torch.sqrt(torch.mean((rank_probs - rank_uniform) ** 2))
+        rank_freq_range = torch.max(rank_probs) - torch.min(rank_probs)
+        rank_expected = float(rank_total_samples) / float(rank_counts_total.numel())
+        rank_chi2 = torch.sum((rank_counts_total.to(torch.float64) - rank_expected) ** 2 / max(rank_expected, 1e-12))
+
+        final_metrics['rank_hist_counts'] = rank_counts_total.tolist()
+        final_metrics['rank_hist_probs'] = rank_probs.to(torch.float32).tolist()
+        final_metrics['rank_total_samples'] = int(rank_total_samples)
+        final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_freq_range'] = float(rank_freq_range.item())
+        final_metrics['rank_uniform_l1'] = float(rank_l1.item())
+        final_metrics['rank_uniform_l2'] = float(rank_l2.item())
+        final_metrics['rank_chi2'] = float(rank_chi2.item())
+    else:
+        final_metrics['rank_hist_counts'] = [0 for _ in range(int(args.N) + 1)]
+        final_metrics['rank_hist_probs'] = [float('nan') for _ in range(int(args.N) + 1)]
+        final_metrics['rank_total_samples'] = 0
+        final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_freq_range'] = float('nan')
+        final_metrics['rank_uniform_l1'] = float('nan')
+        final_metrics['rank_uniform_l2'] = float('nan')
+        final_metrics['rank_chi2'] = float('nan')
 
     # ---- NEW: compute analysis-step timing stats and attach to final_metrics ----
     if len(assim_step_times) > 0:
@@ -2167,6 +2589,10 @@ def print_test_results(results):
         print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
     if 'mean_rrmse' in results and 'std_rrmse' in results:
         print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
+    if 'mean_rmv' in results and 'std_rmv' in results:
+        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
+    if 'mean_spread_error_ratio' in results and 'std_spread_error_ratio' in results:
+        print(f"Spread-Error Ratio: {results['mean_spread_error_ratio']:.3f} ± {results['std_spread_error_ratio']:.3f}")
     if 'mean_crps' in results and 'std_crps' in results:
         print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
     if 'mean_rcrps' in results and 'std_rcrps' in results:
@@ -2189,6 +2615,27 @@ def print_test_results(results):
     if 'mean_snr_var' in results and 'std_snr_var' in results:
         print(f"SNR_var: {results['mean_snr_var']:.3f} ± {results['std_snr_var']:.3f}")
 
+    if 'rank_freq_range' in results:
+        rank_total = results.get('rank_total_samples', 0)
+        rank_proj = results.get('rank_num_projections', None)
+        rank_proj_str = f", projections={rank_proj}" if rank_proj is not None else ""
+        print(f"Rank-Hist FreqRange(max-min): {results['rank_freq_range']:.4f}{rank_proj_str}, samples={rank_total}")
+
+    if 'rank_uniform_l1' in results:
+        rank_total = results.get('rank_total_samples', 0)
+        rank_proj = results.get('rank_num_projections', None)
+        rank_proj_str = f", projections={rank_proj}" if rank_proj is not None else ""
+        print(f"Rank-Hist Uniform L1: {results['rank_uniform_l1']:.4f}{rank_proj_str}, samples={rank_total}")
+    if 'rank_uniform_l2' in results:
+        print(f"Rank-Hist Uniform L2: {results['rank_uniform_l2']:.4f}")
+    if 'rank_chi2' in results:
+        print(f"Rank-Hist Chi2: {results['rank_chi2']:.3f}")
+    if 'rank_hist_probs' in results:
+        probs = results['rank_hist_probs']
+        if isinstance(probs, (list, tuple)) and len(probs) <= 32:
+            probs_str = ", ".join(f"{float(p):.3f}" for p in probs)
+            print(f"Rank-Hist probs: [{probs_str}]")
+
     # --- Timing outputs in milliseconds (ms) ---
 
     # Unweighted per-step assimilation time (originally in seconds)
@@ -2204,6 +2651,44 @@ def print_test_results(results):
         print(f"Assim-step time (ms, weighted): {mean_ms_w:.3f} ± {std_ms_w:.3f}")
 
 
+def _build_runtime_localization_geometry(args, d_state: int, d_obs: int, dtype: torch.dtype):
+    """
+    Build localization geometry on-the-fly.
+
+    This supports nonlinear observations where args.obs_coord_inds/args.Lvy/args.Lyy
+    may be unavailable by falling back to evenly spaced observation coordinates.
+    """
+    if d_obs <= 0:
+        raise ValueError(f"d_obs must be positive, but got {d_obs}.")
+
+    device = args.device
+    coords_state = torch.arange(d_state, device=device, dtype=dtype).unsqueeze(1)
+
+    obs_coord_inds = getattr(args, "obs_coord_inds", None)
+    obs_inds = getattr(args, "obs_inds", None)
+    if obs_coord_inds is not None and len(obs_coord_inds) == d_obs:
+        coords_obs = torch.as_tensor(obs_coord_inds, device=device, dtype=dtype).reshape(-1, 1)
+    elif obs_inds is not None and len(obs_inds) == d_obs:
+        coords_obs = torch.as_tensor(obs_inds, device=device, dtype=dtype).reshape(-1, 1)
+    else:
+        if d_obs == 1:
+            coords_obs = torch.zeros((1, 1), device=device, dtype=dtype)
+        else:
+            coords_obs = torch.linspace(0.0, float(d_state - 1), steps=d_obs, device=device, dtype=dtype).unsqueeze(1)
+
+    if args.dataset in {"lorenz96", "ks"}:
+        domain = torch.tensor([float(d_state)], device=device, dtype=dtype)
+        domain_for_dist = (float(d_state),)
+    else:
+        domain = None
+        domain_for_dist = None
+
+    lvy = pairwise_distances(coords_state, coords_obs, domain=domain_for_dist).to(device=device, dtype=dtype)
+    lyy = pairwise_distances(coords_obs, coords_obs, domain=domain_for_dist).to(device=device, dtype=dtype)
+
+    return coords_state, coords_obs, domain, lvy, lyy
+
+
 
 
 
@@ -2217,7 +2702,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     for all subsequent steps. We keep shape consistency by writing NaNs for its
     outputs so that downstream metrics (which already NaN-mask) ignore it.
 
-    CHANGE: All RMV-related computation and metrics were removed to avoid OOM.
+    CHANGE: Includes spread metrics (RMV/SER) and rank-hist calibration stats.
 
     NEW (timing): Records wall-clock time for each assimilation step (per i),
     aggregates across all batches. Also records a trajectory-weighted variant
@@ -2229,7 +2714,20 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     import torch
     from tqdm import tqdm
 
+    # Keep figure-saving behavior aligned with test_model callers:
+    # allow CLI flag --save_test_figures to enable plotting even if caller forgot.
+    if getattr(args, "save_test_figures", False):
+        plot_figures = True
+
+    # If plotting is enabled but fig_name is left as default, create a stable
+    # benchmark-style output path so generated figures are saved under save/.
+    if plot_figures and fig_name == 'example_fig':
+        auto_fig_dir = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
+        os.makedirs(auto_fig_dir, exist_ok=True)
+        fig_name = os.path.join(auto_fig_dir, f"test_{args.N}_0")
+
     m = args.N
+    test_noise_gen = get_test_noise_generator(args)
 
     # Select forward function
     forward_fun = _get_forward_fun(args)
@@ -2253,7 +2751,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         batch_size = first_batch_for_shape.shape[1]
 
         cache_dir = os.path.join('data', args.dataset)
-        cache_filename = f"pf_results_sigma_y_{args.sigma_y}_batch_{batch_size}_len_{traj_len}_pfN_{args.pf_N}_avg.pt"
+        cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
         if os.path.exists(cache_filepath):
@@ -2262,13 +2760,16 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         else:
             raise FileNotFoundError(
                 f"Required particle filter cache file not found at: {cache_filepath}. "
+                f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
                 f"Please run generate_and_cache_pf_results() first."
             )
 
-    # Aggregated results (RMV removed)
+    # Aggregated results
     all_results = {
         'rmse': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
+        'rmv': torch.empty(0, device=args.device),
+        'spread_error_ratio': torch.empty(0, device=args.device),
         'crps': torch.empty(0, device=args.device),
         'rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
@@ -2285,6 +2786,22 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
     plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
+    rank_num_projections = max(1, int(getattr(args, "rank_num_projections", 8)))
+    rank_seed_default = _safe_int_seed(getattr(args, "seed", None), default=0)
+    rank_projection_seed = _safe_int_seed(
+        getattr(args, "rank_projection_seed", None),
+        default=rank_seed_default,
+    )
+    rank_tie_break = str(getattr(args, "rank_tie_break", "random")).lower()
+    rank_projection_dirs = sample_projection_directions(
+        state_dim=int(args.ori_dim),
+        num_projections=rank_num_projections,
+        device=args.device,
+        dtype=torch.float32,
+        seed=rank_projection_seed,
+    )
+    rank_counts_total = torch.zeros(int(args.N) + 1, dtype=torch.int64)
+    rank_total_samples = 0
 
     with torch.no_grad():
         for batch_ind, batch_v in enumerate(loader):
@@ -2315,9 +2832,25 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             clean_h_list = []
             for i in range(len(batch_v)):
                 clean_h_step = H_fun(batch_v[i].unsqueeze(1))
-                obs_y_step = clean_h_step + args.sigma_y * torch.randn_like(clean_h_step, device=args.device)
+                obs_noise_step = _sample_true_obs_noise_like(clean_h_step, test_noise_gen)
+                obs_y_step = clean_h_step + args.sigma_y * obs_noise_step
                 obs_y_list.append(obs_y_step)
                 clean_h_list.append(clean_h_step.squeeze(1))
+
+            d_state_batch = int(batch_v.shape[-1])
+            d_obs_batch = int(obs_y_list[0].shape[-1]) if len(obs_y_list) > 0 else int(args.obs_dim)
+            (
+                coords_state_runtime,
+                coords_obs_runtime,
+                loc_domain_runtime,
+                loc_lvy_runtime,
+                loc_lyy_runtime,
+            ) = _build_runtime_localization_geometry(
+                args=args,
+                d_state=d_state_batch,
+                d_obs=d_obs_batch,
+                dtype=batch_v.dtype,
+            )
 
             h_tensor = torch.stack(clean_h_list, dim=0)
             snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
@@ -2352,10 +2885,6 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 if plot_prior_enabled:
                     ens_f_list.append(ens_v_f)
 
-                # Shapes
-                B_shape, N_ens, D_state = ens_v_f.shape
-                d_obs_shape = obs_y.shape[2]
-
                 # Common args
                 common_enkf_args = {
                     "observation_y": None,  # will be filled with subset
@@ -2375,53 +2904,33 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     common_enkf_args["observation_y"] = obs_y_active
 
                     if args.v == 'EnKF':
-                        use_loc = (loc_radius is not None and args.Lvy is not None and args.Lyy is not None)
-                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if use_loc else None
-                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if use_loc else None
+                        use_loc = loc_radius is not None
+                        loc_vy = dist2coeff(loc_lvy_runtime, radius=loc_radius).unsqueeze(0) if use_loc else None
+                        loc_yy = dist2coeff(loc_lyy_runtime, radius=loc_radius).unsqueeze(0) if use_loc else None
                         ens_v_a_active, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active, **common_enkf_args, method='EnKF-PertObs',
                             localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
 
                     elif args.v == 'ESRF':
-                        use_loc = (loc_radius is not None and args.Lvy is not None and args.Lyy is not None)
-                        loc_vy = dist2coeff(args.Lvy, radius=loc_radius).unsqueeze(0) if use_loc else None
-                        loc_yy = dist2coeff(args.Lyy, radius=loc_radius).unsqueeze(0) if use_loc else None
                         ens_v_a_active, _ = ensemble_kalman_filter_analysis(
-                            ens_v_f_active, **common_enkf_args, method='ESRF',
-                            localization_matrix_Lxy=loc_vy, localization_matrix_Lyy=loc_yy)
+                            ens_v_f_active, **common_enkf_args, method='ESRF')
 
                     elif args.v == 'LETKF':
-                        coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        if hasattr(args, 'obs_coord_inds') and args.obs_coord_inds is not None and len(args.obs_coord_inds) == d_obs_shape:
-                            coords_obs = torch.as_tensor(args.obs_coord_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        elif hasattr(args, 'obs_inds') and args.obs_inds is not None and len(args.obs_inds) == d_obs_shape:
-                            coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        else:
-                            coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
-                        domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
+                        letkf_radius = float(loc_radius) if loc_radius is not None else float("inf")
                         ens_v_a_active, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active, **common_enkf_args, method='LETKF',
-                            localization_radius=loc_radius, coords_state=coords_state,
-                            coords_obs=coords_obs, localization_domain=domain)
+                            localization_radius=letkf_radius, coords_state=coords_state_runtime,
+                            coords_obs=coords_obs_runtime, localization_domain=loc_domain_runtime)
 
                     elif args.v.startswith('iEnKS'):
-                        coords_state = torch.arange(D_state, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        if hasattr(args, 'obs_coord_inds') and args.obs_coord_inds is not None and len(args.obs_coord_inds) == d_obs_shape:
-                            coords_obs = torch.as_tensor(args.obs_coord_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        elif hasattr(args, 'obs_inds') and args.obs_inds is not None and len(args.obs_inds) == d_obs_shape:
-                            coords_obs = torch.as_tensor(args.obs_inds, device=args.device, dtype=batch_v.dtype).unsqueeze(1)
-                        else:
-                            coords_obs = torch.linspace(0, D_state-1, steps=d_obs_shape, device=args.device, dtype=batch_v.dtype).long().unsqueeze(1)
-                        domain = torch.tensor([D_state], device=args.device, dtype=batch_v.dtype)
-
                         E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active,
                             **common_enkf_args,
                             method=args.v,
-                            localization_radius=loc_radius, 
-                            coords_state=coords_state,
-                            coords_obs=coords_obs, 
-                            localization_domain=domain,
+                            localization_radius=None,
+                            coords_state=coords_state_runtime,
+                            coords_obs=coords_obs_runtime, 
+                            localization_domain=loc_domain_runtime,
                             ienks_lag=1,
                             ienks_niter=10,
                             ienks_wtol=1e-5,
@@ -2490,9 +2999,24 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
+            rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
+            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+
+            rank_stats_batch = compute_ensemble_rank_histogram(
+                ens_states=ens_tensor,
+                true_states=batch_v,
+                projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
+                num_projections=rank_num_projections,
+                tie_break=rank_tie_break,
+                seed=rank_projection_seed + batch_ind,
+            )
+            rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
+            rank_total_samples += int(rank_stats_batch["total_samples"])
 
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
+            all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
+            all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
             all_results['crps'] = torch.cat((all_results['crps'], crps_val))
             all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
@@ -2610,6 +3134,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     final_metrics = {}
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
+                        'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
                         'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
                         'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
                         'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
@@ -2621,6 +3146,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
         if not valid_B_mask.any():
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
+                            'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
                             'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
                             'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
                             'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
@@ -2629,6 +3155,10 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         else:
             final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
             final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
+            final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
+            final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
+                all_results['spread_error_ratio'][valid_B_mask]
+            )
             final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
             final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
@@ -2645,6 +3175,33 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     else:
         final_metrics['mean_snr_var'] = float('nan')
         final_metrics['std_snr_var'] = float('nan')
+
+    if rank_total_samples > 0:
+        rank_probs = rank_counts_total.to(torch.float64) / float(rank_total_samples)
+        rank_uniform = torch.full_like(rank_probs, 1.0 / float(rank_counts_total.numel()))
+        rank_l1 = torch.sum(torch.abs(rank_probs - rank_uniform))
+        rank_l2 = torch.sqrt(torch.mean((rank_probs - rank_uniform) ** 2))
+        rank_freq_range = torch.max(rank_probs) - torch.min(rank_probs)
+        rank_expected = float(rank_total_samples) / float(rank_counts_total.numel())
+        rank_chi2 = torch.sum((rank_counts_total.to(torch.float64) - rank_expected) ** 2 / max(rank_expected, 1e-12))
+
+        final_metrics['rank_hist_counts'] = rank_counts_total.tolist()
+        final_metrics['rank_hist_probs'] = rank_probs.to(torch.float32).tolist()
+        final_metrics['rank_total_samples'] = int(rank_total_samples)
+        final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_freq_range'] = float(rank_freq_range.item())
+        final_metrics['rank_uniform_l1'] = float(rank_l1.item())
+        final_metrics['rank_uniform_l2'] = float(rank_l2.item())
+        final_metrics['rank_chi2'] = float(rank_chi2.item())
+    else:
+        final_metrics['rank_hist_counts'] = [0 for _ in range(int(args.N) + 1)]
+        final_metrics['rank_hist_probs'] = [float('nan') for _ in range(int(args.N) + 1)]
+        final_metrics['rank_total_samples'] = 0
+        final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_freq_range'] = float('nan')
+        final_metrics['rank_uniform_l1'] = float('nan')
+        final_metrics['rank_uniform_l2'] = float('nan')
+        final_metrics['rank_chi2'] = float('nan')
 
     # ---- NEW: compute timing stats and attach to final_metrics ----
     # We compute (1) per-step mean/std and (2) trajectory-weighted mean/std.
@@ -2876,6 +3433,7 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
     # --- Forward and Observation Function Initialization for Linear Model ---
     forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1, -2))
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1, -2))
+    test_noise_gen = get_test_noise_generator(args)
 
     # --- Set Models to Evaluation Mode ---
     model.eval()
@@ -2940,7 +3498,9 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 R = (sigma_y.view(B, 1, 1) ** 2) * torch.eye(D_obs, device=args.device).unsqueeze(0).repeat(B, 1, 1)
                 gt_v_f = forward_fun(gt_v_a, A)
                 gt_v_a = gt_v_f + torch.bmm(torch.randn_like(gt_v_f), Q.sqrt())
-                obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a,H)), R.sqrt())
+                clean_h = H_fun(gt_v_a, H)
+                obs_noise = _sample_true_obs_noise_like(clean_h, test_noise_gen)
+                obs_y = clean_h + torch.bmm(obs_noise, R.sqrt())
 
                 # --- Kalman Filter Covariance Update (Ground Truth) ---
                 P_f = A @ P_a @ A.transpose(-1, -2) + Q
@@ -3148,6 +3708,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
     # --- Forward and Observation Function Initialization ---
     forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1, -2))
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1, -2))
+    test_noise_gen = get_test_noise_generator(args)
 
     # --- Initialize Result Tensors for All Batches---
     all_results = {
@@ -3187,7 +3748,9 @@ def test_linear_sampling_error(loader, args, num_resamples):
                 
                 gt_v_f = forward_fun(gt_v_a, A)
                 gt_v_a = gt_v_f + torch.bmm(torch.randn_like(gt_v_f), Q.sqrt())
-                obs_y = H_fun(gt_v_a, H) + torch.bmm(torch.randn_like(H_fun(gt_v_a, H)), R.sqrt())
+                clean_h = H_fun(gt_v_a, H)
+                obs_noise = _sample_true_obs_noise_like(clean_h, test_noise_gen)
+                obs_y = clean_h + torch.bmm(obs_noise, R.sqrt())
 
                 # --- Kalman Filter Update (Ground Truth) ---
                 P_f = A @ P_a @ A.transpose(-1, -2) + Q
