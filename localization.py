@@ -14,8 +14,11 @@ def pairwise_distances(A, B=None, domain=None):
 
     d = A[:, None] - B
 
-    if domain:
-        domain = torch.reshape(torch.as_tensor(domain), (1, 1, -1))
+    if domain is not None:
+        domain = torch.reshape(
+            torch.as_tensor(domain, device=d.device, dtype=d.dtype),
+            (1, 1, -1),
+        )
         d = torch.abs(d)
         d = torch.minimum(d, domain - d)
 

@@ -2678,13 +2678,11 @@ def _build_runtime_localization_geometry(args, d_state: int, d_obs: int, dtype: 
 
     if args.dataset in {"lorenz96", "ks"}:
         domain = torch.tensor([float(d_state)], device=device, dtype=dtype)
-        domain_for_dist = (float(d_state),)
     else:
         domain = None
-        domain_for_dist = None
 
-    lvy = pairwise_distances(coords_state, coords_obs, domain=domain_for_dist).to(device=device, dtype=dtype)
-    lyy = pairwise_distances(coords_obs, coords_obs, domain=domain_for_dist).to(device=device, dtype=dtype)
+    lvy = pairwise_distances(coords_state, coords_obs, domain=domain).to(device=device, dtype=dtype)
+    lyy = pairwise_distances(coords_obs, coords_obs, domain=domain).to(device=device, dtype=dtype)
 
     return coords_state, coords_obs, domain, lvy, lyy
 
