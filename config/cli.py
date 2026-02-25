@@ -116,6 +116,75 @@ def parse_test_plot_index(value):
     return indices
 
 
+def parse_snapshot_steps(value):
+    """
+    Parse snapshot-step specification.
+
+    Supported forms:
+    - "none" / "" -> None
+    - "100,200,300" -> [100, 200, 300]
+    - "1:2:500" -> [1, 3, 5, ..., 499] (inclusive upper bound when hit exactly)
+    - Mixed: "100,1:2:200,350"
+    """
+    if value is None:
+        return None
+    sval = str(value).strip().lower()
+    if sval in {"", "none", "null"}:
+        return None
+
+    out = []
+    tokens = [tok.strip() for tok in str(value).split(",") if tok.strip() != ""]
+    if len(tokens) == 0:
+        return None
+
+    for tok in tokens:
+        if ":" in tok:
+            parts = tok.split(":")
+            if len(parts) != 3:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid snapshot range '{tok}'. Use start:step:end, e.g. 1:2:500."
+                )
+            try:
+                start = int(parts[0].strip())
+                step = int(parts[1].strip())
+                end = int(parts[2].strip())
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid snapshot range '{tok}'. start/step/end must be integers."
+                )
+            if step == 0:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid snapshot range '{tok}'. step must be non-zero."
+                )
+            if step > 0:
+                if start > end:
+                    raise argparse.ArgumentTypeError(
+                        f"Invalid snapshot range '{tok}'. For positive step, start must be <= end."
+                    )
+                vals = list(range(start, end + 1, step))
+            else:
+                if start < end:
+                    raise argparse.ArgumentTypeError(
+                        f"Invalid snapshot range '{tok}'. For negative step, start must be >= end."
+                    )
+                vals = list(range(start, end - 1, step))
+            out.extend(vals)
+        else:
+            try:
+                out.append(int(tok))
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid snapshot step '{tok}'. Use integer, comma-list, or start:step:end."
+                )
+
+    # De-duplicate while preserving order.
+    dedup = []
+    for v in out:
+        if v not in dedup:
+            dedup.append(v)
+    return dedup if len(dedup) > 0 else None
+
+
 def _parse_csv_float(value):
     if value is None:
         return None
@@ -360,10 +429,26 @@ def get_parameters():
                         help='Training precision. fp32 is default (no precision loss). bf16/fp16 enable mixed precision on CUDA.')
     
     # test settings
-    parser.add_argument('--pf_verification', action='store_true', help='Use particle filter to approximate true filtering distribution')
+    # PF-related settings (kept together)
+    parser.add_argument('--pf_verification', action='store_true',
+                        help='Use particle filter to approximate true filtering distribution')
     parser.add_argument('--pf_N', type=int, default=1000,
-                        help='number particles for PF')
-    parser.add_argument('--pf_save_figure', action='store_true', help='save_pf_visualization')
+                        help='Number of particles for PF')
+    parser.add_argument('--pf_save_figure', action='store_true',
+                        help='Save PF visualization')
+    parser.add_argument('--pf_swd', action='store_true',
+                        help='Compute PF SWD diagnostics during visualization. Disabled by default for speed.')
+    parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
+                        help='Std of noise added during PF resampling (BPF regularization)')
+    parser.add_argument('--pf_num_quantiles', type=int, default=257,
+                        help='Number of quantile points saved for PF marginal summaries')
+    parser.add_argument('--pf_range_q_lo', type=float, default=0.01,
+                        help='Lower quantile used for PF range summary')
+    parser.add_argument('--pf_range_q_hi', type=float, default=0.99,
+                        help='Upper quantile used for PF range summary')
+    parser.add_argument('--pf_range_pad_int', type=int, default=5,
+                        help='Integer padding added to floor/ceil PF quantile ranges')
+
     parser.add_argument('--save_test_figures', action='store_true',
                         help='save visualization figures during test/evaluation')
     parser.add_argument('--legend_in_figure', action='store_true',
@@ -371,8 +456,8 @@ def get_parameters():
                              'If not set, figures omit them and save standalone legends.')
     parser.add_argument('--test_plot_index', type=parse_test_plot_index, default='0',
                         help="Global trajectory index selection for test/PF plotting: e.g. '0', '0,1', or 'adaptive'.")
-    parser.add_argument('--sigma_reg', type=float_or_none_or_default, default=None,
-                        help='the std of noise added to resampling in BPF')
+    parser.add_argument('--test_snapshot_steps', type=parse_snapshot_steps, default=None,
+                        help="Snapshot steps for slice figures. Supports '100,200,300' and '1:2:500'.")
     parser.add_argument('--rank_num_projections', type=int, default=8,
                         help='Number of fixed random projection directions for ensemble-rank evaluation.')
     parser.add_argument('--rank_projection_seed', type=int_or_none_or_default, default=None,

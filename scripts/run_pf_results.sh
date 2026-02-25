@@ -42,7 +42,7 @@ for seed_val in "${SEEDS[@]}"; do
             --sigma_reg None \
             --pf_save_figure \
             --obs_fn square \
-            --adaptive_sigma_y
+            --adaptive_sigma_y 
         
         echo "Done."
         echo ""
@@ -66,12 +66,37 @@ for seed_val in "${SEEDS[@]}"; do
             --sigma_reg None \
             --pf_save_figure \
             --obs_fn arctan \
-            --adaptive_sigma_y
+            --adaptive_sigma_y 
         
         echo "Done."
         echo ""
     done
 done
+
+for seed_val in "${SEEDS[@]}"; do
+    for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
+        
+        echo "============================================================"
+        echo "Running with Seed: $seed_val and Particle Count (pf_N): $pf_n_val"
+        echo "============================================================"
+        
+        "$PYTHON_BIN" gen_pf_results.py \
+            --dataset lorenz63 \
+            --seed "$seed_val" \
+            --normal_output \
+            --test_steps 500 \
+            --pf_verification \
+            --pf_N "$pf_n_val" \
+            --sigma_reg None \
+            --pf_save_figure \
+            --adaptive_sigma_y 
+        
+        echo "Done."
+        echo ""
+    done
+done
+
+
 
 # for seed_val in "${SEEDS[@]}"; do
 #     for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
@@ -163,6 +188,28 @@ for seed_val in "${SEEDS[@]}"; do
             --pf_N "$pf_n_val" \
             --sigma_reg None \
             --obs_fn arctan \
+            --adaptive_sigma_y
+        
+        echo "Done."
+        echo ""
+    done
+done
+
+for seed_val in "${SEEDS[@]}"; do
+    for pf_n_val in "${PARTICLE_NUMBERS[@]}"; do
+        
+        echo "============================================================"
+        echo "Running with Seed: $seed_val and Particle Count (pf_N): $pf_n_val"
+        echo "============================================================"
+        
+        "$PYTHON_BIN" gen_pf_results.py \
+            --dataset lorenz63 \
+            --seed "$seed_val" \
+            --normal_output \
+            --test_steps 500 \
+            --pf_verification \
+            --pf_N "$pf_n_val" \
+            --sigma_reg None \
             --adaptive_sigma_y
         
         echo "Done."

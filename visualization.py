@@ -87,6 +87,230 @@ def _save_horizontal_legend_image(
         fig.savefig(f"{prefix}_legend.pdf", bbox_inches='tight', pad_inches=pad_inches)
     plt.close(fig)
 
+
+def _covariance_ellipse_2d(
+    cov_2d: np.ndarray,
+    center_2d: np.ndarray,
+    n_std: float = 2.447746830680816,
+    **kwargs,
+):
+    """
+    Build a matplotlib ellipse patch from a 2x2 covariance matrix.
+
+    n_std=2.4477 corresponds to a 95% confidence region in 2D.
+    """
+    cov = np.asarray(cov_2d, dtype=np.float64)
+    center = np.asarray(center_2d, dtype=np.float64)
+    if cov.shape != (2, 2):
+        raise ValueError(f"cov_2d must be (2,2), got {cov.shape}.")
+    if center.shape != (2,):
+        raise ValueError(f"center_2d must be (2,), got {center.shape}.")
+
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.clip(eigvals[order], a_min=0.0, a_max=None)
+    eigvecs = eigvecs[:, order]
+
+    angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+    width = 2.0 * n_std * np.sqrt(eigvals[0])
+    height = 2.0 * n_std * np.sqrt(eigvals[1])
+    return mpatches.Ellipse(
+        xy=center,
+        width=float(width),
+        height=float(height),
+        angle=float(angle),
+        **kwargs,
+    )
+
+
+def plot_linear_kalman_vs_method_2d(
+    kalman_means: torch.Tensor,
+    kalman_covs: torch.Tensor,
+    method_means: torch.Tensor,
+    method_covs: torch.Tensor,
+    dim_indices: Tuple[int, int] = (0, 1),
+    tail_steps: int = 20,
+    save_fig: bool = False,
+    save_pdf: bool = False,
+    save_name: str = "example_fig_linear_2d",
+    legend_in_figure: bool = True,
+):
+    """
+    Plot 2D projected trajectories with 95% covariance ellipses:
+    Kalman posterior (as reference truth) vs. method posterior.
+    """
+    if kalman_means.ndim != 2 or method_means.ndim != 2:
+        raise ValueError("kalman_means and method_means must be 2D tensors [T, D].")
+    if kalman_covs.ndim != 3 or method_covs.ndim != 3:
+        raise ValueError("kalman_covs and method_covs must be 3D tensors [T, D, D].")
+    if kalman_means.shape != method_means.shape:
+        raise ValueError("kalman_means and method_means must have the same shape.")
+    if kalman_covs.shape != method_covs.shape:
+        raise ValueError("kalman_covs and method_covs must have the same shape.")
+    if kalman_means.shape[0] != kalman_covs.shape[0]:
+        raise ValueError("Time length mismatch between means and covariances.")
+
+    total_steps, state_dim = kalman_means.shape
+    if total_steps <= 0:
+        print("Warning: empty trajectory, skipping 2D linear visualization.")
+        return
+
+    dim0, dim1 = int(dim_indices[0]), int(dim_indices[1])
+    if not (0 <= dim0 < state_dim and 0 <= dim1 < state_dim):
+        raise ValueError(
+            f"dim_indices={dim_indices} out of range for state_dim={state_dim}."
+        )
+    if dim0 == dim1:
+        raise ValueError("dim_indices must contain two distinct dimensions.")
+
+    tail_steps = max(1, int(tail_steps))
+    start = max(0, total_steps - tail_steps)
+    end = total_steps
+
+    km = kalman_means[start:end, [dim0, dim1]].detach().cpu().numpy()
+    mm = method_means[start:end, [dim0, dim1]].detach().cpu().numpy()
+    kc_full = kalman_covs[start:end].detach().cpu().numpy()
+    mc_full = method_covs[start:end].detach().cpu().numpy()
+
+    idx = np.array([dim0, dim1], dtype=np.int64)
+    kc = kc_full[:, idx[:, None], idx[None, :]]
+    mc = mc_full[:, idx[:, None], idx[None, :]]
+
+    valid_k = np.isfinite(km).all(axis=1) & np.isfinite(kc.reshape(kc.shape[0], -1)).all(axis=1)
+    valid_m = np.isfinite(mm).all(axis=1) & np.isfinite(mc.reshape(mc.shape[0], -1)).all(axis=1)
+    if (not np.any(valid_k)) and (not np.any(valid_m)):
+        print("Warning: all projected values are non-finite, skipping 2D linear visualization.")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    kalman_color = "tab:blue"
+    method_color = "tab:red"
+    n_std_95 = 2.447746830680816
+
+    km_plot = km.copy()
+    km_plot[~valid_k] = np.nan
+    mm_plot = mm.copy()
+    mm_plot[~valid_m] = np.nan
+
+    ax.plot(
+        km_plot[:, 0],
+        km_plot[:, 1],
+        color=kalman_color,
+        linewidth=1.8,
+        marker="o",
+        markersize=3.5,
+        alpha=0.95,
+        label="Kalman mean",
+    )
+    ax.plot(
+        mm_plot[:, 0],
+        mm_plot[:, 1],
+        color=method_color,
+        linewidth=1.6,
+        marker="s",
+        markersize=3.0,
+        alpha=0.9,
+        label="Method mean",
+    )
+
+    for t in range(km.shape[0]):
+        if valid_k[t]:
+            ell_k = _covariance_ellipse_2d(
+                kc[t],
+                km[t],
+                n_std=n_std_95,
+                edgecolor=kalman_color,
+                facecolor=kalman_color,
+                alpha=0.12,
+                linewidth=1.0,
+            )
+            ax.add_patch(ell_k)
+        if valid_m[t]:
+            ell_m = _covariance_ellipse_2d(
+                mc[t],
+                mm[t],
+                n_std=n_std_95,
+                edgecolor=method_color,
+                facecolor=method_color,
+                alpha=0.10,
+                linewidth=1.0,
+            )
+            ax.add_patch(ell_m)
+
+    x_all = np.concatenate([km[:, 0], mm[:, 0]])
+    y_all = np.concatenate([km[:, 1], mm[:, 1]])
+    k_var_x = np.clip(kc[:, 0, 0], a_min=0.0, a_max=None)
+    k_var_y = np.clip(kc[:, 1, 1], a_min=0.0, a_max=None)
+    m_var_x = np.clip(mc[:, 0, 0], a_min=0.0, a_max=None)
+    m_var_y = np.clip(mc[:, 1, 1], a_min=0.0, a_max=None)
+    x_rad = n_std_95 * np.sqrt(np.concatenate([k_var_x, m_var_x]))
+    y_rad = n_std_95 * np.sqrt(np.concatenate([k_var_y, m_var_y]))
+    finite_x = np.isfinite(x_all) & np.isfinite(x_rad)
+    finite_y = np.isfinite(y_all) & np.isfinite(y_rad)
+    if np.any(finite_x):
+        x_min = np.min(x_all[finite_x] - x_rad[finite_x])
+        x_max = np.max(x_all[finite_x] + x_rad[finite_x])
+    else:
+        x_min, x_max = -1.0, 1.0
+    if np.any(finite_y):
+        y_min = np.min(y_all[finite_y] - y_rad[finite_y])
+        y_max = np.max(y_all[finite_y] + y_rad[finite_y])
+    else:
+        y_min, y_max = -1.0, 1.0
+
+    x_pad = max(1e-6, 0.08 * (x_max - x_min))
+    y_pad = max(1e-6, 0.08 * (y_max - y_min))
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+    ax.set_aspect('equal')
+    ax.grid(True, linestyle='--', alpha=0.55)
+    ax.set_xlabel(f"dim{dim0}")
+    ax.set_ylabel(f"dim{dim1}")
+    ax.set_title(
+        f"Linear test 2D projection (steps {start + 1}-{end}, 95% covariance ellipses)"
+    )
+
+    if legend_in_figure:
+        ax.legend(loc='best', frameon=True, fontsize=9)
+
+    fig.tight_layout()
+
+    if save_fig:
+        fig.savefig(f"{save_name}.png", dpi=150, bbox_inches='tight')
+        if save_pdf:
+            fig.savefig(f"{save_name}.pdf", bbox_inches='tight')
+    else:
+        plt.show()
+
+    if not legend_in_figure:
+        handles = [
+            Line2D([0], [0], color=kalman_color, linewidth=1.8, marker="o", markersize=5),
+            Line2D([0], [0], color=method_color, linewidth=1.6, marker="s", markersize=5),
+            mpatches.Patch(facecolor=kalman_color, edgecolor=kalman_color, alpha=0.12),
+            mpatches.Patch(facecolor=method_color, edgecolor=method_color, alpha=0.10),
+        ]
+        labels = [
+            "Kalman mean",
+            "Method mean",
+            "Kalman 95% ellipse",
+            "Method 95% ellipse",
+        ]
+        _save_horizontal_legend_image(
+            prefix=save_name,
+            handles=handles,
+            labels=labels,
+            save_pdf=save_pdf,
+            dpi=150,
+            fontsize=11,
+            frameon=True,
+            scale=1.0,
+        )
+
+    plt.close(fig)
+
 def plot_particle_trajectories_with_histograms(
     particles: torch.Tensor,
     true_traj: torch.Tensor,
@@ -800,8 +1024,8 @@ def _save_separate_legend(
                         label='Observation')
     handle_traj = Line2D([0], [0], linestyle='-', color='black', linewidth=2,
                          label='History trajectory')
-    handle_true = Line2D([0], [0], marker='*', linestyle='None',
-                         markerfacecolor='orange', markeredgecolor='black', markersize=14,
+    handle_true = Line2D([0], [0], marker='x', linestyle='None',
+                         color='black', markeredgecolor='black', markersize=10,
                          label='True state')
 
     handles = []
@@ -881,6 +1105,92 @@ def _compute_axis_limits(values: np.ndarray, pad_ratio: float = 0.06) -> Tuple[f
         return (v_min - delta, v_max + delta)
     pad = max(span * pad_ratio, 1e-6)
     return (v_min - pad, v_max + pad)
+
+
+def _zoom_interval_from_fixed_range(
+    values: np.ndarray,
+    fixed_range: Tuple[float, float],
+    num_splits: int = 10,
+) -> Tuple[float, float]:
+    """
+    Zoom-in 1D interval from a fixed range by bin search.
+
+    Procedure:
+    - Split fixed range into `num_splits` equal bins.
+    - Find the shortest contiguous bin interval covering:
+      * 100% points when n < 500
+      * 99% points when n >= 500
+    """
+    lo_fixed = float(fixed_range[0])
+    hi_fixed = float(fixed_range[1])
+    if not np.isfinite(lo_fixed) or not np.isfinite(hi_fixed) or hi_fixed <= lo_fixed:
+        return (-1.0, 1.0)
+
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return (lo_fixed, hi_fixed)
+
+    bins = max(2, int(num_splits))
+    edges = np.linspace(lo_fixed, hi_fixed, bins + 1, dtype=np.float64)
+
+    # Keep points inside fixed range so required coverage is always feasible.
+    vals = np.clip(vals, lo_fixed, hi_fixed)
+    hist, _ = np.histogram(vals, bins=edges)
+    if int(np.sum(hist)) <= 0:
+        return (lo_fixed, hi_fixed)
+
+    n_points = int(vals.size)
+    required = n_points if n_points < 500 else int(np.ceil(0.99 * n_points))
+    required = max(1, min(required, n_points))
+
+    prefix = np.concatenate(([0], np.cumsum(hist, dtype=np.int64)))
+    best_width = bins + 1
+    best_i, best_j = 0, bins - 1
+    median_val = float(np.median(vals))
+    best_center_dist = float("inf")
+
+    for i in range(bins):
+        target = prefix[i] + required
+        j = int(np.searchsorted(prefix, target, side="left") - 1)
+        j = max(i, min(j, bins - 1))
+        count_ij = int(prefix[j + 1] - prefix[i])
+        if count_ij < required:
+            continue
+        width = j - i + 1
+        center = 0.5 * (edges[i] + edges[j + 1])
+        center_dist = abs(center - median_val)
+        if width < best_width or (width == best_width and center_dist < best_center_dist):
+            best_width = width
+            best_i, best_j = i, j
+            best_center_dist = center_dist
+
+    lo = float(edges[best_i])
+    hi = float(edges[best_j + 1])
+    if hi <= lo:
+        return (lo_fixed, hi_fixed)
+    return (lo, hi)
+
+
+def _compute_zoomed_ranges_from_fixed_3d(
+    points_xyz: np.ndarray,
+    fixed_limits: Dict[str, Tuple[float, float]],
+    num_splits: int = 10,
+) -> Dict[str, Tuple[float, float]]:
+    """Compute per-axis zoom-in ranges from fixed 3D limits."""
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return {
+            "xlim": tuple(fixed_limits["xlim"]),
+            "ylim": tuple(fixed_limits["ylim"]),
+            "zlim": tuple(fixed_limits["zlim"]),
+        }
+    pts = pts[:, :3]
+    return {
+        "xlim": _zoom_interval_from_fixed_range(pts[:, 0], fixed_limits["xlim"], num_splits=num_splits),
+        "ylim": _zoom_interval_from_fixed_range(pts[:, 1], fixed_limits["ylim"], num_splits=num_splits),
+        "zlim": _zoom_interval_from_fixed_range(pts[:, 2], fixed_limits["zlim"], num_splits=num_splits),
+    }
 
 
 def _adaptive_projection_kde_std(n_samples: int, base_std: float) -> float:
@@ -1067,61 +1377,21 @@ def _plot_pf_projection_2d(
     if ylim is None:
         ylim = _compute_axis_limits(xy[:, 1])
 
-    n_plot = int(xy.shape[0])
-    use_small_n_kde = (
-        str(dataset or "").lower() == "lorenz63"
-        and n_plot > 2
-        and n_plot < int(kde_threshold)
-    )
-    scatter_size = float(marker_size * (1.7 if use_small_n_kde else 1.0))
-    scatter_alpha = float(min(0.98, marker_alpha * (1.25 if use_small_n_kde else 1.0)))
-
-    if use_small_n_kde:
-        x_span = max(float(xlim[1]) - float(xlim[0]), 1e-6)
-        y_span = max(float(ylim[1]) - float(ylim[0]), 1e-6)
-        scale = np.sqrt(0.5 * (x_span * x_span + y_span * y_span))
-        base_std = max(1e-6, 0.03 * scale)
-        kde_std = _adaptive_projection_kde_std(n_plot, base_std=base_std)
-        xx, yy, density = _isotropic_kde_2d(xy=xy, xlim=xlim, ylim=ylim, std=kde_std, grid_size=120)
-        finite_density = density[np.isfinite(density)]
-        if finite_density.size > 0:
-            max_density = float(np.max(finite_density))
-            if max_density > 0:
-                contour_levels = np.array([0.22, 0.45, 0.70], dtype=np.float64) * max_density
-                contour_levels = np.unique(contour_levels[contour_levels > 1e-12])
-                if contour_levels.size >= 1:
-                    ax.contour(
-                        xx,
-                        yy,
-                        density,
-                        levels=contour_levels,
-                        colors=point_color,
-                        linewidths=1.2,
-                        alpha=0.7,
-                    )
-                fill_levels = np.concatenate(([0.0], contour_levels, [max_density * 1.001]))
-                fill_levels = np.unique(fill_levels)
-                if fill_levels.size >= 2:
-                    cmap_name = "Reds" if "red" in point_color.lower() else "Blues"
-                    ax.contourf(
-                        xx,
-                        yy,
-                        density,
-                        levels=fill_levels,
-                        cmap=cmap_name,
-                        alpha=0.18,
-                    )
+    _ = dataset
+    _ = kde_threshold
+    scatter_size = float(marker_size)
+    scatter_alpha = float(min(0.98, marker_alpha))
 
     ax.scatter(
         xy[:, 0], xy[:, 1],
-        s=scatter_size, alpha=scatter_alpha, c=point_color, edgecolors='none',
+        s=scatter_size, alpha=scatter_alpha, c=point_color, edgecolors='none', zorder=3,
         label=point_label,
     )
 
     if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
         ax.scatter(
             true_xyz[dim_x], true_xyz[dim_y],
-            marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11,
+            marker='*', s=120, c='orange', edgecolors='black', linewidths=0.6, zorder=12,
             label='True state',
         )
 
@@ -1129,6 +1399,104 @@ def _plot_pf_projection_2d(
     ax.set_ylim(ylim)
     if legend_in_figure:
         ax.legend(loc='best', fontsize=8, frameon=True)
+
+
+def _integer_axis_limits(values: np.ndarray, pad: int = 0) -> Tuple[float, float]:
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return (-1.0, 1.0)
+    lo = float(np.floor(np.min(vals))) - float(max(0, int(pad)))
+    hi = float(np.ceil(np.max(vals))) + float(max(0, int(pad)))
+    if hi <= lo:
+        lo -= 1.0
+        hi += 1.0
+    return (lo, hi)
+
+
+def _fit_pca_2d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=np.float64)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        mean = np.zeros((pts.shape[1],), dtype=np.float64) if pts.ndim == 2 else np.zeros((3,), dtype=np.float64)
+        basis = np.zeros((mean.size, 2), dtype=np.float64)
+        basis[0, 0] = 1.0
+        if mean.size > 1:
+            basis[1, 1] = 1.0
+        return mean, basis
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+    cov = np.cov(centered, rowvar=False)
+    cov = np.atleast_2d(np.asarray(cov, dtype=np.float64))
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    basis = eigvecs[:, order[:2]]
+    if basis.shape[1] < 2:
+        pad = np.zeros((basis.shape[0], 2 - basis.shape[1]), dtype=np.float64)
+        basis = np.concatenate([basis, pad], axis=1)
+    return mean, basis
+
+
+def _project_pca_2d(points: np.ndarray, mean: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    centered = pts - mean.reshape(1, -1)
+    return centered @ basis
+
+
+def _quantile_implied_density_curve(
+    quantiles: np.ndarray,
+    probs: np.ndarray,
+    min_dqdp: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    q = np.asarray(quantiles, dtype=np.float64).reshape(-1)
+    p = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if q.size == 0 or p.size == 0 or q.size != p.size:
+        return np.array([]), np.array([])
+    mask = np.isfinite(q) & np.isfinite(p)
+    q = q[mask]
+    p = p[mask]
+    if q.size < 3:
+        return np.array([]), np.array([])
+    order = np.argsort(p)
+    p = p[order]
+    q = q[order]
+    p_unique, idx_unique = np.unique(p, return_index=True)
+    q = q[idx_unique]
+    p = p_unique
+    if q.size < 3:
+        return np.array([]), np.array([])
+    eps = 1e-10
+    q_mono = np.maximum.accumulate(q + eps * np.arange(q.size, dtype=np.float64))
+    dqdp = np.gradient(q_mono, p)
+    dqdp = np.clip(dqdp, float(min_dqdp), None)
+    density = 1.0 / dqdp
+    area = np.trapz(density, q_mono)
+    if np.isfinite(area) and area > 1e-12:
+        density = density / area
+    return q_mono, density
+
+
+def _save_quantile_density_plot(
+    x: np.ndarray,
+    density: np.ndarray,
+    title: str,
+    save_path: str,
+) -> None:
+    if x.size == 0 or density.size == 0:
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 4.0))
+    ax.plot(x, density, color="tab:blue", linewidth=1.8)
+    ax.fill_between(x, 0.0, density, color="tab:blue", alpha=0.18)
+    ax.set_xlabel("state value")
+    ax.set_ylabel("density")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
 
 
 def plot_and_test_point_clouds(
@@ -1143,15 +1511,19 @@ def plot_and_test_point_clouds(
     history_traj: Optional[torch.Tensor] = None,
     true_state: Optional[torch.Tensor] = None,
     legend_in_figure: bool = True,
+    prior_range_int: Optional[torch.Tensor] = None,
+    post_range_int: Optional[torch.Tensor] = None,
+    quantile_probs: Optional[torch.Tensor] = None,
+    prior_quantiles: Optional[torch.Tensor] = None,
+    post_quantiles: Optional[torch.Tensor] = None,
+    prior_pca_quantiles: Optional[torch.Tensor] = None,
+    post_pca_quantiles: Optional[torch.Tensor] = None,
 ):
     """
-    PF-specific visualization for 3D datasets:
-    - One adaptive-range projection set: (x,y), (y,z), (x,z)
-    - One fixed-range projection set: (x,y), (y,z), (x,z)
-    - One fixed-range 3D scatter
-    - Gaussianity score via SWD ratio against fitted Gaussian
-    - No observation marker
-    - History is shown only in 3D
+    PF visualization for non-ring datasets (dim>=3):
+    - For each mode (prior/post): one fixed figure + one adaptive figure.
+    - Each figure contains 4 subplots: XY, YZ, ZX, and PCA(PC1, PC2).
+    - Adaptive ranges can be provided from cached PF range statistics.
     """
     dataset = str(getattr(args, "dataset", "")).lower()
     if dataset not in PF_3D_SUPPORTED_DATASETS:
@@ -1182,6 +1554,7 @@ def plot_and_test_point_clouds(
     if Dp != Dq:
         raise ValueError(f"State dim mismatch between prior and posterior: {Dp} vs {Dq}.")
 
+    # For dim>3, this visualization intentionally uses the first 3 dims.
     prior_tensor = prior_tensor[..., :3]
     posterior_tensor = posterior_tensor[..., :3]
     B = Bp
@@ -1213,13 +1586,18 @@ def plot_and_test_point_clouds(
     projection_specs = [
         ("xy", 0, 1, "x", "y", fixed_limits["xlim"], fixed_limits["ylim"]),
         ("yz", 1, 2, "y", "z", fixed_limits["ylim"], fixed_limits["zlim"]),
-        ("xz", 0, 2, "x", "z", fixed_limits["xlim"], fixed_limits["zlim"]),
+        ("zx", 2, 0, "z", "x", fixed_limits["zlim"], fixed_limits["xlim"]),
     ]
 
     for i in indices_to_process:
         prior_full = prior_tensor[i, :, :]
         post_full = posterior_tensor[i, :, :]
         true_xyz = _resolve_true_state_xyz(true_state=true_state, batch_idx=i, batch_size=B)
+        adaptive_limits = _compute_zoomed_ranges_from_fixed_3d(
+            points_xyz=torch.cat([prior_full, post_full], dim=0).numpy(),
+            fixed_limits=fixed_limits,
+            num_splits=10,
+        )
 
         prior_for_vis = _sample_points(prior_full, num_samples_plot)
         post_for_vis = _sample_points(post_full, num_samples_plot)
@@ -1227,6 +1605,16 @@ def plot_and_test_point_clouds(
         post_vis_ds, post_downsampled = _prepare_scatter_points(post_for_vis, max_points=PF_MAX_SCATTER_POINTS)
         prior_plot = prior_vis_ds.numpy()
         post_plot = post_vis_ds.numpy()
+
+        # Shared PCA basis from combined cloud.
+        all_full = torch.cat([prior_full, post_full], dim=0).numpy()
+        pca_mean, pca_basis = _fit_pca_2d(all_full)
+        prior_plot_pca = _project_pca_2d(prior_plot, pca_mean, pca_basis)
+        post_plot_pca = _project_pca_2d(post_plot, pca_mean, pca_basis)
+        all_full_pca = _project_pca_2d(all_full, pca_mean, pca_basis)
+        true_pca = None
+        if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
+            true_pca = _project_pca_2d(np.asarray(true_xyz[:3], dtype=np.float64).reshape(1, 3), pca_mean, pca_basis)[0]
         prior_marker_size_2d, prior_marker_alpha_2d = _adaptive_scatter_style(
             n_points=prior_plot.shape[0],
             is_3d=False,
@@ -1238,170 +1626,266 @@ def plot_and_test_point_clouds(
             downsampled=post_downsampled,
         )
         prior_marker_size_3d, prior_marker_alpha_3d = _adaptive_scatter_style(
-            n_points=prior_plot.shape[0],
-            is_3d=True,
-            downsampled=prior_downsampled,
+            n_points=prior_plot.shape[0], is_3d=True, downsampled=prior_downsampled
         )
         post_marker_size_3d, post_marker_alpha_3d = _adaptive_scatter_style(
-            n_points=post_plot.shape[0],
-            is_3d=True,
-            downsampled=post_downsampled,
+            n_points=post_plot.shape[0], is_3d=True, downsampled=post_downsampled
         )
 
-        swd_ratio_prior, swd_data_prior, swd_base_prior = _fitted_gaussian_swd_ratio(
-            points=prior_full.numpy(),
-            num_directions=num_swd_directions,
-            num_reference_samples=num_swd_reference_samples,
-        )
-        swd_ratio_post, swd_data_post, swd_base_post = _fitted_gaussian_swd_ratio(
-            points=post_full.numpy(),
-            num_directions=num_swd_directions,
-            num_reference_samples=num_swd_reference_samples,
-        )
+        compute_swd = bool(getattr(args, "pf_swd", False))
+        if compute_swd:
+            swd_ratio_prior, swd_data_prior, swd_base_prior = _fitted_gaussian_swd_ratio(
+                points=prior_full.numpy(),
+                num_directions=num_swd_directions,
+                num_reference_samples=num_swd_reference_samples,
+            )
+            swd_ratio_post, swd_data_post, swd_base_post = _fitted_gaussian_swd_ratio(
+                points=post_full.numpy(),
+                num_directions=num_swd_directions,
+                num_reference_samples=num_swd_reference_samples,
+            )
+        else:
+            swd_ratio_prior, swd_data_prior, swd_base_prior = float("nan"), float("nan"), float("nan")
+            swd_ratio_post, swd_data_post, swd_base_post = float("nan"), float("nan"), float("nan")
         prior_ratio_str = f"{swd_ratio_prior:.3f}" if np.isfinite(swd_ratio_prior) else "nan"
         post_ratio_str = f"{swd_ratio_post:.3f}" if np.isfinite(swd_ratio_post) else "nan"
         mode_specs = [
             (
                 "prior",
                 prior_plot,
+                prior_plot_pca,
                 "blue",
                 "Predictive (prior) distribution",
                 prior_ratio_str,
                 prior_marker_size_2d,
                 prior_marker_alpha_2d,
+                prior_range_int,
                 prior_marker_size_3d,
                 prior_marker_alpha_3d,
+                prior_quantiles,
+                prior_pca_quantiles,
             ),
             (
                 "post",
                 post_plot,
+                post_plot_pca,
                 "red",
                 "Filtering (posterior) distribution",
                 post_ratio_str,
                 post_marker_size_2d,
                 post_marker_alpha_2d,
+                post_range_int,
                 post_marker_size_3d,
                 post_marker_alpha_3d,
+                post_quantiles,
+                post_pca_quantiles,
             ),
         ]
 
-        for mode_tag, mode_points, mode_color, mode_label, mode_ratio, size_2d, alpha_2d, size_3d, alpha_3d in mode_specs:
-            # A) Adaptive 2D projections + SWD ratio in title.
-            for plane_tag, dim_x, dim_y, x_label, y_label, _, _ in projection_specs:
-                fig, ax = plt.subplots(figsize=(7.2, 6.2))
-                _plot_pf_projection_2d(
-                    ax=ax,
-                    points=mode_points,
-                    point_color=mode_color,
-                    point_label=mode_label,
-                    dim_x=dim_x,
-                    dim_y=dim_y,
-                    marker_size=size_2d,
-                    marker_alpha=alpha_2d,
-                    true_xyz=true_xyz,
-                    xlim=None,
-                    ylim=None,
-                    legend_in_figure=legend_in_figure,
-                    dataset=dataset,
-                )
-                if legend_in_figure:
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_title(
-                        f"{dataset} {mode_tag} {plane_tag} (adaptive) | SWD ratio={mode_ratio}",
-                        fontsize=11,
+        for (
+            mode_tag,
+            mode_points,
+            mode_points_pca,
+            mode_color,
+            mode_label,
+            mode_ratio,
+            size_2d,
+            alpha_2d,
+            mode_range_int,
+            size_3d,
+            alpha_3d,
+            mode_quantiles,
+            mode_pca_quantiles,
+        ) in mode_specs:
+            fixed_pca_xlim = _integer_axis_limits(all_full_pca[:, 0], pad=1)
+            fixed_pca_ylim = _integer_axis_limits(all_full_pca[:, 1], pad=1)
+
+            adapt_xyz = adaptive_limits
+            if mode_range_int is not None:
+                r = torch.as_tensor(mode_range_int).detach().cpu().numpy()
+                if r.ndim == 2 and r.shape[0] >= 3 and r.shape[1] >= 2:
+                    adapt_xyz = {
+                        "xlim": (float(r[0, 0]), float(r[0, 1])),
+                        "ylim": (float(r[1, 0]), float(r[1, 1])),
+                        "zlim": (float(r[2, 0]), float(r[2, 1])),
+                    }
+
+            mask_adapt = (
+                (all_full[:, 0] >= adapt_xyz["xlim"][0]) & (all_full[:, 0] <= adapt_xyz["xlim"][1]) &
+                (all_full[:, 1] >= adapt_xyz["ylim"][0]) & (all_full[:, 1] <= adapt_xyz["ylim"][1]) &
+                (all_full[:, 2] >= adapt_xyz["zlim"][0]) & (all_full[:, 2] <= adapt_xyz["zlim"][1])
+            )
+            pca_for_adapt = all_full_pca[mask_adapt] if np.any(mask_adapt) else all_full_pca
+            adapt_pca_xlim = _integer_axis_limits(pca_for_adapt[:, 0], pad=0)
+            adapt_pca_ylim = _integer_axis_limits(pca_for_adapt[:, 1], pad=0)
+
+            range_modes = [
+                ("fixed", {"xlim": fixed_limits["xlim"], "ylim": fixed_limits["ylim"], "zlim": fixed_limits["zlim"]}, fixed_pca_xlim, fixed_pca_ylim),
+                ("adaptive", adapt_xyz, adapt_pca_xlim, adapt_pca_ylim),
+            ]
+
+            for range_tag, lim_xyz, lim_pca_x, lim_pca_y in range_modes:
+                # 1) 12 / 23 / 13 views as separate files
+                for plane_tag, dim_x, dim_y, x_label, y_label, _, _ in projection_specs:
+                    if plane_tag == "xy":
+                        xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["ylim"]
+                    elif plane_tag == "yz":
+                        xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
+                    else:
+                        xlim_curr, ylim_curr = lim_xyz["zlim"], lim_xyz["xlim"]
+                    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+                    _plot_pf_projection_2d(
+                        ax=ax,
+                        points=mode_points,
+                        point_color=mode_color,
+                        point_label=mode_label,
+                        dim_x=dim_x,
+                        dim_y=dim_y,
+                        marker_size=size_2d,
+                        marker_alpha=alpha_2d,
+                        true_xyz=true_xyz,
+                        xlim=xlim_curr,
+                        ylim=ylim_curr,
+                        legend_in_figure=False,
+                        dataset=dataset,
                     )
-                else:
-                    ax.set_xlabel("")
-                    ax.set_ylabel("")
-                    ax.set_title("")
-                fig.savefig(f"{prefix}_{i}_{mode_tag}_adaptive_{plane_tag}.png", bbox_inches='tight', dpi=150)
-                plt.close(fig)
+                    if legend_in_figure:
+                        ax.set_xlabel(x_label)
+                        ax.set_ylabel(y_label)
+                        ax.set_title(f"{plane_tag} ({range_tag})", fontsize=10)
+                    else:
+                        ax.set_xlabel("")
+                        ax.set_ylabel("")
+                        ax.set_title("")
+                    view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
+                    fig.tight_layout()
+                    fig.savefig(f"{prefix}_{i}_{mode_tag}_{range_tag}_{view_name}.png", bbox_inches='tight', dpi=150)
+                    plt.close(fig)
 
-            # B1) Fixed-range 2D projections.
-            for plane_tag, dim_x, dim_y, x_label, y_label, xlim_fixed, ylim_fixed in projection_specs:
-                fig, ax = plt.subplots(figsize=(7.2, 6.2))
-                _plot_pf_projection_2d(
-                    ax=ax,
-                    points=mode_points,
-                    point_color=mode_color,
-                    point_label=mode_label,
-                    dim_x=dim_x,
-                    dim_y=dim_y,
-                    marker_size=size_2d,
-                    marker_alpha=alpha_2d,
-                    true_xyz=true_xyz,
-                    xlim=xlim_fixed,
-                    ylim=ylim_fixed,
-                    legend_in_figure=legend_in_figure,
-                    dataset=dataset,
+                # 2) PCA12 view as separate file
+                fig_pca, ax_pca = plt.subplots(figsize=(7.2, 6.2))
+                ax_pca.scatter(
+                    mode_points_pca[:, 0],
+                    mode_points_pca[:, 1],
+                    s=float(size_2d),
+                    alpha=float(min(0.98, alpha_2d)),
+                    c=mode_color,
+                    edgecolors='none',
+                    label=mode_label,
                 )
+                if true_pca is not None and np.all(np.isfinite(true_pca)):
+                    ax_pca.scatter(
+                        true_pca[0], true_pca[1],
+                        marker='*', s=120, c='orange', edgecolors='black', linewidths=0.6, zorder=12, label='True state'
+                    )
+                ax_pca.set_xlim(lim_pca_x)
+                ax_pca.set_ylim(lim_pca_y)
                 if legend_in_figure:
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_title(f"{dataset} {mode_tag} {plane_tag} (fixed range)", fontsize=11)
+                    ax_pca.set_xlabel("PC1")
+                    ax_pca.set_ylabel("PC2")
+                    ax_pca.set_title(f"pca12 ({range_tag})", fontsize=10)
                 else:
-                    ax.set_xlabel("")
-                    ax.set_ylabel("")
-                    ax.set_title("")
-                fig.savefig(f"{prefix}_{i}_{mode_tag}_fixed_{plane_tag}.png", bbox_inches='tight', dpi=150)
-                plt.close(fig)
+                    ax_pca.set_xlabel("")
+                    ax_pca.set_ylabel("")
+                    ax_pca.set_title("")
+                if legend_in_figure:
+                    ax_pca.legend(
+                        [
+                            Line2D([0], [0], marker='o', linestyle='None', markerfacecolor=mode_color, markeredgecolor='none', markersize=7),
+                            Line2D([0], [0], marker='*', linestyle='None', markerfacecolor='orange', markeredgecolor='black', markersize=10),
+                        ],
+                        [mode_label, "True state"],
+                        loc='best',
+                        fontsize=8,
+                        frameon=True,
+                    )
+                fig_pca.tight_layout()
+                fig_pca.savefig(f"{prefix}_{i}_{mode_tag}_{range_tag}_PCA12.png", bbox_inches='tight', dpi=150)
+                plt.close(fig_pca)
 
-            # B2) Fixed-range 3D scatter.
-            fig3d = plt.figure(figsize=(8, 8))
+            # 3) fixed-range 3D view (fixed angle, no adaptive range)
+            fig3d = plt.figure(figsize=(8.0, 8.0))
             ax3d = fig3d.add_subplot(111, projection='3d')
             ax3d.scatter(
-                mode_points[:, 0], mode_points[:, 1], mode_points[:, 2],
-                s=size_3d, alpha=alpha_3d, c=mode_color, edgecolors='none',
+                mode_points[:, 0],
+                mode_points[:, 1],
+                mode_points[:, 2],
+                s=float(size_3d),
+                alpha=float(min(0.98, alpha_3d)),
+                c=mode_color,
+                edgecolors='none',
                 label=mode_label,
             )
-            if history_traj is not None:
-                traj = history_traj[:, i, :].numpy()
-                ax3d.plot(traj[:, 0], traj[:, 1], traj[:, 2], color='black', linewidth=1.5, label='History trajectory')
-            if true_xyz is not None and np.all(np.isfinite(true_xyz[:3])):
+            if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
                 ax3d.scatter(
                     true_xyz[0], true_xyz[1], true_xyz[2],
-                    marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11, label='True state',
+                    marker='*', s=130, c='orange', edgecolors='black', linewidths=0.6, zorder=12, label='True state',
                 )
-
             ax3d.set_xlim(fixed_limits["xlim"])
             ax3d.set_ylim(fixed_limits["ylim"])
             ax3d.set_zlim(fixed_limits["zlim"])
+            ax3d.view_init(
+                elev=float(getattr(args, "pf_3d_elev", 25.0)),
+                azim=float(getattr(args, "pf_3d_azim", -55.0)),
+            )
             if legend_in_figure:
                 ax3d.set_xlabel("x")
                 ax3d.set_ylabel("y")
                 ax3d.set_zlabel("z")
-                steps = len(history_traj) if history_traj is not None else 0
-                total_T = round(float(getattr(args, "dt", 1.0)) * steps * 100) / 100.0
-                ax3d.set_title(
-                    rf"{dataset} {mode_tag}: $\Delta t$={getattr(args, 'dt', 1.0)}, step={steps}, T={total_T:.2f} | SWD ratio={mode_ratio}",
-                    fontsize=11,
-                )
+                title_3d = f"{dataset} {mode_tag} 3D fixed"
+                if compute_swd:
+                    title_3d += f" | SWD ratio={mode_ratio}"
+                ax3d.set_title(title_3d, fontsize=11)
                 ax3d.legend(loc='best', fontsize=8, frameon=True)
             else:
                 ax3d.set_title("")
                 ax3d.set_xlabel("")
                 ax3d.set_ylabel("")
                 ax3d.set_zlabel("")
-            fig3d.savefig(f"{prefix}_{i}_{mode_tag}_fixed_3d.png", bbox_inches='tight', dpi=150)
+            fig3d.savefig(f"{prefix}_{i}_{mode_tag}_3d_fixed.png", bbox_inches='tight', dpi=150)
             plt.close(fig3d)
 
-        print(
-            f"[PF Plot] cloud={i}, "
-            f"prior: SWD(data,gauss)={swd_data_prior:.6f}, SWD(baseline)={swd_base_prior:.6f}, ratio={prior_ratio_str}; "
-            f"post: SWD(data,gauss)={swd_data_post:.6f}, SWD(baseline)={swd_base_post:.6f}, ratio={post_ratio_str}"
-        )
-        distance_records.append(
-            {
-                "cloud_index": int(i),
-                "prior_swd_ratio": float(swd_ratio_prior),
-                "prior_swd_data": float(swd_data_prior),
-                "prior_swd_baseline": float(swd_base_prior),
-                "post_swd_ratio": float(swd_ratio_post),
-                "post_swd_data": float(swd_data_post),
-                "post_swd_baseline": float(swd_base_post),
-            }
-        )
+            # 4) quantile-inversion density plots (6 files)
+            q_probs_np = None
+            if quantile_probs is not None:
+                q_probs_np = torch.as_tensor(quantile_probs).detach().cpu().numpy().reshape(-1)
+            mode_q_np = None if mode_quantiles is None else torch.as_tensor(mode_quantiles).detach().cpu().numpy()
+            mode_pca_q_np = None if mode_pca_quantiles is None else torch.as_tensor(mode_pca_quantiles).detach().cpu().numpy()
+            if q_probs_np is not None and mode_q_np is not None and mode_pca_q_np is not None:
+                for d_idx in range(min(3, mode_q_np.shape[0])):
+                    x, dens = _quantile_implied_density_curve(mode_q_np[d_idx], q_probs_np)
+                    _save_quantile_density_plot(
+                        x=x,
+                        density=dens,
+                        title=f"{dataset} {mode_tag} dim{d_idx+1} implied density",
+                        save_path=f"{prefix}_{i}_{mode_tag}_qden_dim{d_idx+1}.png",
+                    )
+                for p_idx in range(min(3, mode_pca_q_np.shape[0])):
+                    x, dens = _quantile_implied_density_curve(mode_pca_q_np[p_idx], q_probs_np)
+                    _save_quantile_density_plot(
+                        x=x,
+                        density=dens,
+                        title=f"{dataset} {mode_tag} pca{p_idx+1} implied density",
+                        save_path=f"{prefix}_{i}_{mode_tag}_qden_PCA{p_idx+1}.png",
+                    )
+
+        if compute_swd:
+            print(
+                f"[PF Plot] cloud={i}, "
+                f"prior: SWD(data,gauss)={swd_data_prior:.6f}, SWD(baseline)={swd_base_prior:.6f}, ratio={prior_ratio_str}; "
+                f"post: SWD(data,gauss)={swd_data_post:.6f}, SWD(baseline)={swd_base_post:.6f}, ratio={post_ratio_str}"
+            )
+            distance_records.append(
+                {
+                    "cloud_index": int(i),
+                    "prior_swd_ratio": float(swd_ratio_prior),
+                    "prior_swd_data": float(swd_data_prior),
+                    "prior_swd_baseline": float(swd_base_prior),
+                    "post_swd_ratio": float(swd_ratio_post),
+                    "post_swd_data": float(swd_data_post),
+                    "post_swd_baseline": float(swd_base_post),
+                }
+            )
 
     if not legend_in_figure:
         legend_dir = os.path.dirname(prefix) or "."
@@ -1412,7 +1896,7 @@ def plot_and_test_point_clouds(
             include_prior=True,
             include_posterior=False,
             include_obs=False,
-            include_history=(history_traj is not None),
+            include_history=False,
             include_true_state=(true_state is not None),
         )
         _save_separate_legend(
@@ -1420,7 +1904,7 @@ def plot_and_test_point_clouds(
             include_prior=False,
             include_posterior=True,
             include_obs=False,
-            include_history=(history_traj is not None),
+            include_history=False,
             include_true_state=(true_state is not None),
         )
 
@@ -1670,11 +2154,10 @@ def _save_ring_pdf_on_ring(
         ax.scatter(
             true_xy[0],
             true_xy[1],
-            marker='*',
-            s=220,
-            c='orange',
-            edgecolors='black',
-            linewidth=0.6,
+            marker='x',
+            s=120,
+            c='black',
+            linewidths=2.0,
             zorder=11,
             label='True state',
         )
@@ -1896,7 +2379,7 @@ def plot_and_test_point_clouds_ring(
         if true_xy is not None:
             ax.scatter(
                 true_xy[0], true_xy[1],
-                marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=11, label='True state'
+                marker='x', s=120, c='black', linewidths=2.0, zorder=11, label='True state'
             )
             _add_label('True state')
 
@@ -2010,8 +2493,8 @@ def plot_and_test_point_clouds_ring(
         legend_handles: List = [
             Line2D([0], [0], marker='o', linestyle='None',
                    markerfacecolor=point_color, markeredgecolor='none', markersize=8),
-            Line2D([0], [0], marker='*', linestyle='None',
-                   markerfacecolor='orange', markeredgecolor='black', markersize=16),
+            Line2D([0], [0], marker='x', linestyle='None',
+                   color='black', markeredgecolor='black', markersize=10),
             Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0),
             mpatches.Patch(facecolor=density_color, alpha=0.22, edgecolor='none'),
         ]

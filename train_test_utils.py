@@ -19,9 +19,9 @@ from visualization import (
     plot_particle_trajectories,
     plot_and_test_point_clouds,
     plot_and_test_point_clouds_ring,
-    _isotropic_kde_2d,
-    _adaptive_projection_kde_std,
+    plot_linear_kalman_vs_method_2d,
     _compute_axis_limits,
+    _compute_zoomed_ranges_from_fixed_3d,
 )
 from localization import dist2coeff, create_loc_mat, pairwise_distances
 from loss import (
@@ -44,6 +44,12 @@ L63_FIXED_LIMITS_3D = {
     "xlim": (-22.0, 22.0),
     "ylim": (-30.0, 30.0),
     "zlim": (0.0, 52.0),
+}
+DYNAMIC_FIXED_LIMITS_3D = {
+    "lorenz63": L63_FIXED_LIMITS_3D,
+    "lorenz96": {"xlim": (-15.0, 15.0), "ylim": (-15.0, 15.0), "zlim": (-15.0, 15.0)},
+    "ks": {"xlim": (-6.0, 6.0), "ylim": (-6.0, 6.0), "zlim": (-6.0, 6.0)},
+    "rossler": {"xlim": (-15.0, 15.0), "ylim": (-15.0, 15.0), "zlim": (0.0, 30.0)},
 }
 
 
@@ -99,6 +105,16 @@ def _build_pf_cache_filename(args, batch_size: int, traj_len: int, avg: bool = F
     if avg:
         return f"{base}_avg{obs_suffix}.pt"
     return f"{base}_{args.seed}{obs_suffix}.pt"
+
+
+def _safe_pf_obs_fn_name(args) -> str:
+    obs_fn = _resolve_obs_fn_for_pf_paths(args)
+    safe_obs_fn = re.sub(r"[^0-9a-zA-Z._-]+", "-", str(obs_fn)).strip("-")
+    return safe_obs_fn if safe_obs_fn else "unknown"
+
+
+def _build_pf_cache_dir(args) -> str:
+    return os.path.join("data", str(args.dataset), f"pf_{_safe_pf_obs_fn_name(args)}")
 
 
 def _setup_mixed_precision(args):
@@ -247,6 +263,134 @@ def _select_plot_batch_index(ens_tensor: torch.Tensor) -> int:
     nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))  # [T, B]
     nan_counts = nan_per_step.sum(dim=0)
     return int(torch.argmin(nan_counts).item())
+
+
+def _get_pf_cached_post_means(entry: Dict[str, Any]) -> Optional[torch.Tensor]:
+    if "post_means" in entry:
+        return entry["post_means"]
+    return entry.get("means", None)
+
+
+def _get_pf_cached_post_covs(entry: Dict[str, Any]) -> Optional[torch.Tensor]:
+    if "post_covs" in entry:
+        return entry["post_covs"]
+    return entry.get("covs", None)
+
+
+def _get_pf_cached_range_int(entry: Dict[str, Any], mode: str, range_idx: int, bidx: int, pad_int: int = 5) -> Optional[torch.Tensor]:
+    key_int = f"{mode}_range_int"
+    if key_int in entry:
+        tensor = entry[key_int]
+        if tensor.ndim == 4 and 0 <= range_idx < tensor.shape[0] and 0 <= bidx < tensor.shape[1]:
+            return tensor[range_idx, bidx]
+
+    key_q = f"{mode}_range_q01_q99"
+    if key_q in entry:
+        q_tensor = entry[key_q]
+        if q_tensor.ndim == 4 and 0 <= range_idx < q_tensor.shape[0] and 0 <= bidx < q_tensor.shape[1]:
+            qvals = q_tensor[range_idx, bidx].to(torch.float32)
+            low = torch.floor(qvals[:, 0]) - int(pad_int)
+            high = torch.ceil(qvals[:, 1]) + int(pad_int)
+            return torch.stack((low, high), dim=-1).to(torch.int32)
+    return None
+
+
+def _get_pf_cached_quantile_block(
+    entry: Dict[str, Any],
+    key: str,
+    range_idx: int,
+    bidx: int,
+) -> Optional[torch.Tensor]:
+    if key not in entry:
+        return None
+    tensor = entry[key]
+    if tensor.ndim < 4:
+        return None
+    if not (0 <= range_idx < tensor.shape[0] and 0 <= bidx < tensor.shape[1]):
+        return None
+    return tensor[range_idx, bidx]
+
+
+def _resolve_snapshot_steps_for_plot(args, total_steps: int) -> List[int]:
+    if total_steps <= 1:
+        return []
+    snapshot_steps = getattr(args, "test_snapshot_steps", None)
+    if snapshot_steps is None and str(getattr(args, "dataset", "")).lower() == "lorenz63":
+        snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
+    if snapshot_steps is None:
+        snapshot_steps = [max(1, total_steps - 1)]
+    valid = []
+    for step in snapshot_steps:
+        s = int(step)
+        if 1 <= s < total_steps and s not in valid:
+            valid.append(s)
+    return valid
+
+
+def _plot_pf_style_projections_from_cache(
+    args,
+    ens_post_tensor: torch.Tensor,
+    ens_prior_tensor: Optional[torch.Tensor],
+    true_tensor: torch.Tensor,
+    pf_entry: Dict[str, Any],
+    fig_name: str,
+    plot_batch_indices: List[int],
+    batch_start_index: int = 0,
+    global_index_naming: bool = False,
+):
+    if ens_post_tensor.ndim != 4 or ens_post_tensor.shape[0] <= 1 or ens_post_tensor.shape[1] == 0:
+        return
+    if ens_prior_tensor is None or ens_prior_tensor.ndim != 4 or ens_prior_tensor.shape[0] <= 1:
+        return
+
+    plot_steps = _resolve_snapshot_steps_for_plot(args, total_steps=ens_post_tensor.shape[0])
+    if len(plot_steps) == 0:
+        return
+
+    for bidx in plot_batch_indices:
+        if not (0 <= int(bidx) < ens_post_tensor.shape[1]):
+            continue
+        b = int(bidx)
+        idx_tag = f"g{batch_start_index + b}" if global_index_naming else f"b{b}"
+        for step_label in plot_steps:
+            prior_cloud = ens_prior_tensor[step_label, b:b + 1, :, :]
+            post_cloud = ens_post_tensor[step_label, b:b + 1, :, :]
+            true_state = true_tensor[step_label, b, :].detach().cpu()
+            range_idx = step_label - 1
+            prior_range_int = _get_pf_cached_range_int(
+                pf_entry, mode="prior", range_idx=range_idx, bidx=b,
+                pad_int=int(getattr(args, "pf_range_pad_int", 5))
+            )
+            post_range_int = _get_pf_cached_range_int(
+                pf_entry, mode="post", range_idx=range_idx, bidx=b,
+                pad_int=int(getattr(args, "pf_range_pad_int", 5))
+            )
+            q_probs = pf_entry.get("quantile_probs", None)
+            prior_quantiles = _get_pf_cached_quantile_block(pf_entry, "prior_quantiles", range_idx=range_idx, bidx=b)
+            post_quantiles = _get_pf_cached_quantile_block(pf_entry, "post_quantiles", range_idx=range_idx, bidx=b)
+            prior_pca_quantiles = _get_pf_cached_quantile_block(pf_entry, "prior_pca_quantiles", range_idx=range_idx, bidx=b)
+            post_pca_quantiles = _get_pf_cached_quantile_block(pf_entry, "post_pca_quantiles", range_idx=range_idx, bidx=b)
+            prefix = f"{fig_name}_{idx_tag}_step{step_label}"
+            plot_and_test_point_clouds(
+                args=args,
+                prior_tensor=prior_cloud.detach().cpu(),
+                posterior_tensor=post_cloud.detach().cpu(),
+                num_samples_plot=min(1000000, int(getattr(args, "pf_N", post_cloud.shape[2]))),
+                prefix=prefix,
+                num_swd_reference_samples=getattr(args, "pf_plot_swd_samples", 1000000),
+                num_swd_directions=getattr(args, "pf_plot_swd_directions", 50),
+                plot_indices=[0],
+                history_traj=true_tensor[1:step_label + 1, b:b + 1, :].detach().cpu(),
+                true_state=true_state,
+                legend_in_figure=getattr(args, "legend_in_figure", False),
+                prior_range_int=None if prior_range_int is None else prior_range_int.detach().cpu(),
+                post_range_int=None if post_range_int is None else post_range_int.detach().cpu(),
+                quantile_probs=None if q_probs is None else torch.as_tensor(q_probs).detach().cpu(),
+                prior_quantiles=None if prior_quantiles is None else prior_quantiles.detach().cpu()[:3],
+                post_quantiles=None if post_quantiles is None else post_quantiles.detach().cpu()[:3],
+                prior_pca_quantiles=None if prior_pca_quantiles is None else prior_pca_quantiles.detach().cpu(),
+                post_pca_quantiles=None if post_pca_quantiles is None else post_pca_quantiles.detach().cpu(),
+            )
 
 
 def _safe_int_seed(seed_like, default: int = 0) -> int:
@@ -485,13 +629,25 @@ def _plot_last_three_steps_lowdim_generic(
             ("yz", 1, 2, "y", "z"),
             ("xz", 0, 2, "x", "z"),
         ]
-        kde_grid_size = 120
-        kde_max_points = 3000
-        rng = np.random.default_rng(0)
-
+        if dataset_key in DYNAMIC_FIXED_LIMITS_3D:
+            fixed_limits_xyz = DYNAMIC_FIXED_LIMITS_3D[dataset_key]
+        else:
+            ens_all = ens_traj.reshape(-1, D)
+            finite_all = torch.isfinite(ens_all).all(dim=1)
+            ens_all_np = ens_all[finite_all].numpy() if finite_all.any() else None
+            if ens_all_np is not None and ens_all_np.shape[0] > 0:
+                fixed_limits_xyz = {
+                    "xlim": _compute_axis_limits(ens_all_np[:, 0]),
+                    "ylim": _compute_axis_limits(ens_all_np[:, 1]),
+                    "zlim": _compute_axis_limits(ens_all_np[:, 2]),
+                }
+            else:
+                fixed_limits_xyz = {
+                    "xlim": (-1.0, 1.0),
+                    "ylim": (-1.0, 1.0),
+                    "zlim": (-1.0, 1.0),
+                }
         for t_idx, step_label in selected_steps:
-            fig, axes = plt.subplots(1, len(projection_specs), figsize=(12.0, 3.8), squeeze=False)
-            axes = axes[0]
             ens_t = ens_traj[t_idx]
             valid = torch.isfinite(ens_t).all(dim=1)
             ens_t = ens_t[valid]
@@ -502,120 +658,88 @@ def _plot_last_three_steps_lowdim_generic(
             true_np = true_traj[t_idx, :3].numpy() if has_true else None
             obs_np = observations[t_idx, :3].numpy() if has_obs else None
 
-            for pidx, (plane_tag, dim_x, dim_y, x_label, y_label) in enumerate(projection_specs):
-                ax = axes[pidx]
+            adaptive_limits_xyz = fixed_limits_xyz
+            if ens_np is not None and ens_np.shape[0] > 0:
+                adaptive_limits_xyz = _compute_zoomed_ranges_from_fixed_3d(
+                    points_xyz=ens_np,
+                    fixed_limits=fixed_limits_xyz,
+                    num_splits=10,
+                )
 
-                if dataset_key == "lorenz63":
+            for range_mode in ["fixed", "adaptive"]:
+                fig, axes = plt.subplots(1, len(projection_specs), figsize=(12.0, 3.8), squeeze=False)
+                axes = axes[0]
+                curr_limits_xyz = fixed_limits_xyz if range_mode == "fixed" else adaptive_limits_xyz
+
+                for pidx, (plane_tag, dim_x, dim_y, x_label, y_label) in enumerate(projection_specs):
+                    ax = axes[pidx]
+
                     if plane_tag == "xy":
-                        xlim = L63_FIXED_LIMITS_3D["xlim"]
-                        ylim = L63_FIXED_LIMITS_3D["ylim"]
+                        xlim = curr_limits_xyz["xlim"]
+                        ylim = curr_limits_xyz["ylim"]
                     elif plane_tag == "yz":
-                        xlim = L63_FIXED_LIMITS_3D["ylim"]
-                        ylim = L63_FIXED_LIMITS_3D["zlim"]
+                        xlim = curr_limits_xyz["ylim"]
+                        ylim = curr_limits_xyz["zlim"]
                     else:
-                        xlim = L63_FIXED_LIMITS_3D["xlim"]
-                        ylim = L63_FIXED_LIMITS_3D["zlim"]
-                else:
+                        xlim = curr_limits_xyz["xlim"]
+                        ylim = curr_limits_xyz["zlim"]
+
                     if ens_np is not None:
-                        xlim = _compute_axis_limits(ens_np[:, dim_x])
-                        ylim = _compute_axis_limits(ens_np[:, dim_y])
-                    else:
-                        xlim = (-1.0, 1.0)
-                        ylim = (-1.0, 1.0)
+                        xy = ens_np[:, [dim_x, dim_y]]
 
-                if ens_np is not None:
-                    xy = ens_np[:, [dim_x, dim_y]]
-                    if xy.shape[0] >= 3:
-                        xy_kde = xy
-                        if xy_kde.shape[0] > kde_max_points:
-                            idx = rng.choice(xy_kde.shape[0], size=kde_max_points, replace=False)
-                            xy_kde = xy_kde[idx]
-
-                        x_span = max(float(xlim[1]) - float(xlim[0]), 1e-6)
-                        y_span = max(float(ylim[1]) - float(ylim[0]), 1e-6)
-                        scale = np.sqrt(0.5 * (x_span * x_span + y_span * y_span))
-                        base_std = max(1e-6, 0.03 * scale)
-                        kde_std = _adaptive_projection_kde_std(xy_kde.shape[0], base_std=base_std)
-                        xx, yy, density = _isotropic_kde_2d(
-                            xy=xy_kde,
-                            xlim=xlim,
-                            ylim=ylim,
-                            std=kde_std,
-                            grid_size=kde_grid_size,
+                        ax.scatter(
+                            xy[:, 0],
+                            xy[:, 1],
+                            s=9,
+                            alpha=0.35,
+                            c=ens_color,
+                            edgecolors='none',
+                            zorder=3,
+                            label='Ensemble',
                         )
-                        finite_density = density[np.isfinite(density)]
-                        if finite_density.size > 0:
-                            max_density = float(np.max(finite_density))
-                            if max_density > 0:
-                                contour_levels = np.array([0.22, 0.45, 0.70], dtype=np.float64) * max_density
-                                contour_levels = np.unique(contour_levels[contour_levels > 1e-12])
-                                fill_levels = np.concatenate(([0.0], contour_levels, [max_density * 1.001]))
-                                fill_levels = np.unique(fill_levels)
-                                if fill_levels.size >= 2:
-                                    cmap_name = 'Blues' if 'blue' in ens_color_lower else 'Reds'
-                                    ax.contourf(xx, yy, density, levels=fill_levels, cmap=cmap_name, alpha=0.18)
-                                    _add_label('KDE density')
-                                if contour_levels.size >= 1:
-                                    ax.contour(
-                                        xx,
-                                        yy,
-                                        density,
-                                        levels=contour_levels,
-                                        colors=ens_color,
-                                        linewidths=1.0,
-                                        alpha=0.7,
-                                    )
+                        _add_label('Ensemble')
 
-                    ax.scatter(
-                        xy[:, 0],
-                        xy[:, 1],
-                        s=9,
-                        alpha=0.35,
-                        c=ens_color,
-                        edgecolors='none',
-                        label='Ensemble',
-                    )
-                    _add_label('Ensemble')
+                    if true_np is not None:
+                        ax.scatter(
+                            true_np[dim_x],
+                            true_np[dim_y],
+                            marker='*',
+                            s=220,
+                            c='orange',
+                            edgecolors='black',
+                            linewidth=0.6,
+                            zorder=2,
+                            label='True state',
+                        )
+                        _add_label('True state')
 
-                if true_np is not None:
-                    ax.scatter(
-                        true_np[dim_x],
-                        true_np[dim_y],
-                        marker='x',
-                        s=90,
-                        c='black',
-                        linewidth=1.6,
-                        label='True',
-                    )
-                    _add_label('True')
+                    if obs_np is not None:
+                        ax.scatter(
+                            obs_np[dim_x],
+                            obs_np[dim_y],
+                            marker='*',
+                            s=120,
+                            c='orange',
+                            edgecolors='black',
+                            linewidth=0.5,
+                            label='Obs',
+                        )
+                        _add_label('Obs')
 
-                if obs_np is not None:
-                    ax.scatter(
-                        obs_np[dim_x],
-                        obs_np[dim_y],
-                        marker='*',
-                        s=120,
-                        c='orange',
-                        edgecolors='black',
-                        linewidth=0.5,
-                        label='Obs',
-                    )
-                    _add_label('Obs')
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                    if legend_in_figure:
+                        ax.set_xlabel(x_label)
+                        ax.set_ylabel(y_label)
+                        ax.set_title(f"{plane_tag} | step={step_label} | {range_mode}")
 
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
                 if legend_in_figure:
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_title(f"{plane_tag} | step={step_label}")
-
-            if legend_in_figure:
-                axes[0].legend(loc='best', fontsize=8)
-            fig.tight_layout()
-            fig.savefig(f"{fig_name}_slice_step{step_label}.png", dpi=150, bbox_inches='tight')
-            if save_pdf:
-                fig.savefig(f"{fig_name}_slice_step{step_label}.pdf", bbox_inches='tight')
-            plt.close(fig)
+                    axes[0].legend(loc='best', fontsize=8)
+                fig.tight_layout()
+                fig.savefig(f"{fig_name}_slice_step{step_label}_{range_mode}.png", dpi=150, bbox_inches='tight')
+                if save_pdf:
+                    fig.savefig(f"{fig_name}_slice_step{step_label}_{range_mode}.pdf", bbox_inches='tight')
+                plt.close(fig)
     else:
         fig, axes = plt.subplots(1, len(selected_steps), figsize=(5 * len(selected_steps), 4))
         if len(selected_steps) == 1:
@@ -645,8 +769,8 @@ def _plot_last_three_steps_lowdim_generic(
                         _add_label('Ensemble density')
                 if torch.isfinite(true_traj[t_idx, :2]).all():
                     ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1],
-                               marker='x', s=80, c='black', linewidth=1.6, label='True')
-                    _add_label('True')
+                               marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=2, label='True state')
+                    _add_label('True state')
                 if torch.isfinite(observations[t_idx, :2]).all():
                     ax.scatter(observations[t_idx, 0], observations[t_idx, 1],
                                marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
@@ -660,8 +784,8 @@ def _plot_last_three_steps_lowdim_generic(
                     ax.scatter(ens_t[:, 0], torch.zeros_like(ens_t[:, 0]), s=8, alpha=0.35, c=ens_color, label='Ensemble')
                     _add_label('Ensemble')
                 if torch.isfinite(true_traj[t_idx, 0]).all():
-                    ax.scatter(true_traj[t_idx, 0], 0.0, marker='x', s=80, c='black', linewidth=1.6, label='True')
-                    _add_label('True')
+                    ax.scatter(true_traj[t_idx, 0], 0.0, marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=2, label='True state')
+                    _add_label('True state')
                 if torch.isfinite(observations[t_idx, 0]).all():
                     ax.scatter(observations[t_idx, 0], 0.0, marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
                     _add_label('Obs')
@@ -690,13 +814,12 @@ def _plot_last_three_steps_lowdim_generic(
                                       markerfacecolor=ens_color, markeredgecolor='none', markersize=7))
             elif label == 'Ensemble density':
                 handles.append(mpatches.Patch(facecolor=ens_color, alpha=0.9, edgecolor='none'))
-            elif label == 'True':
-                handles.append(Line2D([0], [0], marker='x', linestyle='None', color='black', markersize=7))
+            elif label == 'True state':
+                handles.append(Line2D([0], [0], marker='*', linestyle='None',
+                                      markerfacecolor='orange', markeredgecolor='black', markersize=11))
             elif label == 'Obs':
                 handles.append(Line2D([0], [0], marker='*', linestyle='None',
                                       markerfacecolor='orange', markeredgecolor='black', markersize=11))
-            elif label == 'KDE density':
-                handles.append(mpatches.Patch(facecolor=ens_color, alpha=0.18, edgecolor='none'))
             else:
                 continue
             labels.append(label)
@@ -828,6 +951,7 @@ def _plot_test_visualizations(
     global_index_naming: bool = False,
     ens_color: str = 'tab:red',
     ring_plot_history: bool = False,
+    enable_highdim_slices: bool = False,
 ):
     """Dispatch visualization strategy by state dimension.
 
@@ -918,6 +1042,25 @@ def _plot_test_visualizations(
     for bidx in plot_bidx_list:
         idx_tag = f"g{batch_start_index + bidx}" if global_index_naming else f"b{bidx}"
         fig_name_b = f"{fig_name}_{idx_tag}" if multi_bidx else fig_name
+
+        if enable_highdim_slices and int(args.ori_dim) >= 3:
+            dataset_key = str(getattr(args, "dataset", "")).lower()
+            snapshot_steps = getattr(args, "test_snapshot_steps", None)
+            if snapshot_steps is None and dataset_key == "lorenz63":
+                snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
+            _plot_last_three_steps_lowdim_generic(
+                ens_traj=ens_tensor[:, bidx, :, :3],
+                true_traj=true_tensor[:, bidx, :3],
+                observations=observations[:, bidx, :3],
+                fig_name=fig_name_b + "_slice3d",
+                save_pdf=save_pdf,
+                step_offset=step_offset,
+                legend_in_figure=getattr(args, "legend_in_figure", False),
+                ens_color=ens_color,
+                dataset=dataset_key,
+                snapshot_steps=snapshot_steps,
+            )
+
         plot_particle_trajectories_with_histograms(
             particles=ens_tensor[:, bidx, :, :],
             true_traj=comparison_tensor[:, bidx, :],
@@ -1652,11 +1795,14 @@ def generate_and_cache_pf_results(
     first_batch_for_shape = next(iter(loader))
     traj_len = first_batch_for_shape.shape[0]
     batch_size = first_batch_for_shape.shape[1]
-    cache_dir = os.path.join('data', args.dataset)
+    cache_dir = _build_pf_cache_dir(args)
     obs_suffix = _pf_obs_fn_suffix(args)
     cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=False)
     cache_filepath = os.path.join(cache_dir, cache_filename)
-    pf_vis_folder = f"save/{args.dataset}_pf_vis{obs_suffix}"
+    user_suffix = str(getattr(args, "suffix", "") or "").strip()
+    if user_suffix and not user_suffix.startswith("_"):
+        user_suffix = f"_{user_suffix}"
+    pf_vis_folder = f"save/{args.dataset}_pf_vis{obs_suffix}{user_suffix}"
     if obs_suffix:
         print(
             f"[PF cache naming] dataset={args.dataset}, obs_fn={_resolve_obs_fn_for_pf_paths(args)}, "
@@ -1674,6 +1820,14 @@ def generate_and_cache_pf_results(
     print(f"Generating particle filter results and saving to: {cache_filepath}")
     all_pf_results_to_cache = []
     pf_non_gaussian_records = []
+    distance_dir = pf_vis_folder
+    distance_prefix = (
+        f"{distance_dir}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_{args.seed}"
+        "_non_gaussian_distance"
+    )
+    detailed_pt = f"{distance_prefix}_detail.pt"
+    detailed_csv = f"{distance_prefix}_detail.csv"
+    summary_csv = f"{distance_prefix}_per_step_mean.csv"
 
     # --- Initialize Metric Dictionaries ---
     all_pf_metrics = {
@@ -1684,11 +1838,78 @@ def generate_and_cache_pf_results(
         all_pf_metrics['crps'] = torch.empty(0, device=args.device)
         all_pf_metrics['rcrps'] = torch.empty(0, device=args.device)
 
+    # --- Distribution summaries to cache ---
+    num_quantiles = int(getattr(args, "pf_num_quantiles", 257))
+    if num_quantiles < 2:
+        raise ValueError(f"pf_num_quantiles must be >= 2, got {num_quantiles}.")
+    q_lo = float(getattr(args, "pf_range_q_lo", 0.01))
+    q_hi = float(getattr(args, "pf_range_q_hi", 0.99))
+    if not (0.0 <= q_lo < q_hi <= 1.0):
+        raise ValueError(f"Invalid PF range quantiles: q_lo={q_lo}, q_hi={q_hi}.")
+    range_pad_int = int(getattr(args, "pf_range_pad_int", 5))
+    quantile_probs = torch.linspace(
+        0.0, 1.0, steps=num_quantiles, device=args.device, dtype=torch.float32
+    )
+    range_probs = torch.tensor([q_lo, q_hi], device=args.device, dtype=torch.float32)
+
+    def _compute_pf_distribution_summary(ens_tensor: torch.Tensor):
+        """Compute per-step per-trajectory per-dimension summary statistics for PF clouds."""
+        ens32 = ens_tensor.to(torch.float32)
+        B, Np, D = ens32.shape
+        qvals = torch.quantile(ens32, quantile_probs, dim=1).permute(1, 2, 0).contiguous()  # [B, D, K]
+        q01_q99 = torch.quantile(ens32, range_probs, dim=1).permute(1, 2, 0).contiguous()   # [B, D, 2]
+        min_vals = ens32.amin(dim=1)
+        max_vals = ens32.amax(dim=1)
+        minmax = torch.stack((min_vals, max_vals), dim=-1)  # [B, D, 2]
+
+        low_int = torch.floor(q01_q99[..., 0]) - range_pad_int
+        high_int = torch.ceil(q01_q99[..., 1]) + range_pad_int
+        range_int = torch.stack((low_int, high_int), dim=-1).to(torch.int32)  # [B, D, 2]
+
+        mean_vals = ens32.mean(dim=1, keepdim=True)
+        centered = ens32 - mean_vals
+        std_vals = ens32.std(dim=1, unbiased=False)
+        std_safe = torch.clamp(std_vals, min=1e-8)
+        m3 = torch.mean(centered ** 3, dim=1)
+        m4 = torch.mean(centered ** 4, dim=1)
+        skewness = m3 / (std_safe ** 3)
+        kurtosis_excess = m4 / (std_safe ** 4) - 3.0
+
+        cov = torch.bmm(centered.transpose(1, 2), centered) / max(1, Np - 1)  # [B, D, D]
+        eigvals, eigvecs = torch.linalg.eigh(cov.to(torch.float32))  # ascending
+        eigvals_desc = torch.flip(eigvals, dims=(-1,))
+        eigvecs_desc = torch.flip(eigvecs, dims=(-1,))
+        pcs = torch.bmm(centered, eigvecs_desc)  # [B, N, D]
+        pca3 = pcs[:, :, :min(3, D)]
+        pca_quantiles = torch.full(
+            (B, 3, quantile_probs.shape[0]),
+            float("nan"),
+            device=ens32.device,
+            dtype=torch.float32,
+        )
+        if pca3.shape[-1] > 0:
+            pca_q = torch.quantile(pca3, quantile_probs, dim=1).permute(1, 2, 0).contiguous()  # [B, k, K]
+            pca_quantiles[:, :pca3.shape[-1], :] = pca_q
+
+        return {
+            "quantiles": qvals,
+            "range_q01_q99": q01_q99,
+            "minmax": minmax,
+            "range_int": range_int,
+            "skewness": skewness,
+            "kurtosis_excess": kurtosis_excess,
+            "pca_eigvals": eigvals_desc,
+            "pca_quantiles": pca_quantiles,
+        }
+
     # --- Which batch indices to visualize when saving figures ---
     # Controlled by args.test_plot_index (default [0], also supports "adaptive" and lists like [0,1]).
     can_plot_3d = int(getattr(args, 'ori_dim', 0)) >= 3
     can_plot_ring = int(getattr(args, 'ori_dim', 0)) in [1, 2]
-    track_pf_non_gaussian = str(getattr(args, "dataset", "")).lower() == "lorenz63"
+    track_pf_non_gaussian = (
+        str(getattr(args, "dataset", "")).lower() == "lorenz63"
+        and bool(getattr(args, "pf_swd", False))
+    )
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
@@ -1731,6 +1952,17 @@ def generate_and_cache_pf_results(
             # These will be stacked and cached per-batch
             batch_prior_means_to_cache, batch_prior_covs_to_cache = [], []
             batch_post_means_to_cache,  batch_post_covs_to_cache  = [], []
+            batch_prior_quantiles_to_cache, batch_post_quantiles_to_cache = [], []
+            batch_prior_q01_q99_to_cache, batch_post_q01_q99_to_cache = [], []
+            batch_prior_minmax_to_cache, batch_post_minmax_to_cache = [], []
+            batch_prior_range_int_to_cache, batch_post_range_int_to_cache = [], []
+            batch_prior_skew_to_cache, batch_post_skew_to_cache = [], []
+            batch_prior_kurt_to_cache, batch_post_kurt_to_cache = [], []
+            batch_prior_pca_eigvals_to_cache, batch_post_pca_eigvals_to_cache = [], []
+            batch_prior_pca_quantiles_to_cache, batch_post_pca_quantiles_to_cache = [], []
+            batch_post_ess_to_cache = []
+            batch_post_weight_entropy_to_cache = []
+            batch_post_weight_abundance_to_cache = []
 
             batch_rmse_steps = []
             if calculate_crps:
@@ -1762,12 +1994,21 @@ def generate_and_cache_pf_results(
                 prior_cov  = get_ens_cov(pf_ens_v_f)                           # (B, D, D)
                 batch_prior_means_to_cache.append(prior_mean)
                 batch_prior_covs_to_cache.append(prior_cov)
+                prior_summary = _compute_pf_distribution_summary(pf_ens_v_f)
+                batch_prior_quantiles_to_cache.append(prior_summary["quantiles"])
+                batch_prior_q01_q99_to_cache.append(prior_summary["range_q01_q99"])
+                batch_prior_minmax_to_cache.append(prior_summary["minmax"])
+                batch_prior_range_int_to_cache.append(prior_summary["range_int"])
+                batch_prior_skew_to_cache.append(prior_summary["skewness"])
+                batch_prior_kurt_to_cache.append(prior_summary["kurtosis_excess"])
+                batch_prior_pca_eigvals_to_cache.append(prior_summary["pca_eigvals"])
+                batch_prior_pca_quantiles_to_cache.append(prior_summary["pca_quantiles"])
 
                 # Prepare true state for metrics/visualization.
                 true_state_ti1 = batch_v[i + 1]  # (B, D)
 
                 # -------- Analysis (POSTERIOR) step --------
-                pf_ens_v_a = bootstrap_particle_filter_analysis(
+                pf_ens_v_a, pf_diag = bootstrap_particle_filter_analysis(
                     pf_ens_v_f,
                     obs_y_list[i + 1].squeeze(1),  # (B, obs_dim)
                     H_fun if not isinstance(H, torch.Tensor) else H.transpose(1, 0),
@@ -1776,6 +2017,7 @@ def generate_and_cache_pf_results(
                     sigma_reg=args.sigma_reg,
                     max_chunk_size=1000000,
                     resample_on_cpu=False,
+                    return_diagnostics=True,
                 )
                 pf_ens_v_a = torch.clamp(pf_ens_v_a, min=-args.clamp, max=args.clamp)
 
@@ -1784,6 +2026,18 @@ def generate_and_cache_pf_results(
                 post_cov  = get_ens_cov(pf_ens_v_a)                            # (B, D, D)
                 batch_post_means_to_cache.append(post_mean)
                 batch_post_covs_to_cache.append(post_cov)
+                post_summary = _compute_pf_distribution_summary(pf_ens_v_a)
+                batch_post_quantiles_to_cache.append(post_summary["quantiles"])
+                batch_post_q01_q99_to_cache.append(post_summary["range_q01_q99"])
+                batch_post_minmax_to_cache.append(post_summary["minmax"])
+                batch_post_range_int_to_cache.append(post_summary["range_int"])
+                batch_post_skew_to_cache.append(post_summary["skewness"])
+                batch_post_kurt_to_cache.append(post_summary["kurtosis_excess"])
+                batch_post_pca_eigvals_to_cache.append(post_summary["pca_eigvals"])
+                batch_post_pca_quantiles_to_cache.append(post_summary["pca_quantiles"])
+                batch_post_ess_to_cache.append(pf_diag["ess"])
+                batch_post_weight_entropy_to_cache.append(pf_diag["weight_entropy"])
+                batch_post_weight_abundance_to_cache.append(pf_diag["weight_abundance"])
 
                 # Metrics at t=i+1 using POSTERIOR mean
                 rmse_ti = torch.sqrt(torch.mean((post_mean - true_state_ti1) ** 2, dim=1))
@@ -1828,6 +2082,13 @@ def generate_and_cache_pf_results(
                                 history_traj=hist_traj,
                                 true_state=true_state_ti1[bidx].detach().cpu(),
                                 legend_in_figure=getattr(args, "legend_in_figure", False),
+                                prior_range_int=prior_summary["range_int"][bidx].detach().cpu(),
+                                post_range_int=post_summary["range_int"][bidx].detach().cpu(),
+                                quantile_probs=quantile_probs.detach().cpu(),
+                                prior_quantiles=prior_summary["quantiles"][bidx].detach().cpu()[:3],
+                                post_quantiles=post_summary["quantiles"][bidx].detach().cpu()[:3],
+                                prior_pca_quantiles=prior_summary["pca_quantiles"][bidx].detach().cpu(),
+                                post_pca_quantiles=post_summary["pca_quantiles"][bidx].detach().cpu(),
                             )
                             if track_pf_non_gaussian:
                                 for record in swd_records:
@@ -1916,12 +2177,41 @@ def generate_and_cache_pf_results(
                                     legend_in_figure=getattr(args, "legend_in_figure", False),
                                 )
 
+                    # Periodically checkpoint the accumulated SWD list every 100 steps.
+                    if track_pf_non_gaussian and len(pf_non_gaussian_records) > 0 and ((i + 1) % 100 == 0):
+                        os.makedirs(distance_dir, exist_ok=True)
+                        torch.save(pf_non_gaussian_records, detailed_pt)
+                        print(
+                            "[PF non-Gaussian] Periodic list checkpoint: "
+                            f"step={i + 1}, records={len(pf_non_gaussian_records)}, file={detailed_pt}"
+                        )
+
             # --- Aggregate and Cache Batch Results ---
             all_pf_results_to_cache.append({
                 'prior_means': torch.stack(batch_prior_means_to_cache),  # (T-1, B, D)
                 'prior_covs':  torch.stack(batch_prior_covs_to_cache),   # (T-1, B, D, D)
                 'post_means':  torch.stack(batch_post_means_to_cache),   # (T-1, B, D)
                 'post_covs':   torch.stack(batch_post_covs_to_cache),    # (T-1, B, D, D)
+                'quantile_probs': quantile_probs.detach().cpu(),          # (K,)
+                'prior_quantiles': torch.stack(batch_prior_quantiles_to_cache),  # (T-1, B, D, K)
+                'post_quantiles': torch.stack(batch_post_quantiles_to_cache),    # (T-1, B, D, K)
+                'prior_range_q01_q99': torch.stack(batch_prior_q01_q99_to_cache),# (T-1, B, D, 2)
+                'post_range_q01_q99': torch.stack(batch_post_q01_q99_to_cache),  # (T-1, B, D, 2)
+                'prior_minmax': torch.stack(batch_prior_minmax_to_cache),         # (T-1, B, D, 2)
+                'post_minmax': torch.stack(batch_post_minmax_to_cache),           # (T-1, B, D, 2)
+                'prior_range_int': torch.stack(batch_prior_range_int_to_cache),   # (T-1, B, D, 2) int32
+                'post_range_int': torch.stack(batch_post_range_int_to_cache),     # (T-1, B, D, 2) int32
+                'prior_skewness': torch.stack(batch_prior_skew_to_cache),         # (T-1, B, D)
+                'post_skewness': torch.stack(batch_post_skew_to_cache),           # (T-1, B, D)
+                'prior_kurtosis_excess': torch.stack(batch_prior_kurt_to_cache),  # (T-1, B, D)
+                'post_kurtosis_excess': torch.stack(batch_post_kurt_to_cache),    # (T-1, B, D)
+                'prior_pca_eigvals': torch.stack(batch_prior_pca_eigvals_to_cache), # (T-1, B, D)
+                'post_pca_eigvals': torch.stack(batch_post_pca_eigvals_to_cache),   # (T-1, B, D)
+                'prior_pca_quantiles': torch.stack(batch_prior_pca_quantiles_to_cache), # (T-1, B, 3, K)
+                'post_pca_quantiles': torch.stack(batch_post_pca_quantiles_to_cache),   # (T-1, B, 3, K)
+                'post_ess': torch.stack(batch_post_ess_to_cache),                 # (T-1, B)
+                'post_weight_entropy': torch.stack(batch_post_weight_entropy_to_cache), # (T-1, B)
+                'post_weight_abundance': torch.stack(batch_post_weight_abundance_to_cache), # (T-1, B)
             })
 
             # --- Calculate and Aggregate Average Metrics for the Batch (posterior-based) ---
@@ -1951,15 +2241,7 @@ def generate_and_cache_pf_results(
     torch.save(all_pf_results_to_cache, cache_filepath)
 
     if len(pf_non_gaussian_records) > 0:
-        distance_dir = pf_vis_folder
         os.makedirs(distance_dir, exist_ok=True)
-        distance_prefix = (
-            f"{distance_dir}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}_{args.seed}"
-            "_non_gaussian_distance"
-        )
-        detailed_pt = f"{distance_prefix}_detail.pt"
-        detailed_csv = f"{distance_prefix}_detail.csv"
-        summary_csv = f"{distance_prefix}_per_step_mean.csv"
 
         torch.save(pf_non_gaussian_records, detailed_pt)
         csv_fields = [
@@ -2100,7 +2382,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         traj_len = first_batch_for_shape.shape[0]
         batch_size = first_batch_for_shape.shape[1]
         
-        cache_dir = os.path.join('data', args.dataset)
+        cache_dir = _build_pf_cache_dir(args)
         cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
@@ -2108,11 +2390,18 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             print(f"Loading cached PF results from: {cache_filepath}")
             cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
         else:
-            raise FileNotFoundError(
-                f"Required particle filter cache file not found at: {cache_filepath}. "
-                f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
-                f"Please run generate_and_cache_pf_results() first."
-            )
+            legacy_cache_dir = os.path.join('data', args.dataset)
+            legacy_cache_filepath = os.path.join(legacy_cache_dir, cache_filename)
+            if os.path.exists(legacy_cache_filepath):
+                print(f"[PF cache fallback] Loading legacy cache from: {legacy_cache_filepath}")
+                cached_pf_data = torch.load(legacy_cache_filepath, map_location=args.device, weights_only=True)
+            else:
+                raise FileNotFoundError(
+                    f"Required particle filter cache file not found at: {cache_filepath} "
+                    f"(legacy checked: {legacy_cache_filepath}). "
+                    f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
+                    f"Please run generate_and_cache_pf_results() first."
+                )
 
     # Aggregated results
     all_results = {
@@ -2136,7 +2425,16 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
-    plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
+    pf_style_projection_enabled = bool(
+        args.pf_verification
+        and str(getattr(args, "dataset", "")).lower() not in {"doubling1d", "complex2d"}
+        and int(getattr(args, "ori_dim", 0)) >= 3
+    )
+    plot_prior_enabled = bool(
+        plot_figures and (
+            args.dataset in {"lorenz63", "doubling1d", "complex2d"} or pf_style_projection_enabled
+        )
+    )
 
     # Rank-hist configuration: fixed projection directions for the whole test run.
     rank_num_projections = max(1, int(getattr(args, "rank_num_projections", 8)))
@@ -2283,8 +2581,15 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
                 # PF verification: compute only for current active subset, scatter back
                 if args.pf_verification and idx_active.numel() > 0:
-                    pf_mean_a_full = cached_pf_data[batch_ind]['means'][i]     # [B, d]
-                    pf_cov_ens_a_full = cached_pf_data[batch_ind]['covs'][i]   # [B, d, d]
+                    pf_entry = cached_pf_data[batch_ind]
+                    pf_post_means = _get_pf_cached_post_means(pf_entry)
+                    pf_post_covs = _get_pf_cached_post_covs(pf_entry)
+                    if pf_post_means is None or pf_post_covs is None:
+                        raise KeyError(
+                            "PF cache entry must contain either (post_means, post_covs) or legacy (means, covs)."
+                        )
+                    pf_mean_a_full = pf_post_means[i]     # [B, d]
+                    pf_cov_ens_a_full = pf_post_covs[i]   # [B, d, d]
 
                     pf_mean_a = pf_mean_a_full.index_select(0, idx_active)
                     pf_cov_ens_a = pf_cov_ens_a_full.index_select(0, idx_active)
@@ -2382,95 +2687,138 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     unresolved_global_indices.discard(batch_start_index + lidx)
 
                 if len(local_plot_indices) > 0:
-                    ens_plot = ens_tensor
-                    true_plot = batch_v
-                    compare_plot = batch_v
-                    obs_plot = observations
-
-                    if args.pf_verification:
-                        true_plot = true_plot[1:]
-                        compare_plot = cached_pf_data[batch_ind]['means']
-                        ens_plot = ens_plot[1:]
-                        obs_plot = obs_plot[1:]
-                        step_offset = 1
-                    else:
-                        step_offset = 0
-
-                    _plot_test_visualizations(
-                        args=args,
-                        ens_tensor=ens_plot,
-                        true_tensor=true_plot,
-                        comparison_tensor=compare_plot,
-                        observations=obs_plot,
-                        fig_name=fig_name,
-                        save_pdf=save_pdf,
-                        step_offset=step_offset,
-                        plot_batch_indices=local_plot_indices,
-                        batch_start_index=batch_start_index,
-                        global_index_naming=True,
-                        ens_color='tab:red',
-                        ring_plot_history=False,
-                    )
-                    if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
-                        _plot_test_visualizations(
+                    if pf_style_projection_enabled:
+                        _plot_pf_style_projections_from_cache(
                             args=args,
-                            ens_tensor=ens_prior_tensor[1:],
-                            true_tensor=batch_v[1:],
-                            comparison_tensor=batch_v[1:],
-                            observations=observations[1:],
-                            fig_name=fig_name + "_prior",
-                            save_pdf=save_pdf,
-                            step_offset=1,
+                            ens_post_tensor=ens_tensor,
+                            ens_prior_tensor=ens_prior_tensor,
+                            true_tensor=batch_v,
+                            pf_entry=cached_pf_data[batch_ind],
+                            fig_name=fig_name,
                             plot_batch_indices=local_plot_indices,
                             batch_start_index=batch_start_index,
                             global_index_naming=True,
-                            ens_color='tab:blue',
-                            ring_plot_history=False,
                         )
+                    else:
+                        ens_plot = ens_tensor
+                        true_plot = batch_v
+                        compare_plot = batch_v
+                        obs_plot = observations
+
+                        if args.pf_verification:
+                            pf_post_means = _get_pf_cached_post_means(cached_pf_data[batch_ind])
+                            if pf_post_means is None:
+                                raise KeyError("PF cache entry missing post means.")
+                            true_plot = true_plot[1:]
+                            compare_plot = pf_post_means
+                            ens_plot = ens_plot[1:]
+                            obs_plot = obs_plot[1:]
+                            step_offset = 0
+                        else:
+                            step_offset = 0
+
+                        _plot_test_visualizations(
+                            args=args,
+                            ens_tensor=ens_plot,
+                            true_tensor=true_plot,
+                            comparison_tensor=compare_plot,
+                            observations=obs_plot,
+                            fig_name=fig_name,
+                            save_pdf=save_pdf,
+                            step_offset=step_offset,
+                            plot_batch_indices=local_plot_indices,
+                            batch_start_index=batch_start_index,
+                            global_index_naming=True,
+                            ens_color='tab:red',
+                            ring_plot_history=False,
+                            enable_highdim_slices=True,
+                        )
+                        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                            _plot_test_visualizations(
+                                args=args,
+                                ens_tensor=ens_prior_tensor[1:],
+                                true_tensor=batch_v[1:],
+                                comparison_tensor=batch_v[1:],
+                                observations=observations[1:],
+                                fig_name=fig_name + "_prior",
+                                save_pdf=save_pdf,
+                                step_offset=1,
+                                plot_batch_indices=local_plot_indices,
+                                batch_start_index=batch_start_index,
+                                global_index_naming=True,
+                                ens_color='tab:blue',
+                                ring_plot_history=False,
+                                enable_highdim_slices=True,
+                            )
             batch_start_index += B
     
     if plot_figures and plot_mode == "adaptive":
-        ens_plot = ens_tensor
-        true_plot = batch_v
-        compare_plot = batch_v
-        obs_plot = observations
-
-        # With PF verification, compare ensemble means against PF posterior means,
-        # while keeping per-step snapshot markers on true states.
-        if args.pf_verification:
-            true_plot = true_plot[1:]
-            compare_plot = cached_pf_data[-1]['means']
-            ens_plot = ens_plot[1:]
-            obs_plot = obs_plot[1:]
-            step_offset = 1
+        if pf_style_projection_enabled:
+            nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))
+            nan_counts = nan_per_step.sum(dim=0)
+            adaptive_indices = _resolve_plot_batch_indices(
+                args=args,
+                batch_size=ens_tensor.shape[1],
+                nan_counts=nan_counts,
+            )
+            _plot_pf_style_projections_from_cache(
+                args=args,
+                ens_post_tensor=ens_tensor,
+                ens_prior_tensor=ens_prior_tensor,
+                true_tensor=batch_v,
+                pf_entry=cached_pf_data[-1],
+                fig_name=fig_name,
+                plot_batch_indices=adaptive_indices,
+                batch_start_index=0,
+                global_index_naming=False,
+            )
         else:
-            step_offset = 0
+            ens_plot = ens_tensor
+            true_plot = batch_v
+            compare_plot = batch_v
+            obs_plot = observations
 
-        _plot_test_visualizations(
-            args=args,
-            ens_tensor=ens_plot,
-            true_tensor=true_plot,
-            comparison_tensor=compare_plot,
-            observations=obs_plot,
-            fig_name=fig_name,
-            save_pdf=save_pdf,
-            step_offset=step_offset,
-            ens_color='tab:red',
-            ring_plot_history=False,
-        )
-        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+            # With PF verification, compare ensemble means against PF posterior means,
+            # while keeping per-step snapshot markers on true states.
+            if args.pf_verification:
+                pf_post_means = _get_pf_cached_post_means(cached_pf_data[-1])
+                if pf_post_means is None:
+                    raise KeyError("PF cache entry missing post means.")
+                true_plot = true_plot[1:]
+                compare_plot = pf_post_means
+                ens_plot = ens_plot[1:]
+                obs_plot = obs_plot[1:]
+                step_offset = 0
+            else:
+                step_offset = 0
+
             _plot_test_visualizations(
                 args=args,
-                ens_tensor=ens_prior_tensor[1:],
-                true_tensor=batch_v[1:],
-                comparison_tensor=batch_v[1:],
-                observations=observations[1:],
-                fig_name=fig_name + "_prior",
+                ens_tensor=ens_plot,
+                true_tensor=true_plot,
+                comparison_tensor=compare_plot,
+                observations=obs_plot,
+                fig_name=fig_name,
                 save_pdf=save_pdf,
-                step_offset=1,
-                ens_color='tab:blue',
+                step_offset=step_offset,
+                ens_color='tab:red',
                 ring_plot_history=False,
+                enable_highdim_slices=True,
             )
+            if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                _plot_test_visualizations(
+                    args=args,
+                    ens_tensor=ens_prior_tensor[1:],
+                    true_tensor=batch_v[1:],
+                    comparison_tensor=batch_v[1:],
+                    observations=observations[1:],
+                    fig_name=fig_name + "_prior",
+                    save_pdf=save_pdf,
+                    step_offset=0,
+                    ens_color='tab:blue',
+                    ring_plot_history=False,
+                    enable_highdim_slices=True,
+                )
     elif plot_figures and len(unresolved_global_indices) > 0:
         unresolved_sorted = sorted(list(unresolved_global_indices))
         print(
@@ -2748,7 +3096,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         traj_len = first_batch_for_shape.shape[0]
         batch_size = first_batch_for_shape.shape[1]
 
-        cache_dir = os.path.join('data', args.dataset)
+        cache_dir = _build_pf_cache_dir(args)
         cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
         cache_filepath = os.path.join(cache_dir, cache_filename)
 
@@ -2756,11 +3104,18 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             print(f"Loading cached PF results from: {cache_filepath}")
             cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
         else:
-            raise FileNotFoundError(
-                f"Required particle filter cache file not found at: {cache_filepath}. "
-                f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
-                f"Please run generate_and_cache_pf_results() first."
-            )
+            legacy_cache_dir = os.path.join('data', args.dataset)
+            legacy_cache_filepath = os.path.join(legacy_cache_dir, cache_filename)
+            if os.path.exists(legacy_cache_filepath):
+                print(f"[PF cache fallback] Loading legacy cache from: {legacy_cache_filepath}")
+                cached_pf_data = torch.load(legacy_cache_filepath, map_location=args.device, weights_only=True)
+            else:
+                raise FileNotFoundError(
+                    f"Required particle filter cache file not found at: {cache_filepath} "
+                    f"(legacy checked: {legacy_cache_filepath}). "
+                    f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
+                    f"Please run generate_and_cache_pf_results() first."
+                )
 
     # Aggregated results
     all_results = {
@@ -2955,8 +3310,15 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
                 # PF verification (compute only on currently active trajectories)
                 if args.pf_verification and idx_active.numel() > 0:
-                    pf_mean_a_full = cached_pf_data[batch_ind]['means'][i]         # [B, d]
-                    pf_cov_ens_a_full = cached_pf_data[batch_ind]['covs'][i]      # [B, d, d]
+                    pf_entry = cached_pf_data[batch_ind]
+                    pf_post_means = _get_pf_cached_post_means(pf_entry)
+                    pf_post_covs = _get_pf_cached_post_covs(pf_entry)
+                    if pf_post_means is None or pf_post_covs is None:
+                        raise KeyError(
+                            "PF cache entry must contain either (post_means, post_covs) or legacy (means, covs)."
+                        )
+                    pf_mean_a_full = pf_post_means[i]         # [B, d]
+                    pf_cov_ens_a_full = pf_post_covs[i]      # [B, d, d]
 
                     # Subset PF data to active ones
                     pf_mean_a = pf_mean_a_full.index_select(0, idx_active)
@@ -3041,8 +3403,11 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     obs_plot = observations
 
                     if args.pf_verification:
+                        pf_post_means = _get_pf_cached_post_means(cached_pf_data[batch_ind])
+                        if pf_post_means is None:
+                            raise KeyError("PF cache entry missing post means.")
                         true_plot = true_plot[1:]
-                        compare_plot = cached_pf_data[batch_ind]['means']
+                        compare_plot = pf_post_means
                         ens_plot = ens_plot[1:]
                         obs_plot = obs_plot[1:]
                         step_offset = 1
@@ -3089,8 +3454,11 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         obs_plot = observations
 
         if args.pf_verification:
+            pf_post_means = _get_pf_cached_post_means(cached_pf_data[-1])
+            if pf_post_means is None:
+                raise KeyError("PF cache entry missing post means.")
             true_plot = true_plot[1:]
-            compare_plot = cached_pf_data[-1]['means']
+            compare_plot = pf_post_means
             ens_plot = ens_plot[1:]
             obs_plot = obs_plot[1:]
             step_offset = 1
@@ -3474,12 +3842,14 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             
             # --- Initialize Ground Truth and Ensemble States ---
             gt_v_a = m.unsqueeze(1)
+            kalman_m_a = m.unsqueeze(1)
             # Initial analysis error covariance is the provided C
             P_a = C @ C.transpose(-1, -2) 
             
             # Initial ensemble
             ens_v_a = m.unsqueeze(1).repeat(1, N, 1)
             ens_v_a += torch.bmm(torch.randn_like(ens_v_a, device=args.device), C.transpose(-1,-2))
+            init_P_ens_a = get_ens_cov(ens_v_a)
 
             # --- Lists to Store Trajectory Data for the Current Batch ---
             ens_list = [ens_v_a]
@@ -3488,6 +3858,10 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             cov_diff_list = []
             rcov_diff_list = []
             w2_diff_list = []
+            kalman_mean_list = [kalman_m_a.squeeze(1)]
+            kalman_cov_list = [P_a]
+            method_mean_list = [ens_v_a.mean(dim=1)]
+            method_cov_list = [init_P_ens_a]
 
             # --- Main Assimilation Loop ---
             for i in range(args.test_steps -1):
@@ -3500,10 +3874,15 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 obs_noise = _sample_true_obs_noise_like(clean_h, test_noise_gen)
                 obs_y = clean_h + torch.bmm(obs_noise, R.sqrt())
 
-                # --- Kalman Filter Covariance Update (Ground Truth) ---
+                # --- Kalman Filter Mean/Covariance Update (Ground Truth Reference) ---
+                kalman_m_f = forward_fun(kalman_m_a, A)
                 P_f = A @ P_a @ A.transpose(-1, -2) + Q
                 S = H @ P_f @ H.transpose(-1, -2) + R
                 K = P_f @ H.transpose(-1, -2) @ torch.inverse(S)
+                kalman_m_a = kalman_m_f + torch.bmm(
+                    (obs_y - H_fun(kalman_m_f, H)),
+                    K.transpose(-1, -2),
+                )
                 P_a = (torch.eye(D, device=args.device).unsqueeze(0).repeat(B,1,1) - K @ H) @ P_f
 
                 # --- Ensemble Forecast ---
@@ -3539,10 +3918,18 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 # --- Store results for this step ---
                 ens_list.append(ens_v_a)
                 gt_list.append(gt_v_a.squeeze(1))
+                kalman_mean_list.append(kalman_m_a.squeeze(1))
+                kalman_cov_list.append(P_a)
+                method_mean_list.append(ens_v_a.mean(dim=1))
+                method_cov_list.append(P_ens_a)
             
             # --- Process and Store Batch Results ---
             ens_tensor = torch.stack(ens_list, dim=0)
             gt_tensor = torch.stack(gt_list, dim=0)
+            kalman_mean_tensor = torch.stack(kalman_mean_list, dim=0)
+            kalman_cov_tensor = torch.stack(kalman_cov_list, dim=0)
+            method_mean_tensor = torch.stack(method_mean_list, dim=0)
+            method_cov_tensor = torch.stack(method_cov_list, dim=0)
 
             # SNR_var per trajectory using clean observations h(v_j) = H v_j.
             h_tensor = torch.einsum('tbd,bod->tbo', gt_tensor, H)
@@ -3584,23 +3971,45 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                     loc_tensor_all_batches = torch.cat((loc_tensor_all_batches, current_loc_tensor), dim=0)
                     
         if plot_figures: 
-            time_idx_plot = -2 # Example: Plot second to last time state
-            num_dims_plot = 4 # Example
-            dim_indices_plot = list(range(min(args.ori_dim, num_dims_plot)))
+            # Reuse test_plot_index policy to choose one trajectory.
+            nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))
+            nan_counts = nan_per_step.sum(dim=0)
+            vis_indices = _resolve_plot_batch_indices(args, batch_size=ens_tensor.shape[1], nan_counts=nan_counts)
+            vis_bidx = int(vis_indices[0]) if len(vis_indices) > 0 else 0
+            vis_bidx = max(0, min(vis_bidx, ens_tensor.shape[1] - 1))
 
-            plot_particle_trajectories_with_histograms(particles=ens_tensor[:,time_idx_plot,:,:], 
-                                                    true_traj=gt_tensor[:,time_idx_plot,:], 
-                                                    observation=None, #observations[:,time_idx_plot,:],
-                                                    dim_indices=dim_indices_plot,
-                                                    start_time=0, # Adjust as needed
-                                                    end_time=ens_tensor.shape[0], #Trajectory length
-                                                    mode='quantile',
-                                                    save_fig=True,
-                                                    save_pdf=save_pdf,
-                                                    save_name=fig_name + "_hist",
-                                                    hist_step=1,
-                                                    fontsize=None,
-                                                    legend_in_figure=getattr(args, "legend_in_figure", False))
+            # Default to the last 20 steps for the 2D projection.
+            tail_steps = int(getattr(args, "linear_vis_tail_steps", 20))
+            if args.ori_dim >= 2:
+                plot_linear_kalman_vs_method_2d(
+                    kalman_means=kalman_mean_tensor[:, vis_bidx, :],
+                    kalman_covs=kalman_cov_tensor[:, vis_bidx, :, :],
+                    method_means=method_mean_tensor[:, vis_bidx, :],
+                    method_covs=method_cov_tensor[:, vis_bidx, :, :],
+                    dim_indices=(0, 1),
+                    tail_steps=tail_steps,
+                    save_fig=True,
+                    save_pdf=save_pdf,
+                    save_name=f"{fig_name}_kalman2d_b{vis_bidx}",
+                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                )
+            else:
+                dim_indices_plot = list(range(min(args.ori_dim, 1)))
+                plot_particle_trajectories_with_histograms(
+                    particles=ens_tensor[:, vis_bidx, :, :],
+                    true_traj=gt_tensor[:, vis_bidx, :],
+                    observation=None,
+                    dim_indices=dim_indices_plot,
+                    start_time=max(0, ens_tensor.shape[0] - tail_steps),
+                    end_time=ens_tensor.shape[0],
+                    mode='quantile',
+                    save_fig=True,
+                    save_pdf=save_pdf,
+                    save_name=fig_name + "_hist",
+                    hist_step=1,
+                    fontsize=None,
+                    legend_in_figure=getattr(args, "legend_in_figure", False),
+                )
 
     # --- Final Metrics Calculation ---
     final_metrics = {}

@@ -48,7 +48,16 @@ if __name__ == "__main__":
         # test
         print("Test NN Results")
         t_start = time.time()
-        test_results = test_model_v2(test_loader, model_list, args, plot_figures=False, fig_name=f'{folder_name}/test_{args.N}_0', save_pdf=False, infl=1, loc_radius=5)
+        test_results = test_model_v2(
+            test_loader,
+            model_list,
+            args,
+            plot_figures=args.save_test_figures,
+            fig_name=f'{folder_name}/test_{args.N}_0',
+            save_pdf=False,
+            infl=1,
+            loc_radius=5,
+        )
         print_test_results_v2(test_results)
         t_inference = time.time() - t_start
         print(f"Inference finished with time {t_inference: .2f}s.")
@@ -96,5 +105,4 @@ if __name__ == "__main__":
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
         torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
-
 

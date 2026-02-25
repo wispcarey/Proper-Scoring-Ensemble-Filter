@@ -130,7 +130,8 @@ def bootstrap_particle_filter_analysis(
     resample_on_cpu=False,   # bool: If True, moves weight/index calculations to CPU
     sigma_reg=None,          # float (std dev for regularization noise)
     use_half_precision=False,# bool: If True, use float16 to save memory
-    max_chunk_size=5000      # int: Max particles to process at once for non-matrix operators
+    max_chunk_size=5000,     # int: Max particles to process at once for non-matrix operators
+    return_diagnostics=False,# bool: If True, also return PF weight/resampling diagnostics
 ):
     """
     Performs an advanced batch analysis (update & resampling) for a Bootstrap Particle Filter.
@@ -151,7 +152,14 @@ def bootstrap_particle_filter_analysis(
         max_chunk_size (int): Max particles for vectorized call (only for callable operators).
 
     Returns:
-        torch.Tensor: The analysis particles of shape (batch_size, N_particles, d_state).
+        - If return_diagnostics=False:
+            torch.Tensor: The analysis particles of shape (batch_size, N_particles, d_state).
+        - If return_diagnostics=True:
+            Tuple[torch.Tensor, Dict[str, torch.Tensor]]
+            diagnostics keys:
+                - ess: effective sample size [B]
+                - weight_entropy: Shannon entropy of weights [B]
+                - weight_abundance: exp(entropy), effective abundance/perplexity [B]
     """
     batch_size, N_particles, d_state = particles_forecast.shape
     device = particles_forecast.device
@@ -251,6 +259,18 @@ def bootstrap_particle_filter_analysis(
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     particles_analysis = particles_forecast[batch_indices, indices]
 
+    diagnostics = None
+    if return_diagnostics:
+        weights_diag = weights.to(dtype=torch.float32)
+        ess = 1.0 / torch.clamp(torch.sum(weights_diag * weights_diag, dim=1), min=torch.finfo(torch.float32).eps)
+        entropy = -torch.sum(weights_diag * torch.log(torch.clamp(weights_diag, min=torch.finfo(torch.float32).tiny)), dim=1)
+        abundance = torch.exp(entropy)
+        diagnostics = {
+            "ess": ess,
+            "weight_entropy": entropy,
+            "weight_abundance": abundance,
+        }
+
     # 4. Regularization
     if sigma_reg is not None and sigma_reg > 0:
         particles_analysis += torch.randn_like(particles_analysis) * sigma_reg
@@ -258,7 +278,9 @@ def bootstrap_particle_filter_analysis(
     # 5. Final Type Casting
     if use_half_precision:
         particles_analysis = particles_analysis.to(original_dtype)
-        
+
+    if return_diagnostics:
+        return particles_analysis, diagnostics
     return particles_analysis
 
 
@@ -1313,4 +1335,3 @@ if __name__ == '__main__':
         avg_time = time_tensor[stable_start_idx:].mean().item() 
         
         print(f"{method_name:<8s}: Avg. Time: {avg_time:.6f} s | Mean RMSE (stable): {rmse_mean:.4f}")
-
