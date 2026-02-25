@@ -280,7 +280,7 @@ def _apply_adaptive_sigma_y_if_needed(args, dataset_config):
         )
 
 
-def get_parameters():
+def get_parameters(extra_arg_adder=None):
     parser = argparse.ArgumentParser()
     # dataset setting
     parser.add_argument('--dataset', type=str, default='lorenz96', 
@@ -478,6 +478,9 @@ def get_parameters():
     # version setting
     parser.add_argument('--v', type=str,
                         default='EtE-LRes', help='versions')
+
+    if callable(extra_arg_adder):
+        extra_arg_adder(parser)
 
     args = parser.parse_args()
 
