@@ -73,14 +73,10 @@ compute_time_limit() {
 # "EXP_SETTING EPOCHS N BATCH_SIZE SIGMA_Y VERSION LOSS_TYPE LOSS_WEIGHTS USE_PF
 #  LEARNING_RATE OBS_FN WEIGHT_DECAY ADAPTIVE_SIGMA_Y SUFFIX"
 EXPERIMENTS=(
-    "1d 500 30 512 0.1 EtE-LRes es None true default default 0 false None"
-    "1d 500 30 512 0.1 EtE-LRes nl2 None true default default 0 false None"
-    "1d 500 30 512 0.1 CorrTerms es None true default default 0 false None"
-    "1d 500 30 512 0.1 CorrTerms nl2 None true default default 0 false None"
-    "2d 500 30 512 0.1 EtE-LRes es None true default default 0 false None"
-    "2d 500 30 512 0.1 EtE-LRes nl2 None true default default 0 false None"
-    "2d 500 30 512 0.1 CorrTerms es None true default default 0 false None"
-    "2d 500 30 512 0.1 CorrTerms nl2 None true default default 0 false None"
+    "1d 500 30 512 0.2 EtE-LRes es None true default default 0 false None"
+    "1d 500 30 512 0.2 EtE-LRes nl2 None true default default 0 false None"
+    "1d 500 30 512 0.2 CorrTerms es None true default default 0 false None"
+    "1d 500 30 512 0.2 CorrTerms nl2 None true default default 0 false None"
 )
 
 validate_adaptive_sigma_y() {

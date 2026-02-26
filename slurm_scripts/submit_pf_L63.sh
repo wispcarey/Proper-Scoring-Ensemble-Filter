@@ -24,8 +24,10 @@ validate_bool() {
 EXPERIMENTS=(
     "true true square true"
     "true true arctan true"
+    "true true default true"
     "false false square true"
     "false false arctan true"
+    "false false default true"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
