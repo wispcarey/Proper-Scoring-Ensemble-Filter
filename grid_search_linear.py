@@ -43,7 +43,7 @@ def run_grid_search(args, test_loader, model_list, infl_candidates, loc_candidat
                 'w2_diff': current_w2,
                 'rmse': results.get('mean_rmse', float('nan')),
                 'rrmse': results.get('mean_rrmse', float('nan')),
-                'crps': results.get('mean_crps', float('nan'))
+                'es1': results.get('mean_es1', float('nan')),
             }
             grid_history.append(current_metrics)
 

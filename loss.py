@@ -212,6 +212,196 @@ def sample_projection_directions(state_dim, num_projections, device=None, dtype=
     return dirs_cpu.to(device=device, dtype=dtype)
 
 
+def compute_quantile_crps_1d(ens_samples, truth_quantiles, quantile_probs):
+    """
+    Compute 1D distribution-vs-distribution CRPS divergence from quantile-encoded truth.
+
+    This computes:
+        E|X - Y| - 0.5 E|X - X'| - 0.5 E|Y - Y'|
+    where X, X' are empirical ensemble samples and Y, Y' are from the truth distribution
+    represented by quantiles Q(p). The truth expectations are approximated with quadrature
+    weights derived from `quantile_probs`.
+
+    Args:
+        ens_samples (torch.Tensor): Shape [..., N], ensemble samples.
+        truth_quantiles (torch.Tensor): Shape [..., K], truth quantile values.
+        quantile_probs (torch.Tensor): Shape [K], quantile levels in [0, 1].
+
+    Returns:
+        torch.Tensor: Shape [...], non-negative divergence values (NaN where inputs are invalid).
+    """
+    if ens_samples.ndim < 1 or truth_quantiles.ndim < 1:
+        raise ValueError("ens_samples and truth_quantiles must have at least 1 dimension.")
+    if ens_samples.shape[:-1] != truth_quantiles.shape[:-1]:
+        raise ValueError(
+            f"Leading shape mismatch: ens_samples {tuple(ens_samples.shape)} vs "
+            f"truth_quantiles {tuple(truth_quantiles.shape)}"
+        )
+    if quantile_probs.ndim != 1:
+        raise ValueError(f"quantile_probs must be 1D, got {tuple(quantile_probs.shape)}")
+    if truth_quantiles.shape[-1] != quantile_probs.shape[0]:
+        raise ValueError(
+            f"Quantile length mismatch: truth_quantiles K={truth_quantiles.shape[-1]} vs "
+            f"quantile_probs K={quantile_probs.shape[0]}"
+        )
+
+    ens = ens_samples.to(torch.float32)
+    q_true = truth_quantiles.to(torch.float32)
+    probs = quantile_probs.to(device=ens.device, dtype=torch.float32)
+
+    valid = torch.isfinite(ens).all(dim=-1) & torch.isfinite(q_true).all(dim=-1)
+    if not valid.any():
+        return torch.full(ens.shape[:-1], float("nan"), device=ens.device, dtype=torch.float32)
+
+    order = torch.argsort(probs)
+    probs_sorted = probs.index_select(0, order)
+    q_sorted = q_true.index_select(-1, order)
+
+    ens_safe = torch.where(torch.isfinite(ens), ens, torch.zeros_like(ens))
+    q_safe = torch.where(torch.isfinite(q_sorted), q_sorted, torch.zeros_like(q_sorted))
+
+    # Quadrature weights over p from trapz-style rule.
+    k = int(probs_sorted.numel())
+    if k <= 1:
+        quad_w = torch.ones_like(probs_sorted)
+    else:
+        quad_w = torch.zeros_like(probs_sorted)
+        quad_w[0] = 0.5 * (probs_sorted[1] - probs_sorted[0])
+        quad_w[-1] = 0.5 * (probs_sorted[-1] - probs_sorted[-2])
+        if k > 2:
+            quad_w[1:-1] = 0.5 * (probs_sorted[2:] - probs_sorted[:-2])
+        quad_sum = torch.sum(quad_w)
+        if torch.isfinite(quad_sum) and quad_sum > 1e-12:
+            quad_w = quad_w / quad_sum
+        else:
+            quad_w = torch.full_like(probs_sorted, 1.0 / float(max(k, 1)))
+
+    # E|X-Y| using weighted truth quantile support.
+    term_xy_by_q = torch.abs(ens_safe.unsqueeze(-1) - q_safe.unsqueeze(-2)).mean(dim=-2)  # [..., K]
+    w_shape = [1] * (term_xy_by_q.ndim - 1) + [k]
+    quad_w_b = quad_w.view(*w_shape)
+    term_xy = torch.sum(term_xy_by_q * quad_w_b, dim=-1)  # [...]
+
+    # 0.5 * E|X-X'|
+    term_xx = 0.5 * torch.abs(ens_safe.unsqueeze(-1) - ens_safe.unsqueeze(-2)).mean(dim=(-2, -1))  # [...]
+
+    # 0.5 * E|Y-Y'| with quadrature weights.
+    q_pair = torch.abs(q_safe.unsqueeze(-1) - q_safe.unsqueeze(-2))  # [..., K, K]
+    w_i = quad_w.view(*([1] * (q_pair.ndim - 2)), k, 1)
+    w_j = quad_w.view(*([1] * (q_pair.ndim - 2)), 1, k)
+    term_yy = 0.5 * torch.sum(q_pair * (w_i * w_j), dim=(-2, -1))  # [...]
+
+    crps_div = term_xy - term_xx - term_yy
+    crps_div = torch.clamp(crps_div, min=0.0)
+    crps_div = crps_div.masked_fill(~valid, float("nan"))
+    return crps_div
+
+
+def compute_projected_quantile_crps(
+    ens_states,
+    state_truth_quantiles,
+    quantile_probs,
+    pca_truth_quantiles=None,
+    pca_directions=None,
+    max_state_dims=3,
+    max_pca_dims=3,
+):
+    """
+    Compute projected CRPS divergence by averaging 1D quantile-CRPS divergence over:
+    - first `max_state_dims` state coordinates
+    - up to `max_pca_dims` PCA projections (if quantiles + directions are provided)
+
+    Args:
+        ens_states (torch.Tensor): [T, B, N, D]
+        state_truth_quantiles (torch.Tensor): [T, B, Ds, K]
+        quantile_probs (torch.Tensor): [K]
+        pca_truth_quantiles (torch.Tensor or None): [T, B, P, K]
+        pca_directions (torch.Tensor or None): [T, B, D, P] or [T, B, P, D]
+
+    Returns:
+        torch.Tensor: [T, B], mean projected divergence over available projections.
+    """
+    if ens_states.ndim != 4:
+        raise ValueError(f"ens_states must be [T,B,N,D], got {tuple(ens_states.shape)}")
+    if state_truth_quantiles.ndim != 4:
+        raise ValueError(
+            f"state_truth_quantiles must be [T,B,Ds,K], got {tuple(state_truth_quantiles.shape)}"
+        )
+    if ens_states.shape[0] != state_truth_quantiles.shape[0] or ens_states.shape[1] != state_truth_quantiles.shape[1]:
+        raise ValueError(
+            f"Time/batch mismatch: ens_states {tuple(ens_states.shape[:2])} vs "
+            f"state_truth_quantiles {tuple(state_truth_quantiles.shape[:2])}"
+        )
+    if state_truth_quantiles.shape[-1] != quantile_probs.shape[0]:
+        raise ValueError(
+            f"Quantile length mismatch: state_truth_quantiles K={state_truth_quantiles.shape[-1]} vs "
+            f"quantile_probs K={quantile_probs.shape[0]}"
+        )
+
+    T, B, _, D = ens_states.shape
+    score_list = []
+
+    n_state_dims = min(int(max_state_dims), D, int(state_truth_quantiles.shape[2]))
+    for d_idx in range(n_state_dims):
+        score_d = compute_quantile_crps_1d(
+            ens_samples=ens_states[:, :, :, d_idx],
+            truth_quantiles=state_truth_quantiles[:, :, d_idx, :],
+            quantile_probs=quantile_probs,
+        )
+        score_list.append(score_d)
+
+    if pca_truth_quantiles is not None and pca_directions is not None:
+        if pca_truth_quantiles.ndim != 4:
+            raise ValueError(
+                f"pca_truth_quantiles must be [T,B,P,K], got {tuple(pca_truth_quantiles.shape)}"
+            )
+        if pca_truth_quantiles.shape[:2] != (T, B):
+            raise ValueError(
+                f"pca_truth_quantiles time/batch mismatch: expected {(T, B)}, got {tuple(pca_truth_quantiles.shape[:2])}"
+            )
+        if pca_truth_quantiles.shape[-1] != quantile_probs.shape[0]:
+            raise ValueError(
+                f"Quantile length mismatch for PCA: K={pca_truth_quantiles.shape[-1]} vs "
+                f"{quantile_probs.shape[0]}"
+            )
+
+        dirs = pca_directions
+        if dirs.ndim != 4:
+            raise ValueError(f"pca_directions must be 4D, got {tuple(dirs.shape)}")
+        if dirs.shape[:2] != (T, B):
+            raise ValueError(
+                f"pca_directions time/batch mismatch: expected {(T, B)}, got {tuple(dirs.shape[:2])}"
+            )
+        if dirs.shape[2] == D:
+            dirs_tb_dp = dirs
+        elif dirs.shape[3] == D:
+            dirs_tb_dp = dirs.transpose(-1, -2)
+        else:
+            raise ValueError(
+                f"pca_directions must have state dim D={D} in axis 2 or 3, got {tuple(dirs.shape)}"
+            )
+
+        dirs_tb_dp = dirs_tb_dp.to(device=ens_states.device, dtype=ens_states.dtype)
+        dirs_tb_dp = dirs_tb_dp / torch.clamp(torch.norm(dirs_tb_dp, dim=2, keepdim=True), min=1e-12)
+
+        n_pca_dims = min(int(max_pca_dims), int(pca_truth_quantiles.shape[2]), int(dirs_tb_dp.shape[3]))
+        if n_pca_dims > 0:
+            proj = torch.einsum("tbnd,tbdp->tbnp", ens_states, dirs_tb_dp[:, :, :, :n_pca_dims])
+            for p_idx in range(n_pca_dims):
+                score_p = compute_quantile_crps_1d(
+                    ens_samples=proj[:, :, :, p_idx],
+                    truth_quantiles=pca_truth_quantiles[:, :, p_idx, :],
+                    quantile_probs=quantile_probs,
+                )
+                score_list.append(score_p)
+
+    if len(score_list) == 0:
+        return torch.full((T, B), float("nan"), device=ens_states.device, dtype=torch.float32)
+
+    stacked = torch.stack(score_list, dim=0).to(torch.float32)  # [M, T, B]
+    return torch.nanmean(stacked, dim=0)
+
+
 def compute_ensemble_rank_histogram(
     ens_states,
     true_states,

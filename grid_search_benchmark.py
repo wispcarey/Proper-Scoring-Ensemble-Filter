@@ -118,7 +118,7 @@ if __name__ == "__main__":
         num_loc = int(loc_radius_range.numel())
 
         # Define metrics to track during the search
-        metrics_to_track = ["mean_crps", "mean_rmse", "mean_rrmse", "mean_rmv", "valid_percent"]
+        metrics_to_track = ["mean_pf_crps", "mean_rmse", "mean_rrmse", "mean_rmv", "valid_percent"]
         results_grid = {
             metric: torch.full((num_infl, num_loc), float("nan"), device=device, dtype=torch.float32)
             for metric in metrics_to_track
@@ -156,21 +156,21 @@ if __name__ == "__main__":
                     else:
                         results_grid[metric][i, j] = metric_tensor[0]
 
-                crps_ij = results_grid["mean_crps"][i, j].item()
+                crps_ij = results_grid["mean_pf_crps"][i, j].item()
                 rmse_ij = results_grid["mean_rmse"][i, j].item()
-                print(f" > Results: mean_crps={crps_ij:.4f}, mean_rmse={rmse_ij:.4f}")
+                print(f" > Results: mean_pf_crps={crps_ij:.4f}, mean_rmse={rmse_ij:.4f}")
 
         t_grid_search = time.time() - t_start
         print(f"Grid search finished with time {t_grid_search: .2f}s.")
 
-        # --- Find and Print Optimal Parameters based on Mean CRPS ---
-        crps_grid = results_grid["mean_crps"]
+        # --- Find and Print Optimal Parameters based on Mean PF-CRPS ---
+        crps_grid = results_grid["mean_pf_crps"]
         finite_mask = torch.isfinite(crps_grid)
 
         if not finite_mask.any():
             print("\\n--- Grid Search Failed ---")
             print("Could not find any valid results. Please check filter stability and parameter ranges.")
-            best_params_dict = {"infl": None, "loc_radius": None, "mean_crps": float("nan")}
+            best_params_dict = {"infl": None, "loc_radius": None, "mean_pf_crps": float("nan")}
             best_infl = None
             best_loc_radius = None
         else:
@@ -184,7 +184,7 @@ if __name__ == "__main__":
             best_crps_val = float(crps_grid[min_idx].item())
 
             print("\\n--- Grid Search Complete ---")
-            print(f"Best Mean CRPS: {best_crps_val:.4f}")
+            print(f"Best Mean PF-CRPS: {best_crps_val:.4f}")
             print(f"Optimal Inflation: {best_infl:.4f}")
             print(f"Optimal Localization Radius: {best_loc_radius}")
 
@@ -195,7 +195,7 @@ if __name__ == "__main__":
             best_params_dict = {
                 "infl": best_infl,
                 "loc_radius": best_loc_radius,
-                "mean_crps": best_crps_val,
+                "mean_pf_crps": best_crps_val,
             }
 
             # Optional: Run one last time with best parameters to generate plots
@@ -237,7 +237,7 @@ if __name__ == "__main__":
                 results_list.append(row)
 
         df_results = pd.DataFrame(results_list)
-        df_results.sort_values(by="mean_crps", inplace=True, na_position="last")
+        df_results.sort_values(by="mean_pf_crps", inplace=True, na_position="last")
         per_run_csv = os.path.join(folder_name, f"grid_search_results_{args.N}.csv")
         df_results.to_csv(per_run_csv, index=False)
 
@@ -253,7 +253,7 @@ if __name__ == "__main__":
             "loc_radius_range": _tensor_range_to_csv_string(loc_radius_range),
             "best_infl": best_params_dict["infl"],
             "best_loc_radius": best_params_dict["loc_radius"],
-            "best_mean_crps": best_params_dict["mean_crps"],
+            "best_mean_pf_crps": best_params_dict["mean_pf_crps"],
             "time_sec": t_grid_search,
             "per_run_csv": per_run_csv,
             "save_folder": folder_name,

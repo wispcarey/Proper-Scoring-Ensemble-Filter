@@ -74,12 +74,11 @@ if __name__ == "__main__":
                 # RMV (added)
                 'mean_rmv': test_results.get('mean_rmv', float('nan')),
                 'std_rmv': test_results.get('std_rmv', float('nan')),
-                # CRPS
-                'mean_crps': test_results.get('mean_crps', float('nan')),
-                'std_crps': test_results.get('std_crps', float('nan')),
-                # RCRPS
-                'mean_rcrps': test_results.get('mean_rcrps', float('nan')),
-                'std_rcrps': test_results.get('std_rcrps', float('nan')),
+                # ES1
+                'mean_es1': test_results.get('mean_es1', float('nan')),
+                'std_es1': test_results.get('std_es1', float('nan')),
+                'mean_res1': test_results.get('mean_res1', float('nan')),
+                'std_res1': test_results.get('std_res1', float('nan')),
                 # W2 (added)
                 'mean_w2_diff': test_results.get('mean_w2_diff', float('nan')),
                 'std_w2_diff': test_results.get('std_w2_diff', float('nan')),
@@ -105,4 +104,3 @@ if __name__ == "__main__":
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
         torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
-

@@ -46,6 +46,6 @@ if __name__ == "__main__":
 
         # test
         print("Test NN Results")
-        test_results = generate_and_cache_pf_results(test_loader, args, H_info, check_disk=False, calculate_crps=False, save_figure=args.pf_save_figure)
+        test_results = generate_and_cache_pf_results(test_loader, args, H_info, check_disk=False, calculate_es1=False, save_figure=args.pf_save_figure)
         print_test_results(test_results)
         print(f"PF Time: {time.time() - t:.2f}s")

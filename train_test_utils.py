@@ -27,6 +27,7 @@ from localization import dist2coeff, create_loc_mat, pairwise_distances
 from loss import (
     compute_loss,
     compute_es,
+    compute_projected_quantile_crps,
     compute_root_mean_variance,
     compute_spread_error_ratio,
     compute_ensemble_rank_histogram,
@@ -115,6 +116,29 @@ def _safe_pf_obs_fn_name(args) -> str:
 
 def _build_pf_cache_dir(args) -> str:
     return os.path.join("data", str(args.dataset), f"pf_{_safe_pf_obs_fn_name(args)}")
+
+
+def _load_cached_pf_avg_results(loader, args):
+    """
+    Load averaged PF cache from:
+      data/{dataset}/pf_{obs_fn}/pf_results_*_avg{obs_suffix}.pt
+    """
+    first_batch_for_shape = next(iter(loader))
+    traj_len = first_batch_for_shape.shape[0]
+    batch_size = first_batch_for_shape.shape[1]
+    cache_dir = _build_pf_cache_dir(args)
+    cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
+    cache_filepath = os.path.join(cache_dir, cache_filename)
+
+    if not os.path.exists(cache_filepath):
+        raise FileNotFoundError(
+            f"Required averaged PF cache file not found: {cache_filepath}. "
+            f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, "
+            f"default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
+            f"Please run generate_and_cache_pf_results() first."
+        )
+    print(f"Loading cached PF results from: {cache_filepath}")
+    return torch.load(cache_filepath, map_location=args.device, weights_only=True)
 
 
 def _setup_mixed_precision(args):
@@ -277,6 +301,98 @@ def _get_pf_cached_post_covs(entry: Dict[str, Any]) -> Optional[torch.Tensor]:
     return entry.get("covs", None)
 
 
+def _get_pf_post_pca_directions_from_covs(entry: Dict[str, Any], max_dims: int = 3) -> Optional[torch.Tensor]:
+    """
+    Reconstruct PCA directions from cached PF post covariances.
+
+    Returns:
+        torch.Tensor with shape [Tm1, B, D, k], where k=min(max_dims, D),
+        or None if post covariances are unavailable.
+    """
+    post_covs = _get_pf_cached_post_covs(entry)
+    if post_covs is None or post_covs.ndim != 4:
+        return None
+    Tm1, B, D, D2 = post_covs.shape
+    if D != D2 or D <= 0:
+        return None
+
+    k = min(int(max_dims), int(D))
+    cov_flat = post_covs.to(torch.float32).reshape(-1, D, D)
+    cov_flat = 0.5 * (cov_flat + cov_flat.transpose(-1, -2))
+    _, eigvecs = torch.linalg.eigh(cov_flat)  # ascending eigenvalues
+    eigvecs_desc = torch.flip(eigvecs, dims=(-1,))  # descending
+    dirs = eigvecs_desc[:, :, :k]
+    return dirs.view(Tm1, B, D, k)
+
+
+def _compute_dynamic_quantile_crps_from_pf_post(
+    ens_tensor: torch.Tensor,
+    pf_entry: Dict[str, Any],
+    max_state_dims: int = 3,
+    max_pca_dims: int = 3,
+) -> torch.Tensor:
+    """
+    Compute dynamic quantile-based CRPS for one batch.
+
+    Uses cached PF POST quantiles as truth and current ensemble particles as estimate.
+    Returns trajectory-level CRPS averaged over time, shape [B].
+    """
+    if ens_tensor.ndim != 4 or ens_tensor.shape[0] <= 1:
+        return torch.full((ens_tensor.shape[1],), float("nan"), device=ens_tensor.device, dtype=torch.float32)
+
+    q_probs = pf_entry.get("quantile_probs", None)
+    post_quantiles = pf_entry.get("post_quantiles", None)
+    if q_probs is None or post_quantiles is None:
+        return torch.full((ens_tensor.shape[1],), float("nan"), device=ens_tensor.device, dtype=torch.float32)
+
+    ens_post = ens_tensor[1:]  # align with PF post cache indexed by assimilation steps
+    q_probs = torch.as_tensor(q_probs, device=ens_post.device, dtype=torch.float32)
+    post_quantiles = torch.as_tensor(post_quantiles, device=ens_post.device, dtype=torch.float32)
+    post_pca_quantiles = pf_entry.get("post_pca_quantiles", None)
+    if post_pca_quantiles is not None:
+        post_pca_quantiles = torch.as_tensor(post_pca_quantiles, device=ens_post.device, dtype=torch.float32)
+    pca_dirs = _get_pf_post_pca_directions_from_covs(pf_entry, max_dims=max_pca_dims)
+    if pca_dirs is not None:
+        pca_dirs = pca_dirs.to(device=ens_post.device, dtype=ens_post.dtype)
+
+    t_use = min(int(ens_post.shape[0]), int(post_quantiles.shape[0]))
+    b_use = min(int(ens_post.shape[1]), int(post_quantiles.shape[1]))
+    out = torch.full((ens_post.shape[1],), float("nan"), device=ens_post.device, dtype=torch.float32)
+    if t_use <= 0 or b_use <= 0:
+        return out
+
+    ens_use = ens_post[:t_use, :b_use]
+    q_state_use = post_quantiles[:t_use, :b_use]
+
+    q_pca_use = None
+    dirs_use = None
+    if post_pca_quantiles is not None and pca_dirs is not None:
+        t_use_pca = min(int(t_use), int(post_pca_quantiles.shape[0]), int(pca_dirs.shape[0]))
+        b_use_pca = min(int(b_use), int(post_pca_quantiles.shape[1]), int(pca_dirs.shape[1]))
+        if t_use_pca > 0 and b_use_pca > 0:
+            ens_use = ens_post[:t_use_pca, :b_use_pca]
+            q_state_use = post_quantiles[:t_use_pca, :b_use_pca]
+            q_pca_use = post_pca_quantiles[:t_use_pca, :b_use_pca]
+            dirs_use = pca_dirs[:t_use_pca, :b_use_pca]
+
+    try:
+        crps_tb = compute_projected_quantile_crps(
+            ens_states=ens_use,
+            state_truth_quantiles=q_state_use,
+            quantile_probs=q_probs,
+            pca_truth_quantiles=q_pca_use,
+            pca_directions=dirs_use,
+            max_state_dims=max_state_dims,
+            max_pca_dims=max_pca_dims,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to compute quantile CRPS from PF cache ({exc}). Returning NaN.")
+        return out
+    crps_b = torch.nanmean(crps_tb, dim=0).to(torch.float32)
+    out[:crps_b.shape[0]] = crps_b
+    return out
+
+
 def _get_pf_cached_range_int(entry: Dict[str, Any], mode: str, range_idx: int, bidx: int, pad_int: int = 5) -> Optional[torch.Tensor]:
     key_int = f"{mode}_range_int"
     if key_int in entry:
@@ -292,6 +408,40 @@ def _get_pf_cached_range_int(entry: Dict[str, Any], mode: str, range_idx: int, b
             low = torch.floor(qvals[:, 0]) - int(pad_int)
             high = torch.ceil(qvals[:, 1]) + int(pad_int)
             return torch.stack((low, high), dim=-1).to(torch.int32)
+    return None
+
+
+def _get_pf_cached_pca_range_int(entry: Dict[str, Any], mode: str, range_idx: int, bidx: int, pad_int: int = 5) -> Optional[torch.Tensor]:
+    def _validate_and_slice_pca_range(v: torch.Tensor) -> Optional[torch.Tensor]:
+        arr = torch.as_tensor(v)
+        if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 2:
+            return None
+        arr2 = arr[:2, :2]
+        arr2_f = arr2.to(torch.float32)
+        if not torch.isfinite(arr2_f).all():
+            return None
+        if not torch.all(arr2_f[:, 1] > arr2_f[:, 0]):
+            return None
+        return arr2.to(torch.int32)
+
+    key_int = f"{mode}_pca_range_int"
+    if key_int in entry:
+        tensor = entry[key_int]
+        if torch.is_tensor(tensor) and tensor.ndim == 4 and 0 <= range_idx < tensor.shape[0] and 0 <= bidx < tensor.shape[1]:
+            parsed = _validate_and_slice_pca_range(tensor[range_idx, bidx])
+            if parsed is not None:
+                return parsed
+
+    key_q = f"{mode}_pca_range_q01_q99"
+    if key_q in entry:
+        q_tensor = entry[key_q]
+        if torch.is_tensor(q_tensor) and q_tensor.ndim == 4 and 0 <= range_idx < q_tensor.shape[0] and 0 <= bidx < q_tensor.shape[1]:
+            qvals = torch.as_tensor(q_tensor[range_idx, bidx]).to(torch.float32)
+            if qvals.ndim == 2 and qvals.shape[0] >= 2 and qvals.shape[1] >= 2 and torch.isfinite(qvals[:2, :2]).all():
+                low = torch.floor(qvals[:2, 0]) - int(pad_int)
+                high = torch.ceil(qvals[:2, 1]) + int(pad_int)
+                if torch.all(high > low):
+                    return torch.stack((low, high), dim=-1).to(torch.int32)
     return None
 
 
@@ -365,6 +515,14 @@ def _plot_pf_style_projections_from_cache(
                 pf_entry, mode="post", range_idx=range_idx, bidx=b,
                 pad_int=int(getattr(args, "pf_range_pad_int", 5))
             )
+            prior_pca_range_int = _get_pf_cached_pca_range_int(
+                pf_entry, mode="prior", range_idx=range_idx, bidx=b,
+                pad_int=int(getattr(args, "pf_range_pad_int", 5))
+            )
+            post_pca_range_int = _get_pf_cached_pca_range_int(
+                pf_entry, mode="post", range_idx=range_idx, bidx=b,
+                pad_int=int(getattr(args, "pf_range_pad_int", 5))
+            )
             q_probs = pf_entry.get("quantile_probs", None)
             prior_quantiles = _get_pf_cached_quantile_block(pf_entry, "prior_quantiles", range_idx=range_idx, bidx=b)
             post_quantiles = _get_pf_cached_quantile_block(pf_entry, "post_quantiles", range_idx=range_idx, bidx=b)
@@ -385,11 +543,14 @@ def _plot_pf_style_projections_from_cache(
                 legend_in_figure=getattr(args, "legend_in_figure", False),
                 prior_range_int=None if prior_range_int is None else prior_range_int.detach().cpu(),
                 post_range_int=None if post_range_int is None else post_range_int.detach().cpu(),
+                prior_pca_range_int=None if prior_pca_range_int is None else prior_pca_range_int.detach().cpu(),
+                post_pca_range_int=None if post_pca_range_int is None else post_pca_range_int.detach().cpu(),
                 quantile_probs=None if q_probs is None else torch.as_tensor(q_probs).detach().cpu(),
                 prior_quantiles=None if prior_quantiles is None else prior_quantiles.detach().cpu()[:3],
                 post_quantiles=None if post_quantiles is None else post_quantiles.detach().cpu()[:3],
                 prior_pca_quantiles=None if prior_pca_quantiles is None else prior_pca_quantiles.detach().cpu(),
                 post_pca_quantiles=None if post_pca_quantiles is None else post_pca_quantiles.detach().cpu(),
+                scatter_size_scale=float(getattr(args, "test_pf_scatter_scale", 1.8)),
             )
 
 
@@ -703,11 +864,10 @@ def _plot_last_three_steps_lowdim_generic(
                         ax.scatter(
                             true_np[dim_x],
                             true_np[dim_y],
-                            marker='*',
-                            s=220,
-                            c='orange',
-                            edgecolors='black',
-                            linewidth=0.6,
+                            marker='x',
+                            s=140,
+                            c='black',
+                            linewidth=2.0,
                             zorder=2,
                             label='True state',
                         )
@@ -769,7 +929,7 @@ def _plot_last_three_steps_lowdim_generic(
                         _add_label('Ensemble density')
                 if torch.isfinite(true_traj[t_idx, :2]).all():
                     ax.scatter(true_traj[t_idx, 0], true_traj[t_idx, 1],
-                               marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=2, label='True state')
+                               marker='x', s=140, c='black', linewidth=2.0, zorder=2, label='True state')
                     _add_label('True state')
                 if torch.isfinite(observations[t_idx, :2]).all():
                     ax.scatter(observations[t_idx, 0], observations[t_idx, 1],
@@ -784,7 +944,7 @@ def _plot_last_three_steps_lowdim_generic(
                     ax.scatter(ens_t[:, 0], torch.zeros_like(ens_t[:, 0]), s=8, alpha=0.35, c=ens_color, label='Ensemble')
                     _add_label('Ensemble')
                 if torch.isfinite(true_traj[t_idx, 0]).all():
-                    ax.scatter(true_traj[t_idx, 0], 0.0, marker='*', s=220, c='orange', edgecolors='black', linewidth=0.6, zorder=2, label='True state')
+                    ax.scatter(true_traj[t_idx, 0], 0.0, marker='x', s=140, c='black', linewidth=2.0, zorder=2, label='True state')
                     _add_label('True state')
                 if torch.isfinite(observations[t_idx, 0]).all():
                     ax.scatter(observations[t_idx, 0], 0.0, marker='*', s=120, c='orange', edgecolors='black', linewidth=0.5, label='Obs')
@@ -815,8 +975,8 @@ def _plot_last_three_steps_lowdim_generic(
             elif label == 'Ensemble density':
                 handles.append(mpatches.Patch(facecolor=ens_color, alpha=0.9, edgecolor='none'))
             elif label == 'True state':
-                handles.append(Line2D([0], [0], marker='*', linestyle='None',
-                                      markerfacecolor='orange', markeredgecolor='black', markersize=11))
+                handles.append(Line2D([0], [0], marker='x', linestyle='None',
+                                      color='black', markeredgecolor='black', markersize=10))
             elif label == 'Obs':
                 handles.append(Line2D([0], [0], marker='*', linestyle='None',
                                       markerfacecolor='orange', markeredgecolor='black', markersize=11))
@@ -1754,12 +1914,12 @@ def generate_and_cache_pf_results(
     args,
     H_info,
     check_disk: bool = True,
-    calculate_crps: bool = True,
+    calculate_es1: bool = True,
     save_figure: bool = False,
 ):
     """
     Runs a particle filter, saves results (means, covariances) to a cache file,
-    and computes performance metrics (RMSE, optional CRPS).
+    and computes performance metrics (RMSE, optional ES1).
 
     NEW IN THIS VERSION:
     - Records BOTH prior (forecast) and posterior (analysis) ensemble statistics in the cache:
@@ -1768,18 +1928,18 @@ def generate_and_cache_pf_results(
       (adaptive + fixed ranges, including a fixed-range 3D scatter).
     - For ring datasets ('doubling1d', 'complex2d'), it also saves no-history counterparts.
 
-    If calculate_crps is False, CRPS keys are omitted from the output.
+    If calculate_es1 is False, ES1 keys are omitted from the output.
 
     Args:
         loader (torch.utils.data.DataLoader): DataLoader providing dataset batches (shape: T x B x D).
         args (argparse.Namespace): Script arguments (expects fields used below).
         H_info (tuple): (H_fun, H) observation operator function and matrix; if None, uses mystery_operator.
         check_disk (bool): If True, checks cache file existence and returns NaNs (metrics) if present.
-        calculate_crps (bool): If True, calculates CRPS and RCRPS metrics.
+        calculate_es1 (bool): If True, calculates ES1 and RES1 metrics.
         save_figure (bool): If True, saves prior/posterior figures at selected steps.
 
     Returns:
-        dict: A dictionary containing performance metrics. CRPS-related keys exist only if calculate_crps=True.
+        dict: A dictionary containing performance metrics. ES1-related keys exist only if calculate_es1=True.
     """
 
     # --- Model and Observation Initialization ---
@@ -1813,8 +1973,8 @@ def generate_and_cache_pf_results(
     if check_disk and os.path.exists(cache_filepath):
         print(f"Particle filter results already exist at: {cache_filepath}")
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse']
-        if calculate_crps:
-            metrics_keys.extend(['mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps'])
+        if calculate_es1:
+            metrics_keys.extend(['mean_es1', 'std_es1', 'mean_res1', 'std_res1'])
         return {key: float('nan') for key in metrics_keys}
 
     print(f"Generating particle filter results and saving to: {cache_filepath}")
@@ -1834,9 +1994,9 @@ def generate_and_cache_pf_results(
         'rmse': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
     }
-    if calculate_crps:
-        all_pf_metrics['crps'] = torch.empty(0, device=args.device)
-        all_pf_metrics['rcrps'] = torch.empty(0, device=args.device)
+    if calculate_es1:
+        all_pf_metrics['es1'] = torch.empty(0, device=args.device)
+        all_pf_metrics['res1'] = torch.empty(0, device=args.device)
 
     # --- Distribution summaries to cache ---
     num_quantiles = int(getattr(args, "pf_num_quantiles", 257))
@@ -1891,6 +2051,27 @@ def generate_and_cache_pf_results(
             pca_q = torch.quantile(pca3, quantile_probs, dim=1).permute(1, 2, 0).contiguous()  # [B, k, K]
             pca_quantiles[:, :pca3.shape[-1], :] = pca_q
 
+        pca2 = pcs[:, :, :min(2, D)]
+        pca_range_q01_q99 = torch.full(
+            (B, 2, 2),
+            float("nan"),
+            device=ens32.device,
+            dtype=torch.float32,
+        )
+        pca_range_int = torch.zeros(
+            (B, 2, 2),
+            device=ens32.device,
+            dtype=torch.int32,
+        )
+        if pca2.shape[-1] > 0:
+            pca_range_q = torch.quantile(pca2, range_probs, dim=1).permute(1, 2, 0).contiguous()  # [B, k, 2]
+            k2 = int(pca2.shape[-1])
+            pca_range_q01_q99[:, :k2, :] = pca_range_q
+            pca_low_int = torch.floor(pca_range_q[..., 0]) - range_pad_int
+            pca_high_int = torch.ceil(pca_range_q[..., 1]) + range_pad_int
+            pca_range_int[:, :k2, 0] = pca_low_int.to(torch.int32)
+            pca_range_int[:, :k2, 1] = pca_high_int.to(torch.int32)
+
         return {
             "quantiles": qvals,
             "range_q01_q99": q01_q99,
@@ -1900,6 +2081,8 @@ def generate_and_cache_pf_results(
             "kurtosis_excess": kurtosis_excess,
             "pca_eigvals": eigvals_desc,
             "pca_quantiles": pca_quantiles,
+            "pca_range_q01_q99": pca_range_q01_q99,
+            "pca_range_int": pca_range_int,
         }
 
     # --- Which batch indices to visualize when saving figures ---
@@ -1960,21 +2143,23 @@ def generate_and_cache_pf_results(
             batch_prior_kurt_to_cache, batch_post_kurt_to_cache = [], []
             batch_prior_pca_eigvals_to_cache, batch_post_pca_eigvals_to_cache = [], []
             batch_prior_pca_quantiles_to_cache, batch_post_pca_quantiles_to_cache = [], []
+            batch_prior_pca_range_q01_q99_to_cache, batch_post_pca_range_q01_q99_to_cache = [], []
+            batch_prior_pca_range_int_to_cache, batch_post_pca_range_int_to_cache = [], []
             batch_post_ess_to_cache = []
             batch_post_weight_entropy_to_cache = []
             batch_post_weight_abundance_to_cache = []
 
             batch_rmse_steps = []
-            if calculate_crps:
-                batch_crps_steps = []
+            if calculate_es1:
+                batch_es1_steps = []
 
             # --- Metrics at t=0 (posterior at initialization) ---
             true_state_t0 = batch_v[0]  # (B, D)
             rmse_t0 = torch.sqrt(torch.mean((pf_ens_v_a.mean(dim=1) - true_state_t0) ** 2, dim=1))
             batch_rmse_steps.append(rmse_t0)
-            if calculate_crps:
-                crps_t0 = compute_es(pf_ens_v_a.unsqueeze(0), true_state_t0.unsqueeze(0), norm_p=1)
-                batch_crps_steps.append(crps_t0)
+            if calculate_es1:
+                es1_t0 = compute_es(pf_ens_v_a.unsqueeze(0), true_state_t0.unsqueeze(0), norm_p=1)
+                batch_es1_steps.append(es1_t0)
 
             # --- Generate Observations y_t ---
             obs_y_list = []
@@ -2003,6 +2188,8 @@ def generate_and_cache_pf_results(
                 batch_prior_kurt_to_cache.append(prior_summary["kurtosis_excess"])
                 batch_prior_pca_eigvals_to_cache.append(prior_summary["pca_eigvals"])
                 batch_prior_pca_quantiles_to_cache.append(prior_summary["pca_quantiles"])
+                batch_prior_pca_range_q01_q99_to_cache.append(prior_summary["pca_range_q01_q99"])
+                batch_prior_pca_range_int_to_cache.append(prior_summary["pca_range_int"])
 
                 # Prepare true state for metrics/visualization.
                 true_state_ti1 = batch_v[i + 1]  # (B, D)
@@ -2035,6 +2222,8 @@ def generate_and_cache_pf_results(
                 batch_post_kurt_to_cache.append(post_summary["kurtosis_excess"])
                 batch_post_pca_eigvals_to_cache.append(post_summary["pca_eigvals"])
                 batch_post_pca_quantiles_to_cache.append(post_summary["pca_quantiles"])
+                batch_post_pca_range_q01_q99_to_cache.append(post_summary["pca_range_q01_q99"])
+                batch_post_pca_range_int_to_cache.append(post_summary["pca_range_int"])
                 batch_post_ess_to_cache.append(pf_diag["ess"])
                 batch_post_weight_entropy_to_cache.append(pf_diag["weight_entropy"])
                 batch_post_weight_abundance_to_cache.append(pf_diag["weight_abundance"])
@@ -2042,12 +2231,12 @@ def generate_and_cache_pf_results(
                 # Metrics at t=i+1 using POSTERIOR mean
                 rmse_ti = torch.sqrt(torch.mean((post_mean - true_state_ti1) ** 2, dim=1))
                 batch_rmse_steps.append(rmse_ti)
-                if calculate_crps:
-                    crps_ti = compute_es(pf_ens_v_a.unsqueeze(0), true_state_ti1.unsqueeze(0), norm_p=1)
-                    batch_crps_steps.append(crps_ti)
+                if calculate_es1:
+                    es1_ti = compute_es(pf_ens_v_a.unsqueeze(0), true_state_ti1.unsqueeze(0), norm_p=1)
+                    batch_es1_steps.append(es1_ti)
 
                 # -------- Visualization (PRIOR + POSTERIOR), both include observation --------
-                if i < 600 and save_figure and (can_plot_3d or can_plot_ring):
+                if save_figure and (can_plot_3d or can_plot_ring):
                     save_folder = pf_vis_folder
                     os.makedirs(save_folder, exist_ok=True)
 
@@ -2084,6 +2273,8 @@ def generate_and_cache_pf_results(
                                 legend_in_figure=getattr(args, "legend_in_figure", False),
                                 prior_range_int=prior_summary["range_int"][bidx].detach().cpu(),
                                 post_range_int=post_summary["range_int"][bidx].detach().cpu(),
+                                prior_pca_range_int=prior_summary["pca_range_int"][bidx].detach().cpu(),
+                                post_pca_range_int=post_summary["pca_range_int"][bidx].detach().cpu(),
                                 quantile_probs=quantile_probs.detach().cpu(),
                                 prior_quantiles=prior_summary["quantiles"][bidx].detach().cpu()[:3],
                                 post_quantiles=post_summary["quantiles"][bidx].detach().cpu()[:3],
@@ -2187,6 +2378,7 @@ def generate_and_cache_pf_results(
                         )
 
             # --- Aggregate and Cache Batch Results ---
+            is_ring_dataset = str(getattr(args, "dataset", "")).lower() in {"doubling1d", "complex2d"}
             all_pf_results_to_cache.append({
                 'prior_means': torch.stack(batch_prior_means_to_cache),  # (T-1, B, D)
                 'prior_covs':  torch.stack(batch_prior_covs_to_cache),   # (T-1, B, D, D)
@@ -2209,6 +2401,10 @@ def generate_and_cache_pf_results(
                 'post_pca_eigvals': torch.stack(batch_post_pca_eigvals_to_cache),   # (T-1, B, D)
                 'prior_pca_quantiles': torch.stack(batch_prior_pca_quantiles_to_cache), # (T-1, B, 3, K)
                 'post_pca_quantiles': torch.stack(batch_post_pca_quantiles_to_cache),   # (T-1, B, 3, K)
+                'prior_pca_range_q01_q99': None if is_ring_dataset else torch.stack(batch_prior_pca_range_q01_q99_to_cache), # (T-1, B, 2, 2)
+                'post_pca_range_q01_q99': None if is_ring_dataset else torch.stack(batch_post_pca_range_q01_q99_to_cache),   # (T-1, B, 2, 2)
+                'prior_pca_range_int': None if is_ring_dataset else torch.stack(batch_prior_pca_range_int_to_cache),         # (T-1, B, 2, 2) int32
+                'post_pca_range_int': None if is_ring_dataset else torch.stack(batch_post_pca_range_int_to_cache),           # (T-1, B, 2, 2) int32
                 'post_ess': torch.stack(batch_post_ess_to_cache),                 # (T-1, B)
                 'post_weight_entropy': torch.stack(batch_post_weight_entropy_to_cache), # (T-1, B)
                 'post_weight_abundance': torch.stack(batch_post_weight_abundance_to_cache), # (T-1, B)
@@ -2219,11 +2415,11 @@ def generate_and_cache_pf_results(
             rms_val  = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0) # (B,)
             all_pf_metrics['rmse']  = torch.cat((all_pf_metrics['rmse'],  rmse_val))
             all_pf_metrics['rrmse'] = torch.cat((all_pf_metrics['rrmse'], rmse_val / rms_val))
-            if calculate_crps:
-                crps_val  = torch.mean(torch.stack(batch_crps_steps), dim=0)            # (B,)
-                rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
-                all_pf_metrics['crps']  = torch.cat((all_pf_metrics['crps'],  crps_val))
-                all_pf_metrics['rcrps'] = torch.cat((all_pf_metrics['rcrps'], rcrps_val))
+            if calculate_es1:
+                es1_val  = torch.mean(torch.stack(batch_es1_steps), dim=0)            # (B,)
+                res1_val = es1_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+                all_pf_metrics['es1']  = torch.cat((all_pf_metrics['es1'],  es1_val))
+                all_pf_metrics['res1'] = torch.cat((all_pf_metrics['res1'], res1_val))
 
             print("update results")
             batch_start_index += batch_v.shape[1]
@@ -2325,14 +2521,14 @@ def generate_and_cache_pf_results(
         'std_rmse':   std_rmse,
     }
 
-    if calculate_crps:
-        mean_crps,  std_crps  = get_mean_std(all_pf_metrics['crps'][valid_B_mask])
-        mean_rcrps, std_rcrps = get_mean_std(all_pf_metrics['rcrps'][valid_B_mask])
+    if calculate_es1:
+        mean_es1,  std_es1  = get_mean_std(all_pf_metrics['es1'][valid_B_mask])
+        mean_res1, std_res1 = get_mean_std(all_pf_metrics['res1'][valid_B_mask])
         final_metrics.update({
-            'mean_crps':  mean_crps,
-            'std_crps':   std_crps,
-            'mean_rcrps': mean_rcrps,
-            'std_rcrps':  std_rcrps,
+            'mean_es1':  mean_es1,
+            'std_es1':   std_es1,
+            'mean_res1': mean_res1,
+            'std_res1':  std_res1,
         })
 
     final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_pf_metrics['rrmse'].numel() * 100.0
@@ -2378,30 +2574,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     # Optional PF cache
     cached_pf_data = None
     if args.pf_verification:
-        first_batch_for_shape = next(iter(loader))
-        traj_len = first_batch_for_shape.shape[0]
-        batch_size = first_batch_for_shape.shape[1]
-        
-        cache_dir = _build_pf_cache_dir(args)
-        cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
-        cache_filepath = os.path.join(cache_dir, cache_filename)
-
-        if os.path.exists(cache_filepath):
-            print(f"Loading cached PF results from: {cache_filepath}")
-            cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
-        else:
-            legacy_cache_dir = os.path.join('data', args.dataset)
-            legacy_cache_filepath = os.path.join(legacy_cache_dir, cache_filename)
-            if os.path.exists(legacy_cache_filepath):
-                print(f"[PF cache fallback] Loading legacy cache from: {legacy_cache_filepath}")
-                cached_pf_data = torch.load(legacy_cache_filepath, map_location=args.device, weights_only=True)
-            else:
-                raise FileNotFoundError(
-                    f"Required particle filter cache file not found at: {cache_filepath} "
-                    f"(legacy checked: {legacy_cache_filepath}). "
-                    f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
-                    f"Please run generate_and_cache_pf_results() first."
-                )
+        cached_pf_data = _load_cached_pf_avg_results(loader=loader, args=args)
 
     # Aggregated results
     all_results = {
@@ -2409,8 +2582,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         'rrmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
         'spread_error_ratio': torch.empty(0, device=args.device),
-        'crps': torch.empty(0, device=args.device),
-        'rcrps': torch.empty(0, device=args.device),
+        'es1': torch.empty(0, device=args.device),
+        'res1': torch.empty(0, device=args.device),
+        'pf_crps': torch.empty(0, device=args.device),
+        'pf_rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
@@ -2630,13 +2805,27 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
             
             # Metrics (NaNs are handled later by masks)
-            crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
-            rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
+            res1_val = es1_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            if args.pf_verification:
+                pf_crps_val = _compute_dynamic_quantile_crps_from_pf_post(
+                    ens_tensor=ens_tensor,
+                    pf_entry=cached_pf_data[batch_ind],
+                    max_state_dims=3,
+                    max_pca_dims=3,
+                )
+                pf_rcrps_val = pf_crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            else:
+                pf_crps_val = torch.full((B,), float('nan'), device=args.device)
+                pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+            spread_error_ratio_val = torch.nanmean(
+                torch.abs(compute_spread_error_ratio(ens_tensor, batch_v) - 1.0),
+                dim=0,
+            )
 
             rank_stats_batch = compute_ensemble_rank_histogram(
                 ens_states=ens_tensor,
@@ -2654,8 +2843,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
-            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
-            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['es1'] = torch.cat((all_results['es1'], es1_val))
+            all_results['res1'] = torch.cat((all_results['res1'], res1_val))
+            all_results['pf_crps'] = torch.cat((all_results['pf_crps'], pf_crps_val))
+            all_results['pf_rcrps'] = torch.cat((all_results['pf_rcrps'], pf_rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
                 # Use nanmean over time for PF-based metrics
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).nanmean(0)))
@@ -2833,9 +3024,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         metrics_keys = ['mean_rmse', 'std_rmse',
                         'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
                         'mean_spread_error_ratio', 'std_spread_error_ratio',
-                        'mean_crps', 'std_crps',
-                        'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
-                        'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                        'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
+                        'mean_pf_crps', 'std_pf_crps',
+                        'mean_pf_rcrps', 'std_pf_rcrps', 'mean_pf_cov_diff', 'std_pf_cov_diff',
+                        'mean_pf_rcov_diff', 'std_pf_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
                         'mean_pf_rrmse', 'std_pf_rrmse']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
@@ -2847,9 +3039,10 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             metrics_keys = ['mean_rmse', 'std_rmse',
                             'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
                             'mean_spread_error_ratio', 'std_spread_error_ratio',
-                            'mean_crps', 'std_crps',
-                            'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
-                            'mean_rcov_diff', 'std_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
+                            'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
+                            'mean_pf_crps', 'std_pf_crps',
+                            'mean_pf_rcrps', 'std_pf_rcrps', 'mean_pf_cov_diff', 'std_pf_cov_diff',
+                            'mean_pf_rcov_diff', 'std_pf_rcov_diff', 'mean_pf_rmse', 'std_pf_rmse',
                             'mean_pf_rrmse', 'std_pf_rrmse']
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
@@ -2860,12 +3053,14 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
                 all_results['spread_error_ratio'][valid_B_mask]
             )
-            final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
-            final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+            final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
+            final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
+            final_metrics['mean_pf_crps'], final_metrics['std_pf_crps'] = get_mean_std(all_results['pf_crps'][valid_B_mask])
+            final_metrics['mean_pf_rcrps'], final_metrics['std_pf_rcrps'] = get_mean_std(all_results['pf_rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
             if args.pf_verification:
-                final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
-                final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
+                final_metrics['mean_pf_cov_diff'], final_metrics['std_pf_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
+                final_metrics['mean_pf_rcov_diff'], final_metrics['std_pf_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
@@ -2941,16 +3136,20 @@ def print_test_results(results):
         print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
     if 'mean_spread_error_ratio' in results and 'std_spread_error_ratio' in results:
         print(f"Spread-Error Ratio: {results['mean_spread_error_ratio']:.3f} ± {results['std_spread_error_ratio']:.3f}")
-    if 'mean_crps' in results and 'std_crps' in results:
-        print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
-    if 'mean_rcrps' in results and 'std_rcrps' in results:
-        print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
+    if 'mean_es1' in results and 'std_es1' in results:
+        print(f"ES1: {results['mean_es1']:.3f} ± {results['std_es1']:.3f}")
+    if 'mean_res1' in results and 'std_res1' in results:
+        print(f"RES1: {results['mean_res1']:.3f} ± {results['std_res1']:.3f}")
+    if 'mean_pf_crps' in results and 'std_pf_crps' in results:
+        print(f"PF-CRPS: {results['mean_pf_crps']:.3f} ± {results['std_pf_crps']:.3f}")
+    if 'mean_pf_rcrps' in results and 'std_pf_rcrps' in results:
+        print(f"PF-RCRPS: {results['mean_pf_rcrps']:.3f} ± {results['std_pf_rcrps']:.3f}")
 
     # Optional PF verification metrics
-    if 'mean_cov_diff' in results and 'std_cov_diff' in results:
-        print(f"Cov-Diff: {results['mean_cov_diff']:.3f} ± {results['std_cov_diff']:.3f}")
-    if 'mean_rcov_diff' in results and 'std_rcov_diff' in results:
-        print(f"RCov-Diff: {results['mean_rcov_diff']:.3f} ± {results['std_rcov_diff']:.3f}")
+    if 'mean_pf_cov_diff' in results and 'std_pf_cov_diff' in results:
+        print(f"PF-Cov-Diff: {results['mean_pf_cov_diff']:.3f} ± {results['std_pf_cov_diff']:.3f}")
+    if 'mean_pf_rcov_diff' in results and 'std_pf_rcov_diff' in results:
+        print(f"PF-RCov-Diff: {results['mean_pf_rcov_diff']:.3f} ± {results['std_pf_rcov_diff']:.3f}")
     if 'mean_pf_rmse' in results and 'std_pf_rmse' in results:
         print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
     if 'mean_pf_rrmse' in results and 'std_pf_rrmse' in results:
@@ -3092,30 +3291,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     # Optional PF cache
     cached_pf_data = None
     if args.pf_verification:
-        first_batch_for_shape = next(iter(loader))
-        traj_len = first_batch_for_shape.shape[0]
-        batch_size = first_batch_for_shape.shape[1]
-
-        cache_dir = _build_pf_cache_dir(args)
-        cache_filename = _build_pf_cache_filename(args, batch_size=batch_size, traj_len=traj_len, avg=True)
-        cache_filepath = os.path.join(cache_dir, cache_filename)
-
-        if os.path.exists(cache_filepath):
-            print(f"Loading cached PF results from: {cache_filepath}")
-            cached_pf_data = torch.load(cache_filepath, map_location=args.device, weights_only=True)
-        else:
-            legacy_cache_dir = os.path.join('data', args.dataset)
-            legacy_cache_filepath = os.path.join(legacy_cache_dir, cache_filename)
-            if os.path.exists(legacy_cache_filepath):
-                print(f"[PF cache fallback] Loading legacy cache from: {legacy_cache_filepath}")
-                cached_pf_data = torch.load(legacy_cache_filepath, map_location=args.device, weights_only=True)
-            else:
-                raise FileNotFoundError(
-                    f"Required particle filter cache file not found at: {cache_filepath} "
-                    f"(legacy checked: {legacy_cache_filepath}). "
-                    f"(obs_fn={_resolve_obs_fn_for_pf_paths(args)}, default_obs_fn={_get_dataset_default_obs_fn(args.dataset)}) "
-                    f"Please run generate_and_cache_pf_results() first."
-                )
+        cached_pf_data = _load_cached_pf_avg_results(loader=loader, args=args)
 
     # Aggregated results
     all_results = {
@@ -3123,8 +3299,10 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         'rrmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
         'spread_error_ratio': torch.empty(0, device=args.device),
-        'crps': torch.empty(0, device=args.device),
-        'rcrps': torch.empty(0, device=args.device),
+        'es1': torch.empty(0, device=args.device),
+        'res1': torch.empty(0, device=args.device),
+        'pf_crps': torch.empty(0, device=args.device),
+        'pf_rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
@@ -3138,7 +3316,16 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     plot_mode, requested_global_indices = _normalize_global_plot_indices(args)
     unresolved_global_indices = set(requested_global_indices)
     batch_start_index = 0
-    plot_prior_enabled = bool(plot_figures and args.dataset in {"lorenz63", "doubling1d", "complex2d"})
+    pf_style_projection_enabled = bool(
+        args.pf_verification
+        and str(getattr(args, "dataset", "")).lower() not in {"doubling1d", "complex2d"}
+        and int(getattr(args, "ori_dim", 0)) >= 3
+    )
+    plot_prior_enabled = bool(
+        plot_figures and (
+            args.dataset in {"lorenz63", "doubling1d", "complex2d"} or pf_style_projection_enabled
+        )
+    )
     rank_num_projections = max(1, int(getattr(args, "rank_num_projections", 8)))
     rank_seed_default = _safe_int_seed(getattr(args, "seed", None), default=0)
     rank_projection_seed = _safe_int_seed(
@@ -3354,13 +3541,27 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             ens_tensor = torch.stack(ens_list)
             ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
 
-            crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
-            rcrps_val = crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
+            res1_val = es1_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            if args.pf_verification:
+                pf_crps_val = _compute_dynamic_quantile_crps_from_pf_post(
+                    ens_tensor=ens_tensor,
+                    pf_entry=cached_pf_data[batch_ind],
+                    max_state_dims=3,
+                    max_pca_dims=3,
+                )
+                pf_rcrps_val = pf_crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
+            else:
+                pf_crps_val = torch.full((B,), float('nan'), device=args.device)
+                pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+            spread_error_ratio_val = torch.nanmean(
+                torch.abs(compute_spread_error_ratio(ens_tensor, batch_v) - 1.0),
+                dim=0,
+            )
 
             rank_stats_batch = compute_ensemble_rank_histogram(
                 ens_states=ens_tensor,
@@ -3377,8 +3578,10 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
-            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
-            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['es1'] = torch.cat((all_results['es1'], es1_val))
+            all_results['res1'] = torch.cat((all_results['res1'], res1_val))
+            all_results['pf_crps'] = torch.cat((all_results['pf_crps'], pf_crps_val))
+            all_results['pf_rcrps'] = torch.cat((all_results['pf_rcrps'], pf_rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
                 all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], torch.stack(rcov_diff_list).mean(0)))
@@ -3397,99 +3600,132 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     unresolved_global_indices.discard(batch_start_index + lidx)
 
                 if len(local_plot_indices) > 0:
-                    ens_plot = ens_tensor
-                    true_plot = batch_v
-                    compare_plot = batch_v
-                    obs_plot = observations
-
-                    if args.pf_verification:
-                        pf_post_means = _get_pf_cached_post_means(cached_pf_data[batch_ind])
-                        if pf_post_means is None:
-                            raise KeyError("PF cache entry missing post means.")
-                        true_plot = true_plot[1:]
-                        compare_plot = pf_post_means
-                        ens_plot = ens_plot[1:]
-                        obs_plot = obs_plot[1:]
-                        step_offset = 1
-                    else:
-                        step_offset = 0
-
-                    _plot_test_visualizations(
-                        args=args,
-                        ens_tensor=ens_plot,
-                        true_tensor=true_plot,
-                        comparison_tensor=compare_plot,
-                        observations=obs_plot,
-                        fig_name=fig_name + "_classic",
-                        save_pdf=save_pdf,
-                        step_offset=step_offset,
-                        plot_batch_indices=local_plot_indices,
-                        batch_start_index=batch_start_index,
-                        global_index_naming=True,
-                        ens_color='tab:red',
-                        ring_plot_history=False,
-                    )
-                    if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
-                        _plot_test_visualizations(
+                    if pf_style_projection_enabled:
+                        _plot_pf_style_projections_from_cache(
                             args=args,
-                            ens_tensor=ens_prior_tensor[1:],
-                            true_tensor=batch_v[1:],
-                            comparison_tensor=batch_v[1:],
-                            observations=observations[1:],
-                            fig_name=fig_name + "_classic_prior",
-                            save_pdf=save_pdf,
-                            step_offset=1,
+                            ens_post_tensor=ens_tensor,
+                            ens_prior_tensor=ens_prior_tensor,
+                            true_tensor=batch_v,
+                            pf_entry=cached_pf_data[batch_ind],
+                            fig_name=fig_name + "_classic",
                             plot_batch_indices=local_plot_indices,
                             batch_start_index=batch_start_index,
                             global_index_naming=True,
-                            ens_color='tab:blue',
+                        )
+                    else:
+                        ens_plot = ens_tensor
+                        true_plot = batch_v
+                        compare_plot = batch_v
+                        obs_plot = observations
+
+                        if args.pf_verification:
+                            pf_post_means = _get_pf_cached_post_means(cached_pf_data[batch_ind])
+                            if pf_post_means is None:
+                                raise KeyError("PF cache entry missing post means.")
+                            true_plot = true_plot[1:]
+                            compare_plot = pf_post_means
+                            ens_plot = ens_plot[1:]
+                            obs_plot = obs_plot[1:]
+                            step_offset = 1
+                        else:
+                            step_offset = 0
+
+                        _plot_test_visualizations(
+                            args=args,
+                            ens_tensor=ens_plot,
+                            true_tensor=true_plot,
+                            comparison_tensor=compare_plot,
+                            observations=obs_plot,
+                            fig_name=fig_name + "_classic",
+                            save_pdf=save_pdf,
+                            step_offset=step_offset,
+                            plot_batch_indices=local_plot_indices,
+                            batch_start_index=batch_start_index,
+                            global_index_naming=True,
+                            ens_color='tab:red',
                             ring_plot_history=False,
                         )
+                        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                            _plot_test_visualizations(
+                                args=args,
+                                ens_tensor=ens_prior_tensor[1:],
+                                true_tensor=batch_v[1:],
+                                comparison_tensor=batch_v[1:],
+                                observations=observations[1:],
+                                fig_name=fig_name + "_classic_prior",
+                                save_pdf=save_pdf,
+                                step_offset=1,
+                                plot_batch_indices=local_plot_indices,
+                                batch_start_index=batch_start_index,
+                                global_index_naming=True,
+                                ens_color='tab:blue',
+                                ring_plot_history=False,
+                            )
             batch_start_index += B
 
     if plot_figures and plot_mode == "adaptive":
-        ens_plot = ens_tensor
-        true_plot = batch_v
-        compare_plot = batch_v
-        obs_plot = observations
-
-        if args.pf_verification:
-            pf_post_means = _get_pf_cached_post_means(cached_pf_data[-1])
-            if pf_post_means is None:
-                raise KeyError("PF cache entry missing post means.")
-            true_plot = true_plot[1:]
-            compare_plot = pf_post_means
-            ens_plot = ens_plot[1:]
-            obs_plot = obs_plot[1:]
-            step_offset = 1
+        if pf_style_projection_enabled:
+            nan_per_step = torch.isnan(ens_tensor).any(dim=(2, 3))
+            nan_counts = nan_per_step.sum(dim=0)
+            adaptive_indices = _resolve_plot_batch_indices(
+                args=args,
+                batch_size=ens_tensor.shape[1],
+                nan_counts=nan_counts,
+            )
+            _plot_pf_style_projections_from_cache(
+                args=args,
+                ens_post_tensor=ens_tensor,
+                ens_prior_tensor=ens_prior_tensor,
+                true_tensor=batch_v,
+                pf_entry=cached_pf_data[-1],
+                fig_name=fig_name + "_classic",
+                plot_batch_indices=adaptive_indices,
+                batch_start_index=0,
+                global_index_naming=False,
+            )
         else:
-            step_offset = 0
+            ens_plot = ens_tensor
+            true_plot = batch_v
+            compare_plot = batch_v
+            obs_plot = observations
 
-        _plot_test_visualizations(
-            args=args,
-            ens_tensor=ens_plot,
-            true_tensor=true_plot,
-            comparison_tensor=compare_plot,
-            observations=obs_plot,
-            fig_name=fig_name + "_classic",
-            save_pdf=save_pdf,
-            step_offset=step_offset,
-            ens_color='tab:red',
-            ring_plot_history=False,
-        )
-        if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+            if args.pf_verification:
+                pf_post_means = _get_pf_cached_post_means(cached_pf_data[-1])
+                if pf_post_means is None:
+                    raise KeyError("PF cache entry missing post means.")
+                true_plot = true_plot[1:]
+                compare_plot = pf_post_means
+                ens_plot = ens_plot[1:]
+                obs_plot = obs_plot[1:]
+                step_offset = 1
+            else:
+                step_offset = 0
+
             _plot_test_visualizations(
                 args=args,
-                ens_tensor=ens_prior_tensor[1:],
-                true_tensor=batch_v[1:],
-                comparison_tensor=batch_v[1:],
-                observations=observations[1:],
-                fig_name=fig_name + "_classic_prior",
+                ens_tensor=ens_plot,
+                true_tensor=true_plot,
+                comparison_tensor=compare_plot,
+                observations=obs_plot,
+                fig_name=fig_name + "_classic",
                 save_pdf=save_pdf,
-                step_offset=1,
-                ens_color='tab:blue',
+                step_offset=step_offset,
+                ens_color='tab:red',
                 ring_plot_history=False,
             )
+            if plot_prior_enabled and ens_prior_tensor is not None and ens_prior_tensor.shape[0] > 1:
+                _plot_test_visualizations(
+                    args=args,
+                    ens_tensor=ens_prior_tensor[1:],
+                    true_tensor=batch_v[1:],
+                    comparison_tensor=batch_v[1:],
+                    observations=observations[1:],
+                    fig_name=fig_name + "_classic_prior",
+                    save_pdf=save_pdf,
+                    step_offset=1,
+                    ens_color='tab:blue',
+                    ring_plot_history=False,
+                )
     elif plot_figures and len(unresolved_global_indices) > 0:
         unresolved_sorted = sorted(list(unresolved_global_indices))
         print(
@@ -3501,8 +3737,9 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
                         'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
-                        'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
-                        'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
+                        'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
+                        'mean_pf_crps', 'std_pf_crps', 'mean_pf_rcrps', 'std_pf_rcrps',
+                        'mean_pf_cov_diff', 'std_pf_cov_diff', 'mean_pf_rcov_diff', 'std_pf_rcov_diff',
                         'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
@@ -3513,8 +3750,9 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         if not valid_B_mask.any():
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
                             'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
-                            'mean_crps', 'std_crps', 'mean_rcrps', 'std_rcrps',
-                            'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
+                            'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
+                            'mean_pf_crps', 'std_pf_crps', 'mean_pf_rcrps', 'std_pf_rcrps',
+                            'mean_pf_cov_diff', 'std_pf_cov_diff', 'mean_pf_rcov_diff', 'std_pf_rcov_diff',
                             'mean_pf_rmse', 'std_pf_rmse', 'mean_pf_rrmse', 'std_pf_rrmse']
             final_metrics = {key: float('nan') for key in metrics_keys}
             final_metrics['no_nan_percent'] = 0.0
@@ -3525,12 +3763,14 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
                 all_results['spread_error_ratio'][valid_B_mask]
             )
-            final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
-            final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+            final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
+            final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
+            final_metrics['mean_pf_crps'], final_metrics['std_pf_crps'] = get_mean_std(all_results['pf_crps'][valid_B_mask])
+            final_metrics['mean_pf_rcrps'], final_metrics['std_pf_rcrps'] = get_mean_std(all_results['pf_rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
             if args.pf_verification:
-                final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
-                final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
+                final_metrics['mean_pf_cov_diff'], final_metrics['std_pf_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
+                final_metrics['mean_pf_rcov_diff'], final_metrics['std_pf_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
 
@@ -3813,8 +4053,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         'rmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device), # Using RMV for spread
         'rrmse': torch.empty(0, device=args.device),
-        'crps': torch.empty(0, device=args.device),
-        'rcrps': torch.empty(0, device=args.device),
+        'es1': torch.empty(0, device=args.device),
+        'res1': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
@@ -3941,8 +4181,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             rms_val = torch.sqrt(torch.mean(gt_tensor ** 2, dim=-1)).mean(dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.sqrt(torch.mean((ens_tensor - gt_tensor.unsqueeze(2))**2, dim=(2,-1))).mean(dim=0)
-            crps_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=gt_tensor, norm_p=1), dim=0) 
-            rcrps_val = crps_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
+            es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=gt_tensor, norm_p=1), dim=0)
+            res1_val = es1_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
             
             cov_diff_tensor = torch.stack(cov_diff_list, dim=0)
             rcov_diff_tensor = torch.stack(rcov_diff_list, dim=0)
@@ -3955,8 +4195,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
-            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
-            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['es1'] = torch.cat((all_results['es1'], es1_val))
+            all_results['res1'] = torch.cat((all_results['res1'], res1_val))
             all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
             all_results['cov_diff'] = torch.cat((all_results['cov_diff'], cov_diff_val))
             all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], rcov_diff_val))
@@ -4021,8 +4261,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
     if not valid_B_mask.any():
          # Return NaNs if all results are invalid
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
-                        'mean_rrmse', 'std_rrmse', 'mean_crps', 'std_crps',
-                        'mean_rcrps', 'std_rcrps', 'mean_cov_diff', 'std_cov_diff',
+                        'mean_rrmse', 'std_rrmse', 'mean_es1', 'std_es1',
+                        'mean_res1', 'std_res1', 'mean_cov_diff', 'std_cov_diff',
                         'mean_rcov_diff', 'std_rcov_diff', 'mean_w2_diff', 'std_w2_diff',
                         'min_m_norm', 'max_m_norm']
         final_metrics = {key: float('nan') for key in metrics_keys}
@@ -4032,8 +4272,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
         final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
         final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
-        final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
-        final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+        final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
+        final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
         final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
         final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
         final_metrics['mean_w2_diff'], final_metrics['std_w2_diff'] = get_mean_std(all_results['w2_diff'][valid_B_mask])
@@ -4071,11 +4311,11 @@ def print_test_results_v2(results):
     if 'mean_rmv' in results and 'std_rmv' in results:
         print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
         
-    if 'mean_crps' in results and 'std_crps' in results:
-        print(f"CRPS: {results['mean_crps']:.3f} ± {results['std_crps']:.3f}")
+    if 'mean_es1' in results and 'std_es1' in results:
+        print(f"ES1: {results['mean_es1']:.3f} ± {results['std_es1']:.3f}")
         
-    if 'mean_rcrps' in results and 'std_rcrps' in results:
-        print(f"RCRPS: {results['mean_rcrps']:.3f} ± {results['std_rcrps']:.3f}")
+    if 'mean_res1' in results and 'std_res1' in results:
+        print(f"RES1: {results['mean_res1']:.3f} ± {results['std_res1']:.3f}")
         
     if 'mean_w2_diff' in results and 'std_w2_diff' in results:
         print(f"W2: {results['mean_w2_diff']:.3f} ± {results['std_w2_diff']:.3f}")
@@ -4097,7 +4337,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
 
     This function runs a Kalman Filter to get the true posterior mean and
     covariance. At each step, it repeatedly samples from this true posterior
-    to measure the statistical error (RMSE, CRPS, W2) introduced by a
+    to measure the statistical error (RMSE, ES1, W2) introduced by a
     finite ensemble size N.
 
     Args:
@@ -4122,8 +4362,8 @@ def test_linear_sampling_error(loader, args, num_resamples):
         'rmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
         'rrmse': torch.empty(0, device=args.device),
-        'crps': torch.empty(0, device=args.device),
-        'rcrps': torch.empty(0, device=args.device),
+        'es1': torch.empty(0, device=args.device),
+        'res1': torch.empty(0, device=args.device),
         'w2_diff': torch.empty(0, device=args.device),
     }
 
@@ -4144,7 +4384,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
             
             # --- Lists to Store Trajectory-Averaged Data ---
             gt_list = [gt_v_a.squeeze(1)]
-            rmse_list, rmv_list, crps_list, w2_diff_list = [], [], [], []
+            rmse_list, rmv_list, es1_list, w2_diff_list = [], [], [], []
 
             # --- Main Assimilation Loop ---
             for i in range(args.test_steps - 1):
@@ -4167,7 +4407,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
                 gt_v_a = (gt_v_f.transpose(-1,-2) + K @ (obs_y - H_fun(gt_v_f, H)).transpose(-1,-2)).transpose(-1,-2)
 
                 # --- Resampling and Metric Calculation Loop ---
-                step_rmses, step_rmvs, step_crpses, step_w2s = [], [], [], []
+                step_rmses, step_rmvs, step_es1s, step_w2s = [], [], [], []
                 L_a = torch.linalg.cholesky(P_a)
                 
                 for _ in range(num_resamples):
@@ -4184,8 +4424,8 @@ def test_linear_sampling_error(loader, args, num_resamples):
                     rmv = torch.sqrt(torch.mean((ens_v_a - gt_v_a)**2, dim=(1,-1)))
                     step_rmvs.append(rmv)
                     
-                    crps = compute_es(ens_v_a.unsqueeze(0), gt_v_a.squeeze(1).unsqueeze(0)).squeeze(0)
-                    step_crpses.append(crps)
+                    es1 = compute_es(ens_v_a.unsqueeze(0), gt_v_a.squeeze(1).unsqueeze(0)).squeeze(0)
+                    step_es1s.append(es1)
 
                     w2 = wasserstein2_multivariate_gaussian(
                         mean_true=gt_v_a.squeeze(1), cov_true=P_a, 
@@ -4196,7 +4436,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
                 # --- Average metrics over the resamples for this time step ---
                 rmse_list.append(torch.stack(step_rmses).mean(dim=0))
                 rmv_list.append(torch.stack(step_rmvs).mean(dim=0))
-                crps_list.append(torch.stack(step_crpses).mean(dim=0))
+                es1_list.append(torch.stack(step_es1s).mean(dim=0))
                 w2_diff_list.append(torch.stack(step_w2s).mean(dim=0))
                 
                 gt_list.append(gt_v_a.squeeze(1))
@@ -4206,19 +4446,19 @@ def test_linear_sampling_error(loader, args, num_resamples):
             
             rmse_val = torch.stack(rmse_list).mean(dim=0)
             rmv_val = torch.stack(rmv_list).mean(dim=0)
-            crps_val = torch.stack(crps_list).mean(dim=0)
+            es1_val = torch.stack(es1_list).mean(dim=0)
             w2_diff_val = torch.stack(w2_diff_list).mean(dim=0)
 
             rms_val = torch.sqrt(torch.mean(gt_tensor ** 2, dim=-1)).mean(dim=0)
             rrmse_val = rmse_val / rms_val
-            rcrps_val = crps_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
+            res1_val = es1_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
 
             # --- Aggregate Results ---
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
-            all_results['crps'] = torch.cat((all_results['crps'], crps_val))
-            all_results['rcrps'] = torch.cat((all_results['rcrps'], rcrps_val))
+            all_results['es1'] = torch.cat((all_results['es1'], es1_val))
+            all_results['res1'] = torch.cat((all_results['res1'], res1_val))
             all_results['w2_diff'] = torch.cat((all_results['w2_diff'], w2_diff_val))
 
     # --- Final Metrics Calculation ---
@@ -4228,16 +4468,16 @@ def test_linear_sampling_error(loader, args, num_resamples):
     
     if not valid_B_mask.any():
         metrics_keys = ['mean_rrmse', 'std_rrmse', 'mean_rmse', 'std_rmse', 
-                        'mean_rmv', 'std_rmv', 'mean_crps', 'std_crps', 
-                        'mean_rcrps', 'std_rcrps', 'mean_w2_diff', 'std_w2_diff']
+                        'mean_rmv', 'std_rmv', 'mean_es1', 'std_es1',
+                        'mean_res1', 'std_res1', 'mean_w2_diff', 'std_w2_diff']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
         final_metrics['mean_rrmse'], final_metrics['std_rrmse'] = get_mean_std(all_results['rrmse'][valid_B_mask])
         final_metrics['mean_rmse'], final_metrics['std_rmse'] = get_mean_std(all_results['rmse'][valid_B_mask])
         final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
-        final_metrics['mean_crps'], final_metrics['std_crps'] = get_mean_std(all_results['crps'][valid_B_mask])
-        final_metrics['mean_rcrps'], final_metrics['std_rcrps'] = get_mean_std(all_results['rcrps'][valid_B_mask])
+        final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
+        final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
         final_metrics['mean_w2_diff'], final_metrics['std_w2_diff'] = get_mean_std(all_results['w2_diff'][valid_B_mask])
         final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
 

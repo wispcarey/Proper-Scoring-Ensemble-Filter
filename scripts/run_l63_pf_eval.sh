@@ -13,9 +13,9 @@ experiments=(
     # "CorrTerms save/lorenz63_EtE_LRes/2026-01-14_18-04lorenz63_0.7_10_60_8192_es_joint_CorrTerms/cp_1000.pth 0.7"
     # "CorrTerms save/lorenz63_EtE_LRes/2026-01-14_01-06lorenz63_1.0_10_60_8192_es_joint_CorrTerms/cp_1000.pth 1.0"
     "EtE-LRes save/lorenz63_obs_fn_square/2026-02-22_20-23lorenz63_16.97_10_60_8192_es_joint_EtE-LResNone_square/cp_1000.pth adaptive square"
-    "EtE-LRes save/lorenz63_obs_fn_square/2026-02-22_20-23lorenz63_16.97_10_60_8192_nl2_joint_EtE-LResNone_square/cp_1000.pth adaptive square"
-    "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_es_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
-    "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_nl2_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
+    # "EtE-LRes save/lorenz63_obs_fn_square/2026-02-22_20-23lorenz63_16.97_10_60_8192_nl2_joint_EtE-LResNone_square/cp_1000.pth adaptive square"
+    # "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_es_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
+    # "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_nl2_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
 
 )
 

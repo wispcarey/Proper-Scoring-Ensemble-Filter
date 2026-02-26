@@ -448,6 +448,8 @@ def get_parameters(extra_arg_adder=None):
                         help='Upper quantile used for PF range summary')
     parser.add_argument('--pf_range_pad_int', type=int, default=5,
                         help='Integer padding added to floor/ceil PF quantile ranges')
+    parser.add_argument('--pf_contour_grid_bins', type=int, default=200,
+                        help='Grid bins per axis for PF 2D contour density plots')
 
     parser.add_argument('--save_test_figures', action='store_true',
                         help='save visualization figures during test/evaluation')

@@ -34,6 +34,8 @@ AVERAGE_KEYS = {
     "post_covs",
     "post_quantiles",
     "post_pca_quantiles",
+    "post_pca_range_q01_q99",
+    "post_pca_range_int",
     "post_ess",
     "post_weight_entropy",
     "post_weight_abundance",
@@ -43,6 +45,8 @@ AVERAGE_KEYS = {
     "prior_covs",
     "prior_quantiles",
     "prior_pca_quantiles",
+    "prior_pca_range_q01_q99",
+    "prior_pca_range_int",
     "prior_skewness",
     "prior_kurtosis_excess",
 }

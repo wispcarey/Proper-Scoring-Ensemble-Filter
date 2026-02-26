@@ -33,7 +33,7 @@ dataset="lorenz63"
 sigma_y=2.0
 seed=42
 # methods=("EnKF" "ESRF" "iEnKS-PertObs") 
-methods=("EnKF") 
+methods=("EnKF" "ESRF") 
 
 # --- Evaluation Loop ---
 for N in 5 10 15 20 40 60 100; do

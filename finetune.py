@@ -94,7 +94,7 @@ if __name__ == "__main__":
             
             for key, value in initial_test_results.items():
                 if key != "loc_tensor":
-                    train_records[key] = [value]
+                    train_records.setdefault(key, []).append(value)
             train_records['test_epochs'].append(0)
             
             for epoch in range(1, 1 + args.epochs):
@@ -116,7 +116,7 @@ if __name__ == "__main__":
                     
                     for key, value in epoch_test_results.items():
                         if key != "loc_tensor":
-                            train_records[key] = [value]
+                            train_records.setdefault(key, []).append(value)
                     train_records['test_epochs'].append(epoch)
                     
                     # Save training records and model checkpoint

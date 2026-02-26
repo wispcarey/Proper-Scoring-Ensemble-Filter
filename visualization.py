@@ -14,7 +14,8 @@ from argparse import Namespace
 
 
 PF_3D_SUPPORTED_DATASETS = {"lorenz63", "lorenz96", "ks"}
-PF_MAX_SCATTER_POINTS = 50000
+PF_MAX_SCATTER_POINTS = 1000000
+PF_MAX_CONTOUR_POINTS = 1000000
 PF_FIXED_RANGES_3D = {
     # Typical Lorenz-63 attractor envelope is about x in [-20, 20], y in [-27, 27], z in [0, 48.5].
     # We keep a slightly larger plotting box for robustness.
@@ -1113,13 +1114,13 @@ def _zoom_interval_from_fixed_range(
     num_splits: int = 10,
 ) -> Tuple[float, float]:
     """
-    Zoom-in 1D interval from a fixed range by bin search.
+    Build adaptive 1D interval from current data range.
 
-    Procedure:
-    - Split fixed range into `num_splits` equal bins.
-    - Find the shortest contiguous bin interval covering:
-      * 100% points when n < 500
-      * 99% points when n >= 500
+    Rule:
+    - Let current range be [min(values), max(values)] (after clipping to fixed range).
+    - Expand both sides by `min(0.15 * span, 5)`, where span = max - min.
+    - Integerize all bounds: floor for lower bound, ceil for upper bound.
+    - Keep interval within fixed range.
     """
     lo_fixed = float(fixed_range[0])
     hi_fixed = float(fixed_range[1])
@@ -1129,46 +1130,47 @@ def _zoom_interval_from_fixed_range(
     vals = np.asarray(values, dtype=np.float64)
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
-        return (lo_fixed, hi_fixed)
+        lo_out = float(np.floor(lo_fixed))
+        hi_out = float(np.ceil(hi_fixed))
+        if hi_out <= lo_out:
+            lo_out -= 1.0
+            hi_out += 1.0
+        return (lo_out, hi_out)
 
-    bins = max(2, int(num_splits))
-    edges = np.linspace(lo_fixed, hi_fixed, bins + 1, dtype=np.float64)
-
-    # Keep points inside fixed range so required coverage is always feasible.
+    _ = num_splits
     vals = np.clip(vals, lo_fixed, hi_fixed)
-    hist, _ = np.histogram(vals, bins=edges)
-    if int(np.sum(hist)) <= 0:
-        return (lo_fixed, hi_fixed)
+    cur_lo = float(np.min(vals))
+    cur_hi = float(np.max(vals))
+    if not np.isfinite(cur_lo) or not np.isfinite(cur_hi):
+        lo_out = float(np.floor(lo_fixed))
+        hi_out = float(np.ceil(hi_fixed))
+        if hi_out <= lo_out:
+            lo_out -= 1.0
+            hi_out += 1.0
+        return (lo_out, hi_out)
 
-    n_points = int(vals.size)
-    required = n_points if n_points < 500 else int(np.ceil(0.99 * n_points))
-    required = max(1, min(required, n_points))
+    span = max(cur_hi - cur_lo, 0.0)
+    expand = min(0.15 * span, 5.0)
 
-    prefix = np.concatenate(([0], np.cumsum(hist, dtype=np.int64)))
-    best_width = bins + 1
-    best_i, best_j = 0, bins - 1
-    median_val = float(np.median(vals))
-    best_center_dist = float("inf")
+    lo = cur_lo - expand
+    hi = cur_hi + expand
+    lo = max(lo, lo_fixed)
+    hi = min(hi, hi_fixed)
+    lo = float(np.floor(lo))
+    hi = float(np.ceil(hi))
 
-    for i in range(bins):
-        target = prefix[i] + required
-        j = int(np.searchsorted(prefix, target, side="left") - 1)
-        j = max(i, min(j, bins - 1))
-        count_ij = int(prefix[j + 1] - prefix[i])
-        if count_ij < required:
-            continue
-        width = j - i + 1
-        center = 0.5 * (edges[i] + edges[j + 1])
-        center_dist = abs(center - median_val)
-        if width < best_width or (width == best_width and center_dist < best_center_dist):
-            best_width = width
-            best_i, best_j = i, j
-            best_center_dist = center_dist
-
-    lo = float(edges[best_i])
-    hi = float(edges[best_j + 1])
     if hi <= lo:
-        return (lo_fixed, hi_fixed)
+        center = 0.5 * (cur_lo + cur_hi)
+        lo = float(np.floor(center - 1.0))
+        hi = float(np.ceil(center + 1.0))
+        lo = max(lo, float(np.floor(lo_fixed)))
+        hi = min(hi, float(np.ceil(hi_fixed)))
+        if hi <= lo:
+            lo = float(np.floor(lo_fixed))
+            hi = float(np.ceil(hi_fixed))
+            if hi <= lo:
+                lo -= 1.0
+                hi += 1.0
     return (lo, hi)
 
 
@@ -1368,6 +1370,9 @@ def _plot_pf_projection_2d(
     legend_in_figure: bool = True,
     dataset: Optional[str] = None,
     kde_threshold: int = 200,
+    contour_grid_bins: int = 200,
+    draw_scatter: bool = True,
+    draw_contour: bool = True,
 ) -> None:
     """Plot a single PF distribution in one 2D projection with scatter."""
     xy = points[:, [dim_x, dim_y]]
@@ -1382,16 +1387,27 @@ def _plot_pf_projection_2d(
     scatter_size = float(marker_size)
     scatter_alpha = float(min(0.98, marker_alpha))
 
-    ax.scatter(
-        xy[:, 0], xy[:, 1],
-        s=scatter_size, alpha=scatter_alpha, c=point_color, edgecolors='none', zorder=3,
-        label=point_label,
-    )
+    if draw_contour:
+        _draw_density_contours_2d(
+            ax=ax,
+            points_xy=xy,
+            xlim=xlim,
+            ylim=ylim,
+            point_color=point_color,
+            grid_bins=contour_grid_bins,
+        )
+
+    if draw_scatter:
+        ax.scatter(
+            xy[:, 0], xy[:, 1],
+            s=scatter_size, alpha=scatter_alpha, c=point_color, edgecolors='none', zorder=4,
+            label=point_label,
+        )
 
     if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
         ax.scatter(
             true_xyz[dim_x], true_xyz[dim_y],
-            marker='*', s=120, c='orange', edgecolors='black', linewidths=0.6, zorder=12,
+            marker='x', s=120, c='black', linewidths=2.0, zorder=12,
             label='True state',
         )
 
@@ -1399,6 +1415,101 @@ def _plot_pf_projection_2d(
     ax.set_ylim(ylim)
     if legend_in_figure:
         ax.legend(loc='best', fontsize=8, frameon=True)
+
+
+def _draw_density_contours_2d(
+    ax,
+    points_xy: np.ndarray,
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+    point_color: str,
+    grid_bins: int = 200,
+    alpha_scale: float = 1.0,
+) -> None:
+    """Draw filled density contours from a regular 2D histogram grid."""
+    pts = np.asarray(points_xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 2 or pts.shape[0] < 8:
+        return
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] < 8:
+        return
+
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    y0, y1 = float(ylim[0]), float(ylim[1])
+    if (not np.isfinite(x0)) or (not np.isfinite(x1)) or (not np.isfinite(y0)) or (not np.isfinite(y1)):
+        return
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    bins = int(max(16, grid_bins))
+    try:
+        hist, x_edges, y_edges = np.histogram2d(
+            pts[:, 0],
+            pts[:, 1],
+            bins=[bins, bins],
+            range=[[x0, x1], [y0, y1]],
+            density=True,
+        )
+    except Exception:
+        return
+
+    hist = np.nan_to_num(hist, nan=0.0, posinf=0.0, neginf=0.0)
+    if hist.size == 0 or not np.any(hist > 0):
+        return
+
+    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+    xx, yy = np.meshgrid(x_centers, y_centers, indexing="xy")
+    zz = hist.T
+    # Light smoothing spreads tiny mass outward so outer contours are visible.
+    for _ in range(2):
+        pad = np.pad(zz, ((1, 1), (1, 1)), mode="edge")
+        zz = (
+            pad[:-2, :-2] + pad[:-2, 1:-1] + pad[:-2, 2:] +
+            pad[1:-1, :-2] + pad[1:-1, 1:-1] + pad[1:-1, 2:] +
+            pad[2:, :-2] + pad[2:, 1:-1] + pad[2:, 2:]
+        ) / 9.0
+    positive = zz[zz > 0.0]
+    if positive.size == 0:
+        return
+    z_min = float(np.min(positive))
+    z_max = float(np.max(positive))
+    if (not np.isfinite(z_min)) or (not np.isfinite(z_max)) or z_max <= z_min:
+        return
+    # More contour bands with log-spaced levels to emphasize outer low-density structure.
+    levels = np.geomspace(max(z_min, 1e-12), z_max, 16, dtype=np.float64)
+    levels = np.unique(levels)
+    if levels.size < 2:
+        return
+
+    cmap_name = "Blues" if "blue" in str(point_color).lower() else "Reds"
+    cmap_base = plt.colormaps.get_cmap(cmap_name)
+    # Use darker half of the colormap so contours are visually stronger.
+    cmap_dark = mcolors.LinearSegmentedColormap.from_list(
+        f"{cmap_name}_dark",
+        cmap_base(np.linspace(0.35, 1.0, 256)),
+    )
+    alpha_scale = float(np.clip(alpha_scale, 0.0, 1.0))
+    ax.contourf(
+        xx,
+        yy,
+        zz,
+        levels=levels,
+        cmap=cmap_dark,
+        alpha=0.68 * alpha_scale,
+        zorder=1,
+        antialiased=True,
+    )
+    ax.contour(
+        xx,
+        yy,
+        zz,
+        levels=levels,
+        cmap=cmap_dark,
+        linewidths=0.6,
+        alpha=0.9 * alpha_scale,
+        zorder=2,
+    )
 
 
 def _integer_axis_limits(values: np.ndarray, pad: int = 0) -> Tuple[float, float]:
@@ -1412,6 +1523,58 @@ def _integer_axis_limits(values: np.ndarray, pad: int = 0) -> Tuple[float, float
         lo -= 1.0
         hi += 1.0
     return (lo, hi)
+
+
+def _pca_limits_from_xyz_ranges(
+    xyz_limits: Dict[str, Tuple[float, float]],
+    mean: np.ndarray,
+    basis: np.ndarray,
+    pad: int = 0,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    Convert axis-aligned 3D limits into integer PCA(PC1, PC2) limits.
+
+    For linear PCA projection, extrema over a 3D box are attained at box corners.
+    """
+    if not all(k in xyz_limits for k in ("xlim", "ylim", "zlim")):
+        return ((-1.0, 1.0), (-1.0, 1.0))
+
+    xlim = np.asarray(xyz_limits["xlim"], dtype=np.float64).reshape(-1)
+    ylim = np.asarray(xyz_limits["ylim"], dtype=np.float64).reshape(-1)
+    zlim = np.asarray(xyz_limits["zlim"], dtype=np.float64).reshape(-1)
+    mu = np.asarray(mean, dtype=np.float64).reshape(-1)
+    vec = np.asarray(basis, dtype=np.float64)
+
+    if (
+        xlim.size < 2 or ylim.size < 2 or zlim.size < 2 or
+        mu.size < 3 or vec.ndim != 2 or vec.shape[0] < 3 or vec.shape[1] < 2
+    ):
+        return ((-1.0, 1.0), (-1.0, 1.0))
+
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    y0, y1 = float(ylim[0]), float(ylim[1])
+    z0, z1 = float(zlim[0]), float(zlim[1])
+    if not all(np.isfinite(v) for v in (x0, x1, y0, y1, z0, z1)):
+        return ((-1.0, 1.0), (-1.0, 1.0))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    if z1 < z0:
+        z0, z1 = z1, z0
+
+    corners = np.asarray(
+        [
+            [x0, y0, z0], [x0, y0, z1], [x0, y1, z0], [x0, y1, z1],
+            [x1, y0, z0], [x1, y0, z1], [x1, y1, z0], [x1, y1, z1],
+        ],
+        dtype=np.float64,
+    )
+    proj = _project_pca_2d(corners, mean=mu[:3], basis=vec[:3, :2])
+    return (
+        _integer_axis_limits(proj[:, 0], pad=pad),
+        _integer_axis_limits(proj[:, 1], pad=pad),
+    )
 
 
 def _fit_pca_2d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1513,19 +1676,25 @@ def plot_and_test_point_clouds(
     legend_in_figure: bool = True,
     prior_range_int: Optional[torch.Tensor] = None,
     post_range_int: Optional[torch.Tensor] = None,
+    prior_pca_range_int: Optional[torch.Tensor] = None,
+    post_pca_range_int: Optional[torch.Tensor] = None,
     quantile_probs: Optional[torch.Tensor] = None,
     prior_quantiles: Optional[torch.Tensor] = None,
     post_quantiles: Optional[torch.Tensor] = None,
     prior_pca_quantiles: Optional[torch.Tensor] = None,
     post_pca_quantiles: Optional[torch.Tensor] = None,
+    scatter_size_scale: float = 1.0,
 ):
     """
     PF visualization for non-ring datasets (dim>=3):
-    - For each mode (prior/post): one fixed figure + one adaptive figure.
-    - Each figure contains 4 subplots: XY, YZ, ZX, and PCA(PC1, PC2).
+    - For each mode (prior/post) and range mode (fixed/adaptive), save separate 2D views:
+      12, 23, 13, and PCA12 (no grid).
+    - Save one fixed-range 3D view with fixed camera angle.
+    - Save 6 quantile-density figures: dim1-3 and PCA1-3.
     - Adaptive ranges can be provided from cached PF range statistics.
     """
     dataset = str(getattr(args, "dataset", "")).lower()
+    scatter_size_scale = float(max(0.1, scatter_size_scale))
     if dataset not in PF_3D_SUPPORTED_DATASETS:
         raise ValueError(
             f"PF 3D plotter supports only {sorted(PF_3D_SUPPORTED_DATASETS)}, got dataset='{dataset}'."
@@ -1581,6 +1750,34 @@ def plot_and_test_point_clouds(
         return []
 
     distance_records: List[Dict[str, Any]] = []
+    contour_grid_bins = int(max(16, int(getattr(args, "pf_contour_grid_bins", 200))))
+
+    def _merge_mode_ranges(
+        range_a: Optional[torch.Tensor],
+        range_b: Optional[torch.Tensor],
+        min_axes: int,
+    ) -> Optional[np.ndarray]:
+        ranges = []
+        for r_t in [range_a, range_b]:
+            if r_t is None:
+                continue
+            r_np = torch.as_tensor(r_t).detach().cpu().numpy()
+            if (
+                r_np.ndim == 2
+                and r_np.shape[0] >= min_axes
+                and r_np.shape[1] >= 2
+                and np.isfinite(r_np[:min_axes, :2]).all()
+                and np.all(r_np[:min_axes, 1] > r_np[:min_axes, 0])
+            ):
+                ranges.append(r_np[:min_axes, :2].astype(np.float64))
+        if len(ranges) == 0:
+            return None
+        stacked = np.stack(ranges, axis=0)  # [M, A, 2]
+        lo = np.min(stacked[:, :, 0], axis=0)
+        hi = np.max(stacked[:, :, 1], axis=0)
+        if not np.all(hi > lo):
+            return None
+        return np.stack([lo, hi], axis=1)
 
     fixed_limits = PF_FIXED_RANGES_3D[dataset]
     projection_specs = [
@@ -1598,38 +1795,60 @@ def plot_and_test_point_clouds(
             fixed_limits=fixed_limits,
             num_splits=10,
         )
+        shared_mode_range_3d = _merge_mode_ranges(prior_range_int, post_range_int, min_axes=3)
+        if shared_mode_range_3d is not None:
+            adaptive_limits = {
+                "xlim": (float(shared_mode_range_3d[0, 0]), float(shared_mode_range_3d[0, 1])),
+                "ylim": (float(shared_mode_range_3d[1, 0]), float(shared_mode_range_3d[1, 1])),
+                "zlim": (float(shared_mode_range_3d[2, 0]), float(shared_mode_range_3d[2, 1])),
+            }
 
         prior_for_vis = _sample_points(prior_full, num_samples_plot)
         post_for_vis = _sample_points(post_full, num_samples_plot)
-        prior_vis_ds, prior_downsampled = _prepare_scatter_points(prior_for_vis, max_points=PF_MAX_SCATTER_POINTS)
-        post_vis_ds, post_downsampled = _prepare_scatter_points(post_for_vis, max_points=PF_MAX_SCATTER_POINTS)
-        prior_plot = prior_vis_ds.numpy()
-        post_plot = post_vis_ds.numpy()
+
+        prior_scatter_ds, prior_downsampled = _prepare_scatter_points(
+            prior_for_vis, max_points=PF_MAX_SCATTER_POINTS
+        )
+        post_scatter_ds, post_downsampled = _prepare_scatter_points(
+            post_for_vis, max_points=PF_MAX_SCATTER_POINTS
+        )
+        prior_contour_ds, _ = _prepare_scatter_points(
+            prior_for_vis, max_points=PF_MAX_CONTOUR_POINTS
+        )
+        post_contour_ds, _ = _prepare_scatter_points(
+            post_for_vis, max_points=PF_MAX_CONTOUR_POINTS
+        )
+
+        prior_scatter = prior_scatter_ds.numpy()
+        post_scatter = post_scatter_ds.numpy()
+        prior_contour = prior_contour_ds.numpy()
+        post_contour = post_contour_ds.numpy()
 
         # Shared PCA basis from combined cloud.
         all_full = torch.cat([prior_full, post_full], dim=0).numpy()
         pca_mean, pca_basis = _fit_pca_2d(all_full)
-        prior_plot_pca = _project_pca_2d(prior_plot, pca_mean, pca_basis)
-        post_plot_pca = _project_pca_2d(post_plot, pca_mean, pca_basis)
-        all_full_pca = _project_pca_2d(all_full, pca_mean, pca_basis)
+        prior_scatter_pca = _project_pca_2d(prior_scatter, pca_mean, pca_basis)
+        post_scatter_pca = _project_pca_2d(post_scatter, pca_mean, pca_basis)
+        prior_contour_pca = _project_pca_2d(prior_contour, pca_mean, pca_basis)
+        post_contour_pca = _project_pca_2d(post_contour, pca_mean, pca_basis)
         true_pca = None
         if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
             true_pca = _project_pca_2d(np.asarray(true_xyz[:3], dtype=np.float64).reshape(1, 3), pca_mean, pca_basis)[0]
         prior_marker_size_2d, prior_marker_alpha_2d = _adaptive_scatter_style(
-            n_points=prior_plot.shape[0],
+            n_points=prior_scatter.shape[0],
             is_3d=False,
             downsampled=prior_downsampled,
         )
         post_marker_size_2d, post_marker_alpha_2d = _adaptive_scatter_style(
-            n_points=post_plot.shape[0],
+            n_points=post_scatter.shape[0],
             is_3d=False,
             downsampled=post_downsampled,
         )
         prior_marker_size_3d, prior_marker_alpha_3d = _adaptive_scatter_style(
-            n_points=prior_plot.shape[0], is_3d=True, downsampled=prior_downsampled
+            n_points=prior_scatter.shape[0], is_3d=True, downsampled=prior_downsampled
         )
         post_marker_size_3d, post_marker_alpha_3d = _adaptive_scatter_style(
-            n_points=post_plot.shape[0], is_3d=True, downsampled=post_downsampled
+            n_points=post_scatter.shape[0], is_3d=True, downsampled=post_downsampled
         )
 
         compute_swd = bool(getattr(args, "pf_swd", False))
@@ -1649,75 +1868,90 @@ def plot_and_test_point_clouds(
             swd_ratio_post, swd_data_post, swd_base_post = float("nan"), float("nan"), float("nan")
         prior_ratio_str = f"{swd_ratio_prior:.3f}" if np.isfinite(swd_ratio_prior) else "nan"
         post_ratio_str = f"{swd_ratio_post:.3f}" if np.isfinite(swd_ratio_post) else "nan"
+        prior_size_scale = scatter_size_scale if prior_scatter.shape[0] < 500 else 1.0
+        post_size_scale = scatter_size_scale if post_scatter.shape[0] < 500 else 1.0
         mode_specs = [
             (
                 "prior",
-                prior_plot,
-                prior_plot_pca,
+                prior_scatter,
+                prior_contour,
+                prior_scatter_pca,
+                prior_contour_pca,
                 "blue",
                 "Predictive (prior) distribution",
                 prior_ratio_str,
-                prior_marker_size_2d,
+                prior_marker_size_2d * prior_size_scale,
                 prior_marker_alpha_2d,
-                prior_range_int,
-                prior_marker_size_3d,
+                prior_marker_size_3d * prior_size_scale,
                 prior_marker_alpha_3d,
                 prior_quantiles,
                 prior_pca_quantiles,
             ),
             (
                 "post",
-                post_plot,
-                post_plot_pca,
+                post_scatter,
+                post_contour,
+                post_scatter_pca,
+                post_contour_pca,
                 "red",
                 "Filtering (posterior) distribution",
                 post_ratio_str,
-                post_marker_size_2d,
+                post_marker_size_2d * post_size_scale,
                 post_marker_alpha_2d,
-                post_range_int,
-                post_marker_size_3d,
+                post_marker_size_3d * post_size_scale,
                 post_marker_alpha_3d,
                 post_quantiles,
                 post_pca_quantiles,
             ),
         ]
 
+        shared_mode_pca_range_2d = _merge_mode_ranges(prior_pca_range_int, post_pca_range_int, min_axes=2)
+        shared_adapt_pca_xlim, shared_adapt_pca_ylim = _pca_limits_from_xyz_ranges(
+            xyz_limits=adaptive_limits,
+            mean=pca_mean,
+            basis=pca_basis,
+            pad=0,
+        )
+        if shared_mode_pca_range_2d is not None:
+            shared_adapt_pca_xlim = (
+                float(shared_mode_pca_range_2d[0, 0]),
+                float(shared_mode_pca_range_2d[0, 1]),
+            )
+            shared_adapt_pca_ylim = (
+                float(shared_mode_pca_range_2d[1, 0]),
+                float(shared_mode_pca_range_2d[1, 1]),
+            )
+
         for (
             mode_tag,
-            mode_points,
-            mode_points_pca,
+            mode_points_scatter,
+            mode_points_contour,
+            mode_points_pca_scatter,
+            mode_points_pca_contour,
             mode_color,
             mode_label,
             mode_ratio,
             size_2d,
             alpha_2d,
-            mode_range_int,
             size_3d,
             alpha_3d,
             mode_quantiles,
             mode_pca_quantiles,
         ) in mode_specs:
-            fixed_pca_xlim = _integer_axis_limits(all_full_pca[:, 0], pad=1)
-            fixed_pca_ylim = _integer_axis_limits(all_full_pca[:, 1], pad=1)
+            fixed_xyz = {
+                "xlim": fixed_limits["xlim"],
+                "ylim": fixed_limits["ylim"],
+                "zlim": fixed_limits["zlim"],
+            }
+            fixed_pca_xlim, fixed_pca_ylim = _pca_limits_from_xyz_ranges(
+                xyz_limits=fixed_xyz,
+                mean=pca_mean,
+                basis=pca_basis,
+                pad=0,
+            )
 
             adapt_xyz = adaptive_limits
-            if mode_range_int is not None:
-                r = torch.as_tensor(mode_range_int).detach().cpu().numpy()
-                if r.ndim == 2 and r.shape[0] >= 3 and r.shape[1] >= 2:
-                    adapt_xyz = {
-                        "xlim": (float(r[0, 0]), float(r[0, 1])),
-                        "ylim": (float(r[1, 0]), float(r[1, 1])),
-                        "zlim": (float(r[2, 0]), float(r[2, 1])),
-                    }
-
-            mask_adapt = (
-                (all_full[:, 0] >= adapt_xyz["xlim"][0]) & (all_full[:, 0] <= adapt_xyz["xlim"][1]) &
-                (all_full[:, 1] >= adapt_xyz["ylim"][0]) & (all_full[:, 1] <= adapt_xyz["ylim"][1]) &
-                (all_full[:, 2] >= adapt_xyz["zlim"][0]) & (all_full[:, 2] <= adapt_xyz["zlim"][1])
-            )
-            pca_for_adapt = all_full_pca[mask_adapt] if np.any(mask_adapt) else all_full_pca
-            adapt_pca_xlim = _integer_axis_limits(pca_for_adapt[:, 0], pad=0)
-            adapt_pca_ylim = _integer_axis_limits(pca_for_adapt[:, 1], pad=0)
+            adapt_pca_xlim, adapt_pca_ylim = shared_adapt_pca_xlim, shared_adapt_pca_ylim
 
             range_modes = [
                 ("fixed", {"xlim": fixed_limits["xlim"], "ylim": fixed_limits["ylim"], "zlim": fixed_limits["zlim"]}, fixed_pca_xlim, fixed_pca_ylim),
@@ -1725,7 +1959,7 @@ def plot_and_test_point_clouds(
             ]
 
             for range_tag, lim_xyz, lim_pca_x, lim_pca_y in range_modes:
-                # 1) 12 / 23 / 13 views as separate files
+                # 1) 12 / 23 / 13 views as separate files: scatter and contour
                 for plane_tag, dim_x, dim_y, x_label, y_label, _, _ in projection_specs:
                     if plane_tag == "xy":
                         xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["ylim"]
@@ -1733,83 +1967,233 @@ def plot_and_test_point_clouds(
                         xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
                     else:
                         xlim_curr, ylim_curr = lim_xyz["zlim"], lim_xyz["xlim"]
-                    fig, ax = plt.subplots(figsize=(7.2, 6.2))
-                    _plot_pf_projection_2d(
-                        ax=ax,
-                        points=mode_points,
-                        point_color=mode_color,
-                        point_label=mode_label,
-                        dim_x=dim_x,
-                        dim_y=dim_y,
-                        marker_size=size_2d,
-                        marker_alpha=alpha_2d,
-                        true_xyz=true_xyz,
-                        xlim=xlim_curr,
-                        ylim=ylim_curr,
-                        legend_in_figure=False,
-                        dataset=dataset,
-                    )
-                    if legend_in_figure:
-                        ax.set_xlabel(x_label)
-                        ax.set_ylabel(y_label)
-                        ax.set_title(f"{plane_tag} ({range_tag})", fontsize=10)
-                    else:
-                        ax.set_xlabel("")
-                        ax.set_ylabel("")
-                        ax.set_title("")
                     view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
-                    fig.tight_layout()
-                    fig.savefig(f"{prefix}_{i}_{mode_tag}_{range_tag}_{view_name}.png", bbox_inches='tight', dpi=150)
-                    plt.close(fig)
+                    for plot_style in ["scatter", "contour"]:
+                        plot_points = mode_points_scatter if plot_style == "scatter" else mode_points_contour
+                        fig, ax = plt.subplots(figsize=(7.2, 6.2))
+                        _plot_pf_projection_2d(
+                            ax=ax,
+                            points=plot_points,
+                            point_color=mode_color,
+                            point_label=mode_label,
+                            dim_x=dim_x,
+                            dim_y=dim_y,
+                            marker_size=size_2d,
+                            marker_alpha=alpha_2d,
+                            true_xyz=true_xyz,
+                            xlim=xlim_curr,
+                            ylim=ylim_curr,
+                            legend_in_figure=False,
+                            dataset=dataset,
+                            contour_grid_bins=contour_grid_bins,
+                            draw_scatter=(plot_style == "scatter"),
+                            draw_contour=(plot_style == "contour"),
+                        )
+                        if legend_in_figure:
+                            ax.set_xlabel(x_label)
+                            ax.set_ylabel(y_label)
+                            ax.set_title(f"{plane_tag} ({range_tag}, {plot_style})", fontsize=10)
+                        else:
+                            ax.set_xlabel("")
+                            ax.set_ylabel("")
+                            ax.set_title("")
+                        fig.tight_layout()
+                        if plot_style == "scatter":
+                            save_path = f"{prefix}_{i}_{mode_tag}_{range_tag}_{view_name}.png"
+                        else:
+                            save_path = f"{prefix}_{i}_{mode_tag}_{range_tag}_{view_name}_contour.png"
+                        fig.savefig(save_path, bbox_inches='tight', dpi=150)
+                        plt.close(fig)
 
-                # 2) PCA12 view as separate file
-                fig_pca, ax_pca = plt.subplots(figsize=(7.2, 6.2))
-                ax_pca.scatter(
-                    mode_points_pca[:, 0],
-                    mode_points_pca[:, 1],
-                    s=float(size_2d),
-                    alpha=float(min(0.98, alpha_2d)),
-                    c=mode_color,
-                    edgecolors='none',
-                    label=mode_label,
-                )
-                if true_pca is not None and np.all(np.isfinite(true_pca)):
-                    ax_pca.scatter(
-                        true_pca[0], true_pca[1],
-                        marker='*', s=120, c='orange', edgecolors='black', linewidths=0.6, zorder=12, label='True state'
-                    )
-                ax_pca.set_xlim(lim_pca_x)
-                ax_pca.set_ylim(lim_pca_y)
-                if legend_in_figure:
-                    ax_pca.set_xlabel("PC1")
-                    ax_pca.set_ylabel("PC2")
-                    ax_pca.set_title(f"pca12 ({range_tag})", fontsize=10)
-                else:
-                    ax_pca.set_xlabel("")
-                    ax_pca.set_ylabel("")
-                    ax_pca.set_title("")
-                if legend_in_figure:
-                    ax_pca.legend(
-                        [
-                            Line2D([0], [0], marker='o', linestyle='None', markerfacecolor=mode_color, markeredgecolor='none', markersize=7),
-                            Line2D([0], [0], marker='*', linestyle='None', markerfacecolor='orange', markeredgecolor='black', markersize=10),
-                        ],
-                        [mode_label, "True state"],
-                        loc='best',
-                        fontsize=8,
-                        frameon=True,
-                    )
-                fig_pca.tight_layout()
-                fig_pca.savefig(f"{prefix}_{i}_{mode_tag}_{range_tag}_PCA12.png", bbox_inches='tight', dpi=150)
-                plt.close(fig_pca)
+                # 2) PCA12 view as separate files: scatter and contour
+                for plot_style in ["scatter", "contour"]:
+                    fig_pca, ax_pca = plt.subplots(figsize=(7.2, 6.2))
+                    if plot_style == "contour":
+                        _draw_density_contours_2d(
+                            ax=ax_pca,
+                            points_xy=mode_points_pca_contour,
+                            xlim=lim_pca_x,
+                            ylim=lim_pca_y,
+                            point_color=mode_color,
+                            grid_bins=contour_grid_bins,
+                        )
+                    else:
+                        ax_pca.scatter(
+                            mode_points_pca_scatter[:, 0],
+                            mode_points_pca_scatter[:, 1],
+                            s=float(size_2d),
+                            alpha=float(min(0.98, alpha_2d)),
+                            c=mode_color,
+                            edgecolors='none',
+                            zorder=4,
+                            label=mode_label,
+                        )
+                    if true_pca is not None and np.all(np.isfinite(true_pca)):
+                        ax_pca.scatter(
+                            true_pca[0], true_pca[1],
+                            marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state'
+                        )
+                    ax_pca.set_xlim(lim_pca_x)
+                    ax_pca.set_ylim(lim_pca_y)
+                    if legend_in_figure:
+                        ax_pca.set_xlabel("PC1")
+                        ax_pca.set_ylabel("PC2")
+                        ax_pca.set_title(f"pca12 ({range_tag}, {plot_style})", fontsize=10)
+                    else:
+                        ax_pca.set_xlabel("")
+                        ax_pca.set_ylabel("")
+                        ax_pca.set_title("")
+                    if legend_in_figure:
+                        pca_handles = [
+                            Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10),
+                        ]
+                        pca_labels = ["True state"]
+                        if plot_style == "scatter":
+                            pca_handles.insert(
+                                0,
+                                Line2D([0], [0], marker='o', linestyle='None', markerfacecolor=mode_color, markeredgecolor='none', markersize=7),
+                            )
+                            pca_labels.insert(0, mode_label)
+                        ax_pca.legend(
+                            pca_handles,
+                            pca_labels,
+                            loc='best',
+                            fontsize=8,
+                            frameon=True,
+                        )
+                    fig_pca.tight_layout()
+                    if plot_style == "scatter":
+                        save_path = f"{prefix}_{i}_{mode_tag}_{range_tag}_PCA12.png"
+                    else:
+                        save_path = f"{prefix}_{i}_{mode_tag}_{range_tag}_PCA12_contour.png"
+                    fig_pca.savefig(save_path, bbox_inches='tight', dpi=150)
+                    plt.close(fig_pca)
 
-            # 3) fixed-range 3D view (fixed angle, no adaptive range)
+                # 3) mixed contour views (posterior over prior), lighter colors (60%)
+                if mode_tag == "post":
+                    mixed_alpha_scale = 0.6
+                    for plane_tag, dim_x, dim_y, x_label, y_label, _, _ in projection_specs:
+                        if plane_tag == "xy":
+                            xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["ylim"]
+                        elif plane_tag == "yz":
+                            xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
+                        else:
+                            xlim_curr, ylim_curr = lim_xyz["zlim"], lim_xyz["xlim"]
+                        view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
+
+                        fig_mix, ax_mix = plt.subplots(figsize=(7.2, 6.2))
+                        _draw_density_contours_2d(
+                            ax=ax_mix,
+                            points_xy=prior_contour[:, [dim_x, dim_y]],
+                            xlim=xlim_curr,
+                            ylim=ylim_curr,
+                            point_color="blue",
+                            grid_bins=contour_grid_bins,
+                            alpha_scale=mixed_alpha_scale,
+                        )
+                        _draw_density_contours_2d(
+                            ax=ax_mix,
+                            points_xy=post_contour[:, [dim_x, dim_y]],
+                            xlim=xlim_curr,
+                            ylim=ylim_curr,
+                            point_color="red",
+                            grid_bins=contour_grid_bins,
+                            alpha_scale=mixed_alpha_scale,
+                        )
+                        if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
+                            ax_mix.scatter(
+                                true_xyz[dim_x], true_xyz[dim_y],
+                                marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state',
+                            )
+                        ax_mix.set_xlim(xlim_curr)
+                        ax_mix.set_ylim(ylim_curr)
+                        if legend_in_figure:
+                            ax_mix.set_xlabel(x_label)
+                            ax_mix.set_ylabel(y_label)
+                            ax_mix.set_title(f"{plane_tag} ({range_tag}, mixed contour)", fontsize=10)
+                            ax_mix.legend(
+                                [
+                                    Line2D([0], [0], color='blue', linewidth=2.0),
+                                    Line2D([0], [0], color='red', linewidth=2.0),
+                                    Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10),
+                                ],
+                                ["Prior contour", "Posterior contour", "True state"],
+                                loc='best',
+                                fontsize=8,
+                                frameon=True,
+                            )
+                        else:
+                            ax_mix.set_xlabel("")
+                            ax_mix.set_ylabel("")
+                            ax_mix.set_title("")
+                        fig_mix.tight_layout()
+                        fig_mix.savefig(
+                            f"{prefix}_{i}_mixed_{range_tag}_{view_name}_contour.png",
+                            bbox_inches='tight',
+                            dpi=150,
+                        )
+                        plt.close(fig_mix)
+
+                    fig_mix_pca, ax_mix_pca = plt.subplots(figsize=(7.2, 6.2))
+                    _draw_density_contours_2d(
+                        ax=ax_mix_pca,
+                        points_xy=prior_contour_pca,
+                        xlim=lim_pca_x,
+                        ylim=lim_pca_y,
+                        point_color="blue",
+                        grid_bins=contour_grid_bins,
+                        alpha_scale=mixed_alpha_scale,
+                    )
+                    _draw_density_contours_2d(
+                        ax=ax_mix_pca,
+                        points_xy=post_contour_pca,
+                        xlim=lim_pca_x,
+                        ylim=lim_pca_y,
+                        point_color="red",
+                        grid_bins=contour_grid_bins,
+                        alpha_scale=mixed_alpha_scale,
+                    )
+                    if true_pca is not None and np.all(np.isfinite(true_pca)):
+                        ax_mix_pca.scatter(
+                            true_pca[0], true_pca[1],
+                            marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state'
+                        )
+                    ax_mix_pca.set_xlim(lim_pca_x)
+                    ax_mix_pca.set_ylim(lim_pca_y)
+                    if legend_in_figure:
+                        ax_mix_pca.set_xlabel("PC1")
+                        ax_mix_pca.set_ylabel("PC2")
+                        ax_mix_pca.set_title(f"pca12 ({range_tag}, mixed contour)", fontsize=10)
+                        ax_mix_pca.legend(
+                            [
+                                Line2D([0], [0], color='blue', linewidth=2.0),
+                                Line2D([0], [0], color='red', linewidth=2.0),
+                                Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10),
+                            ],
+                            ["Prior contour", "Posterior contour", "True state"],
+                            loc='best',
+                            fontsize=8,
+                            frameon=True,
+                        )
+                    else:
+                        ax_mix_pca.set_xlabel("")
+                        ax_mix_pca.set_ylabel("")
+                        ax_mix_pca.set_title("")
+                    fig_mix_pca.tight_layout()
+                    fig_mix_pca.savefig(
+                        f"{prefix}_{i}_mixed_{range_tag}_PCA12_contour.png",
+                        bbox_inches='tight',
+                        dpi=150,
+                    )
+                    plt.close(fig_mix_pca)
+
+            # 4) fixed-range 3D view (fixed angle, no adaptive range)
             fig3d = plt.figure(figsize=(8.0, 8.0))
             ax3d = fig3d.add_subplot(111, projection='3d')
             ax3d.scatter(
-                mode_points[:, 0],
-                mode_points[:, 1],
-                mode_points[:, 2],
+                mode_points_scatter[:, 0],
+                mode_points_scatter[:, 1],
+                mode_points_scatter[:, 2],
                 s=float(size_3d),
                 alpha=float(min(0.98, alpha_3d)),
                 c=mode_color,
@@ -1819,7 +2203,7 @@ def plot_and_test_point_clouds(
             if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
                 ax3d.scatter(
                     true_xyz[0], true_xyz[1], true_xyz[2],
-                    marker='*', s=130, c='orange', edgecolors='black', linewidths=0.6, zorder=12, label='True state',
+                    marker='x', s=130, c='black', linewidths=2.0, zorder=12, label='True state',
                 )
             ax3d.set_xlim(fixed_limits["xlim"])
             ax3d.set_ylim(fixed_limits["ylim"])
@@ -2198,7 +2582,7 @@ def plot_and_test_point_clouds_ring(
     - For 1D: state x is mapped by theta=2*pi*x.
     - For 2D: state (u,v) is mapped by theta=atan2(v,u).
     - Observation is interpreted as circle x-coordinate and shown as a vertical line.
-    - True state is mapped to ring and plotted with an orange star marker if provided.
+    - True state is mapped to ring and plotted with a black X marker if provided.
     - History trajectory is optional and controlled by `plot_history`.
     - If plotted ensemble size < 1000, draw all points directly (scatter).
       Otherwise use 2D hexbin density.
@@ -2375,7 +2759,7 @@ def plot_and_test_point_clouds_ring(
             ax.axvline(obs_x_clip, color='orange', linestyle='--', linewidth=2.0, alpha=0.7, label='Observation')
             _add_label('Observation')
 
-        # True state mapped to ring (orange star).
+        # True state mapped to ring (black X).
         if true_xy is not None:
             ax.scatter(
                 true_xy[0], true_xy[1],
