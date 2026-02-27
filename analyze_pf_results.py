@@ -13,6 +13,9 @@ from config.cli import get_parameters
 from config.dataset_info import DATASET_INFO
 
 
+ANALYSIS_DEVICE = torch.device("cpu")
+
+
 # Built-in PF particle counts (do not use args.N).
 PF_N_LIST: List[int] = [500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
 
@@ -105,9 +108,123 @@ def _parse_pf_file(path: Path) -> Optional[PFFileMeta]:
 
 def _torch_load(path: Path) -> Any:
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
+        return torch.load(path, map_location=ANALYSIS_DEVICE, weights_only=True)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location=ANALYSIS_DEVICE)
+
+
+def _to_cpu_value(v: Any) -> Any:
+    if torch.is_tensor(v):
+        return v.detach().cpu()
+    if isinstance(v, dict):
+        return {k: _to_cpu_value(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_to_cpu_value(x) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_to_cpu_value(x) for x in v)
+    return v
+
+
+def _tensor_to_float_list(x: Optional[torch.Tensor]) -> Optional[List[float]]:
+    if x is None:
+        return None
+    return [float(v) for v in x.detach().cpu().tolist()]
+
+
+def _new_running_tensor_stats() -> Dict[str, Any]:
+    return {"count": 0, "mean": None, "m2": None, "shape": None, "valid": True}
+
+
+def _update_running_tensor_stats(state: Dict[str, Any], x: Optional[torch.Tensor]) -> bool:
+    if not state["valid"] or x is None or not torch.is_tensor(x):
+        state["valid"] = False
+        return False
+
+    x32 = x.to(torch.float32)
+    shape = tuple(x32.shape)
+    if state["mean"] is None:
+        state["count"] = 1
+        state["shape"] = shape
+        state["mean"] = x32.clone()
+        state["m2"] = torch.zeros_like(x32)
+        return True
+
+    if shape != state["shape"]:
+        state["valid"] = False
+        return False
+
+    count_next = int(state["count"]) + 1
+    delta = x32 - state["mean"]
+    state["mean"] = state["mean"] + delta / float(count_next)
+    delta2 = x32 - state["mean"]
+    state["m2"] = state["m2"] + delta * delta2
+    state["count"] = count_next
+    return True
+
+
+def _finalize_running_tensor_se(state: Dict[str, Any]) -> Optional[torch.Tensor]:
+    if (not state["valid"]) or state["mean"] is None or state["m2"] is None:
+        return None
+    k = int(state["count"])
+    if k < 2:
+        return None
+    return torch.sqrt(state["m2"] / float((k - 1) * k))
+
+
+def _finalize_running_tensor_mean(state: Dict[str, Any]) -> Optional[torch.Tensor]:
+    if (not state["valid"]) or state["mean"] is None:
+        return None
+    return state["mean"]
+
+
+def _new_running_scalar_mean() -> Dict[str, Any]:
+    return {"sum": 0.0, "count": 0}
+
+
+def _update_running_scalar_mean(state: Dict[str, Any], value: Optional[float]) -> None:
+    if value is None:
+        return
+    try:
+        fv = float(value)
+    except Exception:
+        return
+    if not math.isfinite(fv):
+        return
+    state["sum"] += fv
+    state["count"] += 1
+
+
+def _finalize_running_scalar_mean(state: Dict[str, Any]) -> float:
+    if int(state["count"]) <= 0:
+        return float("nan")
+    return float(state["sum"] / float(state["count"]))
+
+
+def _new_running_scalar_minmax() -> Dict[str, Any]:
+    return {"min": None, "max": None}
+
+
+def _update_running_scalar_minmax(state: Dict[str, Any], value: Optional[float]) -> None:
+    if value is None:
+        return
+    try:
+        fv = float(value)
+    except Exception:
+        return
+    if not math.isfinite(fv):
+        return
+    if state["min"] is None or fv < float(state["min"]):
+        state["min"] = fv
+    if state["max"] is None or fv > float(state["max"]):
+        state["max"] = fv
+
+
+def _finalize_running_scalar_minmax(state: Dict[str, Any]) -> Tuple[float, float]:
+    min_v = state["min"]
+    max_v = state["max"]
+    if min_v is None or max_v is None:
+        return float("nan"), float("nan")
+    return float(min_v), float(max_v)
 
 
 def _clone_value(v: Any) -> Any:
@@ -581,25 +698,33 @@ def _build_quantile_6d_slice(payload: List[Dict[str, Any]], t_start: int, t_end:
 
 
 def _se_quantile_metrics(
-    seed_payloads: List[List[Dict[str, Any]]],
+    records: List[PFFileMeta],
     chunk_steps: int = 16,
-) -> Tuple[Optional[torch.Tensor], Optional[float]]:
-    if len(seed_payloads) < 2:
-        return None, None
-    q_probs = _get_quantile_probs(seed_payloads[0])
-    if q_probs is None or q_probs.ndim != 1:
-        return None, None
+) -> Tuple[Optional[torch.Tensor], Optional[float], Optional[torch.Tensor]]:
+    if len(records) < 2:
+        return None, None, None
 
-    shape0 = _infer_quantile_shape(seed_payloads[0])
-    if shape0 is None:
-        return None, None
+    q_probs: Optional[torch.Tensor] = None
+    shape0: Optional[Tuple[int, int, int]] = None
+    for rec in records:
+        try:
+            payload = _torch_load(rec.path)
+        except Exception as exc:
+            print(f"[WARN] failed to load {rec.path} for quantile SE setup: {exc}")
+            return None, None, None
+        if not isinstance(payload, list) or len(payload) == 0:
+            return None, None, None
+        q_probs = _get_quantile_probs(payload)
+        shape0 = _infer_quantile_shape(payload)
+        if q_probs is not None and shape0 is not None:
+            break
+
+    if q_probs is None or q_probs.ndim != 1 or shape0 is None:
+        return None, None, None
+
     t_dim, b_dim, q_dim = shape0
     if q_dim != int(q_probs.shape[0]):
-        return None, None
-    for payload in seed_payloads[1:]:
-        shape_i = _infer_quantile_shape(payload)
-        if shape_i is None or shape_i != shape0:
-            return None, None
+        return None, None, None
 
     q_probs = q_probs.to(torch.float32)
     step = max(1, int(chunk_steps))
@@ -607,30 +732,47 @@ def _se_quantile_metrics(
     count_avg = 0
     sum_l2 = torch.zeros(6, dtype=torch.float64)
     count_l2 = torch.zeros(6, dtype=torch.float64)
+    sum_dim_avg = torch.zeros(6, dtype=torch.float64)
+    count_dim_avg = torch.zeros(6, dtype=torch.float64)
 
     for t_start in range(0, t_dim, step):
         t_end = min(t_dim, t_start + step)
-        q_items: List[torch.Tensor] = []
-        for payload in seed_payloads:
+        q_state = _new_running_tensor_stats()
+        chunk_b_dim: Optional[int] = None
+        chunk_q_dim: Optional[int] = None
+
+        for rec in records:
+            try:
+                payload = _torch_load(rec.path)
+            except Exception as exc:
+                print(f"[WARN] failed to load {rec.path} for quantile SE chunk: {exc}")
+                return None, None, None
+            if not isinstance(payload, list) or len(payload) == 0:
+                return None, None, None
+
             q_chunk = _build_quantile_6d_slice(payload, t_start, t_end)
             if q_chunk is None:
-                return None, None
-            if int(q_chunk.shape[1]) != b_dim or int(q_chunk.shape[-1]) != q_dim:
-                return None, None
-            q_items.append(q_chunk.to(torch.float32))
+                return None, None, None
+            if chunk_b_dim is None:
+                chunk_b_dim = int(q_chunk.shape[1])
+                chunk_q_dim = int(q_chunk.shape[-1])
+            if int(q_chunk.shape[1]) != chunk_b_dim or int(q_chunk.shape[-1]) != chunk_q_dim:
+                return None, None, None
+            if chunk_b_dim != b_dim or chunk_q_dim != q_dim:
+                return None, None, None
+            if not _update_running_tensor_stats(q_state, q_chunk):
+                return None, None, None
 
-        if not _all_same_shape(q_items):
-            return None, None
-
-        q_stack = torch.stack(q_items, dim=0)  # [K, t, B, 6, Q]
-        se_q = _se_from_seed_stack(q_stack)
+        se_q = _finalize_running_tensor_se(q_state)
         if se_q is None:
-            return None, None
+            return None, None, None
 
         finite_q = torch.isfinite(se_q)
         if bool(torch.any(finite_q).item()):
             sum_avg += float(torch.where(finite_q, se_q, torch.zeros_like(se_q)).sum().item())
             count_avg += int(finite_q.sum().item())
+            sum_dim_avg += torch.where(finite_q, se_q, torch.zeros_like(se_q)).sum(dim=(0, 1, 3)).to(torch.float64).cpu()
+            count_dim_avg += finite_q.sum(dim=(0, 1, 3)).to(torch.float64).cpu()
 
         l2_tb_dim = torch.sqrt(torch.trapz(se_q ** 2, x=q_probs.to(se_q.device), dim=-1))
         finite_l2 = torch.isfinite(l2_tb_dim)
@@ -639,15 +781,25 @@ def _se_quantile_metrics(
             count_l2 += finite_l2.sum(dim=(0, 1)).to(torch.float64).cpu()
 
     l2_out = torch.full((6,), float("nan"), dtype=torch.float32)
-    valid = count_l2 > 0
-    if bool(torch.any(valid).item()):
-        l2_out[valid] = (sum_l2[valid] / count_l2[valid]).to(torch.float32)
-        l2_ret: Optional[torch.Tensor] = l2_out
+    valid_l2 = count_l2 > 0
+    l2_ret: Optional[torch.Tensor]
+    if bool(torch.any(valid_l2).item()):
+        l2_out[valid_l2] = (sum_l2[valid_l2] / count_l2[valid_l2]).to(torch.float32)
+        l2_ret = l2_out
     else:
         l2_ret = None
 
+    dim_avg_out = torch.full((6,), float("nan"), dtype=torch.float32)
+    valid_dim = count_dim_avg > 0
+    dim_avg_ret: Optional[torch.Tensor]
+    if bool(torch.any(valid_dim).item()):
+        dim_avg_out[valid_dim] = (sum_dim_avg[valid_dim] / count_dim_avg[valid_dim]).to(torch.float32)
+        dim_avg_ret = dim_avg_out
+    else:
+        dim_avg_ret = None
+
     avg_ret: Optional[float] = None if count_avg == 0 else float(sum_avg / count_avg)
-    return l2_ret, avg_ret
+    return l2_ret, avg_ret, dim_avg_ret
 
 
 def _se_scalar_rmse(
@@ -885,7 +1037,9 @@ def _sigma_matches(token: str, sigma_arg: Any, tol: float = 1e-8) -> bool:
 
 
 def main() -> None:
+    global ANALYSIS_DEVICE
     args = get_parameters()
+    ANALYSIS_DEVICE = args.device if isinstance(args.device, torch.device) else torch.device(str(args.device))
 
     dataset = str(args.dataset)
     effective_obs = _effective_obs_fn(dataset, args.obs_fn)
@@ -904,6 +1058,7 @@ def main() -> None:
         raise FileNotFoundError(f"PF directory not found: {pf_dir}")
 
     print(f"[INFO] dataset={dataset}, obs_fn={effective_obs}, pf_dir={pf_dir}")
+    print(f"[INFO] analysis_device={ANALYSIS_DEVICE}")
     print(f"[INFO] filter: batch={test_traj_num}, len={test_steps}, accepted_suffixes={accepted_suffixes}")
     print(f"[INFO] target sigma_y from args={target_sigma} (adaptive_sigma_y={adaptive_enabled})")
     print(f"[INFO] built-in PF_N_LIST={PF_N_LIST}")
@@ -978,115 +1133,122 @@ def main() -> None:
         valid_seeds = [r.seed for r in valid_records]
         avg_name = f"pf_results_sigma_y_{sigma}_batch_{test_traj_num}_len_{test_steps}_pfN_{n}_avg"
         avg_path = pf_dir / f"{avg_name}{canonical_suffix}.pt"
-        torch.save(avg_payload, avg_path)
+        avg_payload_cpu = _to_cpu_value(avg_payload)
+        torch.save(avg_payload_cpu, avg_path)
         print(f"[N={n}] saved avg file: {avg_path}")
         del avg_payload
+        del avg_payload_cpu
 
-        # Second pass: reload only the payloads used in avg, then compact for SE/plots.
-        seed_payloads: List[List[Dict[str, Any]]] = []
-        compact_valid_seeds: List[int] = []
+        # Second pass: stream per-seed metrics without stacking all seeds in memory.
+        mean_state = _new_running_tensor_stats()
+        cov_state = _new_running_tensor_stats()
+        kurt_mean_state = _new_running_tensor_stats()
+        ess_mean_state = _new_running_scalar_mean()
+        ess_minmax_state = _new_running_scalar_minmax()
+        abundance_mean_state = _new_running_scalar_mean()
+        abundance_minmax_state = _new_running_scalar_minmax()
+        metric_records: List[PFFileMeta] = []
+
         for rec in valid_records:
             try:
                 payload = _torch_load(rec.path)
-                if not isinstance(payload, list) or len(payload) == 0:
-                    print(f"[WARN] skip invalid payload on SE pass: {rec.path}")
-                    continue
-                compact_payload = _compact_payload_for_analysis(payload)
-                if compact_payload is None:
-                    print(f"[WARN] failed to compact payload for seed={rec.seed}, skip this seed in SE analysis.")
-                    continue
-                seed_payloads.append(compact_payload)
-                compact_valid_seeds.append(rec.seed)
             except Exception as exc:
-                print(f"[WARN] failed to load {rec.path} on SE pass: {exc}")
+                print(f"[WARN] failed to load {rec.path} on metrics pass: {exc}")
+                continue
 
-        if len(seed_payloads) == 0:
-            print(f"[N={n}] no compact payload available for SE analysis.")
+            if not isinstance(payload, list) or len(payload) == 0:
+                print(f"[WARN] skip invalid payload on metrics pass: {rec.path}")
+                continue
+            if any(not isinstance(entry, dict) for entry in payload):
+                print(f"[WARN] skip invalid payload entries on metrics pass: {rec.path}")
+                continue
+
+            metric_records.append(rec)
+
+            mean_key = _pick_key(payload[0], ["post_means", "means"])
+            cov_key = _pick_key(payload[0], ["post_covs", "covs"])
+            kurt_key = _pick_key(payload[0], ["post_kurtosis_excess", "kurtosis_excess"])
+
+            mean_x = _concat_batches(payload, mean_key) if mean_key is not None else None
+            cov_x = _concat_batches(payload, cov_key) if cov_key is not None else None
+            _update_running_tensor_stats(mean_state, mean_x)
+            _update_running_tensor_stats(cov_state, cov_x)
+
+            kurt_x = _concat_batches(payload, kurt_key) if kurt_key is not None else None
+            if kurt_x is None or kurt_x.ndim != 3:
+                _update_running_tensor_stats(kurt_mean_state, None)
+            else:
+                _update_running_tensor_stats(kurt_mean_state, torch.nanmean(kurt_x, dim=(0, 1)))
+
+            ess_mean_value = _scalar_mean_over_tb(payload, ["post_ess", "ess"])
+            abundance_mean_value = _scalar_mean_over_tb(payload, ["post_weight_abundance", "weight_abundance"])
+            _update_running_scalar_mean(ess_mean_state, ess_mean_value)
+            _update_running_scalar_minmax(ess_minmax_state, ess_mean_value)
+            _update_running_scalar_mean(
+                abundance_mean_state,
+                abundance_mean_value,
+            )
+            _update_running_scalar_minmax(abundance_minmax_state, abundance_mean_value)
+
+        if len(metric_records) == 0:
+            print(f"[N={n}] no loadable seed payload on metrics pass.")
             continue
 
-        valid_seeds = compact_valid_seeds
+        valid_seeds = [r.seed for r in metric_records]
 
-        se_mean_rmse = _se_mean_rmse(seed_payloads)
-        se_mean_avg = _se_mean_avg(seed_payloads)
-        se_cov_fnorm = _se_cov_fnorm(seed_payloads)
-        se_cov_avg = _se_cov_avg(seed_payloads)
-        quantile_se, se_quantile_avg = _se_quantile_metrics(seed_payloads)
+        se_mean_tensor = _finalize_running_tensor_se(mean_state)
+        se_cov_tensor = _finalize_running_tensor_se(cov_state)
+
+        se_mean_rmse: Optional[float]
+        se_mean_avg: Optional[float]
+        if se_mean_tensor is None or se_mean_tensor.ndim != 3:
+            se_mean_rmse = None
+            se_mean_avg = None
+        else:
+            rmse_tb = torch.sqrt(torch.mean(se_mean_tensor * se_mean_tensor, dim=-1))
+            se_mean_rmse = float(torch.nanmean(rmse_tb).item())
+            se_mean_avg = float(torch.nanmean(se_mean_tensor).item())
+
+        se_cov_fnorm: Optional[float]
+        se_cov_avg: Optional[float]
+        if se_cov_tensor is None or se_cov_tensor.ndim != 4:
+            se_cov_fnorm = None
+            se_cov_avg = None
+        else:
+            fnorm_tb = torch.linalg.norm(se_cov_tensor, ord="fro", dim=(-2, -1))
+            se_cov_fnorm = float(torch.nanmean(fnorm_tb).item())
+            se_cov_avg = float(torch.nanmean(se_cov_tensor).item())
+
+        quantile_se, se_quantile_avg, quantile_se_avg_dim = _se_quantile_metrics(metric_records)
         se_quantile_l2 = None if quantile_se is None else float(torch.nanmean(quantile_se).item())
-        se_ess_rmse = _se_scalar_rmse(seed_payloads, ["post_ess", "ess"])
-        se_entropy_rmse = _se_scalar_rmse(seed_payloads, ["post_weight_entropy", "weight_entropy"])
-        se_abundance_rmse = _se_scalar_rmse(seed_payloads, ["post_weight_abundance", "weight_abundance"])
-        skew_se = _se_skew_rmse_by_dim(seed_payloads)
-        kurt_se = _se_kurtosis_rmse_by_dim(seed_payloads)
 
-        ess_seed_means: List[float] = []
-        entropy_seed_means: List[float] = []
-        abundance_seed_means: List[float] = []
-        skew_seed_mean_dims: List[torch.Tensor] = []
-        kurt_seed_mean_dims: List[torch.Tensor] = []
-
-        for payload in seed_payloads:
-            ess_mean = _scalar_mean_over_tb(payload, ["post_ess", "ess"])
-            entropy_mean = _scalar_mean_over_tb(payload, ["post_weight_entropy", "weight_entropy"])
-            abundance_mean = _scalar_mean_over_tb(payload, ["post_weight_abundance", "weight_abundance"])
-            skew_mean = _skew_mean_by_dim(payload)
-            kurt_mean = _kurtosis_mean_by_dim(payload)
-
-            if ess_mean is not None:
-                ess_seed_means.append(ess_mean)
-            if entropy_mean is not None:
-                entropy_seed_means.append(entropy_mean)
-            if abundance_mean is not None:
-                abundance_seed_means.append(abundance_mean)
-            if skew_mean is not None:
-                skew_seed_mean_dims.append(skew_mean)
-            if kurt_mean is not None:
-                kurt_seed_mean_dims.append(kurt_mean)
-
-        skew_range = _range_by_dim(skew_seed_mean_dims)
-        kurt_range = _range_by_dim(kurt_seed_mean_dims)
-        ess_mean_center, ess_mean_min, ess_mean_max = _mean_min_max(ess_seed_means)
-        entropy_mean_center, entropy_mean_min, entropy_mean_max = _mean_min_max(entropy_seed_means)
-        abundance_mean_center, abundance_mean_min, abundance_mean_max = _mean_min_max(abundance_seed_means)
-        skew_mean_minmax = _mean_min_max_by_dim(skew_seed_mean_dims)
-        kurt_mean_minmax = _mean_min_max_by_dim(kurt_seed_mean_dims)
+        kurt_mean_dims = _finalize_running_tensor_mean(kurt_mean_state)
+        if kurt_mean_dims is not None and kurt_mean_dims.ndim != 1:
+            kurt_mean_dims = None
+        ess_mean_min, ess_mean_max = _finalize_running_scalar_minmax(ess_minmax_state)
+        abundance_mean_min, abundance_mean_max = _finalize_running_scalar_minmax(abundance_minmax_state)
 
         row: Dict[str, Any] = {
             "sigma_y": sigma,
             "n_seeds": len(valid_seeds),
             "seeds": valid_seeds,
             "avg_file": str(avg_path),
+            "analysis_device": str(ANALYSIS_DEVICE),
             "se_mean_rmse": float("nan") if se_mean_rmse is None else float(se_mean_rmse),
             "se_mean_avg": float("nan") if se_mean_avg is None else float(se_mean_avg),
             "se_cov_fnorm": float("nan") if se_cov_fnorm is None else float(se_cov_fnorm),
             "se_cov_avg": float("nan") if se_cov_avg is None else float(se_cov_avg),
             "se_quantile_l2": float("nan") if se_quantile_l2 is None else float(se_quantile_l2),
             "se_quantile_avg": float("nan") if se_quantile_avg is None else float(se_quantile_avg),
-            "se_ess_rmse": float("nan") if se_ess_rmse is None else float(se_ess_rmse),
-            "se_weight_entropy_rmse": float("nan") if se_entropy_rmse is None else float(se_entropy_rmse),
-            "se_weight_abundance_rmse": float("nan") if se_abundance_rmse is None else float(se_abundance_rmse),
-            "range_ess_mean": _range(ess_seed_means),
-            "range_weight_entropy_mean": _range(entropy_seed_means),
-            "range_weight_abundance_mean": _range(abundance_seed_means),
-            "mean_ess_mean": ess_mean_center,
+            "mean_ess_mean": _finalize_running_scalar_mean(ess_mean_state),
             "min_ess_mean": ess_mean_min,
             "max_ess_mean": ess_mean_max,
-            "mean_weight_entropy_mean": entropy_mean_center,
-            "min_weight_entropy_mean": entropy_mean_min,
-            "max_weight_entropy_mean": entropy_mean_max,
-            "mean_weight_abundance_mean": abundance_mean_center,
+            "mean_weight_abundance_mean": _finalize_running_scalar_mean(abundance_mean_state),
             "min_weight_abundance_mean": abundance_mean_min,
             "max_weight_abundance_mean": abundance_mean_max,
-            "se_quantile_l2_dim": None if quantile_se is None else [float(v) for v in quantile_se.tolist()],
-            "se_skew_rmse_dim": None if skew_se is None else [float(v) for v in skew_se.tolist()],
-            "range_skew_mean_dim": None if skew_range is None else [float(v) for v in skew_range.tolist()],
-            "mean_skew_mean_dim": None if skew_mean_minmax is None else [float(v) for v in skew_mean_minmax[0].tolist()],
-            "min_skew_mean_dim": None if skew_mean_minmax is None else [float(v) for v in skew_mean_minmax[1].tolist()],
-            "max_skew_mean_dim": None if skew_mean_minmax is None else [float(v) for v in skew_mean_minmax[2].tolist()],
-            "se_kurtosis_rmse_dim": None if kurt_se is None else [float(v) for v in kurt_se.tolist()],
-            "range_kurtosis_mean_dim": None if kurt_range is None else [float(v) for v in kurt_range.tolist()],
-            "mean_kurtosis_mean_dim": None if kurt_mean_minmax is None else [float(v) for v in kurt_mean_minmax[0].tolist()],
-            "min_kurtosis_mean_dim": None if kurt_mean_minmax is None else [float(v) for v in kurt_mean_minmax[1].tolist()],
-            "max_kurtosis_mean_dim": None if kurt_mean_minmax is None else [float(v) for v in kurt_mean_minmax[2].tolist()],
+            "se_quantile_l2_dim": _tensor_to_float_list(quantile_se),
+            "se_quantile_avg_dim": _tensor_to_float_list(quantile_se_avg_dim),
+            "mean_kurtosis_mean_dim": _tensor_to_float_list(kurt_mean_dims),
         }
         analysis_rows[n] = row
 
@@ -1108,174 +1270,149 @@ def main() -> None:
     se_cov_avg = [_maybe_float(analysis_rows[n]["se_cov_avg"]) for n in available_n]
     se_quantile_l2 = [_maybe_float(analysis_rows[n]["se_quantile_l2"]) for n in available_n]
     se_quantile_avg = [_maybe_float(analysis_rows[n]["se_quantile_avg"]) for n in available_n]
+
     _plot_multi_line(
         x=available_n,
         series={
             "mean RMSE SE": [float("nan") if v is None else v for v in se_mean_rmse],
             "mean avg SE": [float("nan") if v is None else v for v in se_mean_avg],
+        },
+        title="",
+        ylabel="Standard Error",
+        save_path=analysis_dir / f"se_mean_{base_tag}.png",
+    )
+
+    _plot_multi_line(
+        x=available_n,
+        series={
             "cov F-norm SE": [float("nan") if v is None else v for v in se_cov_fnorm],
             "cov avg SE": [float("nan") if v is None else v for v in se_cov_avg],
+        },
+        title="",
+        ylabel="Standard Error",
+        save_path=analysis_dir / f"se_cov_{base_tag}.png",
+    )
+
+    _plot_multi_line(
+        x=available_n,
+        series={
             "quantile L2[0,1] SE": [float("nan") if v is None else v for v in se_quantile_l2],
             "quantile avg SE": [float("nan") if v is None else v for v in se_quantile_avg],
         },
         title="",
         ylabel="Standard Error",
-        save_path=analysis_dir / f"se_mean_cov_quantile_{base_tag}.png",
+        save_path=analysis_dir / f"se_quantile_{base_tag}.png",
     )
 
-    state_quantile_series: Dict[str, List[float]] = {}
-    pca_quantile_series: Dict[str, List[float]] = {}
+    state_quantile_dim_series: Dict[str, List[float]] = {}
+    pca_quantile_dim_series: Dict[str, List[float]] = {}
     for q_dim, q_name in enumerate(["x1", "x2", "x3", "pca1", "pca2", "pca3"]):
-        y = []
+        y: List[float] = []
         for n in available_n:
-            arr = analysis_rows[n].get("se_quantile_l2_dim")
+            arr = analysis_rows[n].get("se_quantile_avg_dim")
             if isinstance(arr, list) and q_dim < len(arr):
                 y.append(float(arr[q_dim]))
             else:
                 y.append(float("nan"))
         if q_dim < 3:
-            state_quantile_series[f"{q_name} quantile SE"] = y
+            state_quantile_dim_series[f"{q_name} quantile SE"] = y
         else:
-            pca_quantile_series[f"{q_name} quantile SE"] = y
+            pca_quantile_dim_series[f"{q_name} quantile SE"] = y
 
-    _plot_multi_line(
-        x=available_n,
-        series=state_quantile_series,
-        title="",
-        ylabel="Quantile L2 SE",
-        save_path=analysis_dir / f"se_quantile_state_{base_tag}.png",
-    )
-    _plot_multi_line(
-        x=available_n,
-        series=pca_quantile_series,
-        title="",
-        ylabel="Quantile L2 SE",
-        save_path=analysis_dir / f"se_quantile_pca_{base_tag}.png",
-    )
-
-    _plot_multi_line_with_band(
-        x=available_n,
-        centers={
-            "ESS mean": [float("nan") if _maybe_float(analysis_rows[n]["mean_ess_mean"]) is None else float(analysis_rows[n]["mean_ess_mean"]) for n in available_n],
-        },
-        lowers={
-            "ESS mean": [float("nan") if _maybe_float(analysis_rows[n]["min_ess_mean"]) is None else float(analysis_rows[n]["min_ess_mean"]) for n in available_n],
-        },
-        uppers={
-            "ESS mean": [float("nan") if _maybe_float(analysis_rows[n]["max_ess_mean"]) is None else float(analysis_rows[n]["max_ess_mean"]) for n in available_n],
-        },
-        title="",
-        ylabel="ESS mean",
-        save_path=analysis_dir / f"range_ess_{base_tag}.png",
-    )
-
-    _plot_multi_line_with_band(
-        x=available_n,
-        centers={
-            "weight entropy mean": [float("nan") if _maybe_float(analysis_rows[n]["mean_weight_entropy_mean"]) is None else float(analysis_rows[n]["mean_weight_entropy_mean"]) for n in available_n],
-        },
-        lowers={
-            "weight entropy mean": [float("nan") if _maybe_float(analysis_rows[n]["min_weight_entropy_mean"]) is None else float(analysis_rows[n]["min_weight_entropy_mean"]) for n in available_n],
-        },
-        uppers={
-            "weight entropy mean": [float("nan") if _maybe_float(analysis_rows[n]["max_weight_entropy_mean"]) is None else float(analysis_rows[n]["max_weight_entropy_mean"]) for n in available_n],
-        },
-        title="",
-        ylabel="Weight entropy mean",
-        save_path=analysis_dir / f"range_weight_entropy_{base_tag}.png",
-    )
-
-    _plot_multi_line_with_band(
-        x=available_n,
-        centers={
-            "weight abundance mean": [float("nan") if _maybe_float(analysis_rows[n]["mean_weight_abundance_mean"]) is None else float(analysis_rows[n]["mean_weight_abundance_mean"]) for n in available_n],
-        },
-        lowers={
-            "weight abundance mean": [float("nan") if _maybe_float(analysis_rows[n]["min_weight_abundance_mean"]) is None else float(analysis_rows[n]["min_weight_abundance_mean"]) for n in available_n],
-        },
-        uppers={
-            "weight abundance mean": [float("nan") if _maybe_float(analysis_rows[n]["max_weight_abundance_mean"]) is None else float(analysis_rows[n]["max_weight_abundance_mean"]) for n in available_n],
-        },
-        title="",
-        ylabel="Weight abundance mean",
-        save_path=analysis_dir / f"range_weight_abundance_{base_tag}.png",
-    )
-
-    # Skewness dims (if present).
-    skew_dim_len = 0
-    for n in available_n:
-        arr = analysis_rows[n].get("mean_skew_mean_dim")
-        if isinstance(arr, list):
-            skew_dim_len = max(skew_dim_len, len(arr))
-    if skew_dim_len > 0:
-        skew_mean_series = {}
-        skew_min_series = {}
-        skew_max_series = {}
-        for d in range(skew_dim_len):
-            y_mean = []
-            y_min = []
-            y_max = []
-            for n in available_n:
-                mean_arr = analysis_rows[n].get("mean_skew_mean_dim")
-                min_arr = analysis_rows[n].get("min_skew_mean_dim")
-                max_arr = analysis_rows[n].get("max_skew_mean_dim")
-                y_mean.append(float(mean_arr[d]) if isinstance(mean_arr, list) and d < len(mean_arr) else float("nan"))
-                y_min.append(float(min_arr[d]) if isinstance(min_arr, list) and d < len(min_arr) else float("nan"))
-                y_max.append(float(max_arr[d]) if isinstance(max_arr, list) and d < len(max_arr) else float("nan"))
-            key = f"skew dim {d + 1} mean"
-            skew_mean_series[key] = y_mean
-            skew_min_series[key] = y_min
-            skew_max_series[key] = y_max
-
-        _plot_multi_line_with_band(
+    if len(state_quantile_dim_series) > 0:
+        _plot_multi_line(
             x=available_n,
-            centers=skew_mean_series,
-            lowers=skew_min_series,
-            uppers=skew_max_series,
+            series=state_quantile_dim_series,
             title="",
-            ylabel="Value",
-            save_path=analysis_dir / f"range_skewness_{base_tag}.png",
+            ylabel="Quantile SE",
+            save_path=analysis_dir / f"se_quantile_state_dim_{base_tag}.png",
         )
+
+    if len(pca_quantile_dim_series) > 0:
+        _plot_multi_line(
+            x=available_n,
+            series=pca_quantile_dim_series,
+            title="",
+            ylabel="Quantile SE",
+            save_path=analysis_dir / f"se_quantile_pca_dim_{base_tag}.png",
+        )
+
+    _plot_multi_line_with_band(
+        x=available_n,
+        centers={
+            "ESS mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["mean_ess_mean"]) is None
+                else float(analysis_rows[n]["mean_ess_mean"])
+                for n in available_n
+            ],
+            "weight abundance mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["mean_weight_abundance_mean"]) is None
+                else float(analysis_rows[n]["mean_weight_abundance_mean"])
+                for n in available_n
+            ],
+        },
+        lowers={
+            "ESS mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["min_ess_mean"]) is None
+                else float(analysis_rows[n]["min_ess_mean"])
+                for n in available_n
+            ],
+            "weight abundance mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["min_weight_abundance_mean"]) is None
+                else float(analysis_rows[n]["min_weight_abundance_mean"])
+                for n in available_n
+            ],
+        },
+        uppers={
+            "ESS mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["max_ess_mean"]) is None
+                else float(analysis_rows[n]["max_ess_mean"])
+                for n in available_n
+            ],
+            "weight abundance mean": [
+                float("nan")
+                if _maybe_float(analysis_rows[n]["max_weight_abundance_mean"]) is None
+                else float(analysis_rows[n]["max_weight_abundance_mean"])
+                for n in available_n
+            ],
+        },
+        title="",
+        ylabel="Mean",
+        save_path=analysis_dir / f"mean_ess_abundance_{base_tag}.png",
+    )
 
     kurt_dim_len = 0
     for n in available_n:
         arr = analysis_rows[n].get("mean_kurtosis_mean_dim")
         if isinstance(arr, list):
-            kurt_dim_len = max(kurt_dim_len, len(arr))
+            kurt_dim_len = max(kurt_dim_len, min(3, len(arr)))
     if kurt_dim_len > 0:
-        kurt_mean_series = {}
-        kurt_min_series = {}
-        kurt_max_series = {}
+        kurt_mean_series: Dict[str, List[float]] = {}
         for d in range(kurt_dim_len):
-            y_mean = []
-            y_min = []
-            y_max = []
+            y: List[float] = []
             for n in available_n:
                 mean_arr = analysis_rows[n].get("mean_kurtosis_mean_dim")
-                min_arr = analysis_rows[n].get("min_kurtosis_mean_dim")
-                max_arr = analysis_rows[n].get("max_kurtosis_mean_dim")
-                y_mean.append(float(mean_arr[d]) if isinstance(mean_arr, list) and d < len(mean_arr) else float("nan"))
-                y_min.append(float(min_arr[d]) if isinstance(min_arr, list) and d < len(min_arr) else float("nan"))
-                y_max.append(float(max_arr[d]) if isinstance(max_arr, list) and d < len(max_arr) else float("nan"))
-            key = f"kurt dim {d + 1} mean"
-            kurt_mean_series[key] = y_mean
-            kurt_min_series[key] = y_min
-            kurt_max_series[key] = y_max
+                y.append(float(mean_arr[d]) if isinstance(mean_arr, list) and d < len(mean_arr) else float("nan"))
+            kurt_mean_series[f"kurt dim {d + 1} mean"] = y
 
-        _plot_multi_line_with_band(
+        _plot_multi_line(
             x=available_n,
-            centers=kurt_mean_series,
-            lowers=kurt_min_series,
-            uppers=kurt_max_series,
+            series=kurt_mean_series,
             title="",
-            ylabel="Value",
-            save_path=analysis_dir / f"range_kurtosis_{base_tag}.png",
+            ylabel="Kurtosis mean",
+            save_path=analysis_dir / f"mean_kurtosis_{base_tag}.png",
         )
 
     summary = {
         "dataset": dataset,
         "obs_fn": effective_obs,
         "pf_dir": str(pf_dir),
+        "analysis_device": str(ANALYSIS_DEVICE),
         "test_steps": test_steps,
         "test_traj_num": test_traj_num,
         "built_in_pf_N_list": PF_N_LIST,

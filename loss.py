@@ -175,6 +175,31 @@ def compute_spread_error_ratio(ens_states, true_states, unbiased=False, eps=1e-8
     return spread / (err + eps)
 
 
+def compute_spread_error_ratio_minus_1(ens_states, true_states, unbiased=False, eps=1e-8):
+    """
+    Computes |SER - 1| per (T, B), where SER is the spread-error ratio.
+
+    This preserves the per-step difference from ideal calibration before any
+    temporal averaging is applied.
+
+    Args:
+        ens_states (torch.Tensor): Ensemble predictions. Shape: [T, B, N, D].
+        true_states (torch.Tensor): Ground truth. Shape: [T, B, D].
+        unbiased (bool): Use unbiased variance estimate for RMV.
+        eps (float): Numerical stabilizer.
+
+    Returns:
+        torch.Tensor: |SER - 1| per (T, B). Shape: [T, B].
+    """
+    ser = compute_spread_error_ratio(
+        ens_states=ens_states,
+        true_states=true_states,
+        unbiased=unbiased,
+        eps=eps,
+    )
+    return torch.abs(ser - 1.0)
+
+
 def sample_projection_directions(state_dim, num_projections, device=None, dtype=None, seed=None):
     """
     Sample fixed projection directions on the unit sphere for rank-hist evaluation.
@@ -297,7 +322,7 @@ def compute_quantile_crps_1d(ens_samples, truth_quantiles, quantile_probs):
     return crps_div
 
 
-def compute_projected_quantile_crps(
+def compute_projected_quantile_crps_components(
     ens_states,
     state_truth_quantiles,
     quantile_probs,
@@ -307,7 +332,7 @@ def compute_projected_quantile_crps(
     max_pca_dims=3,
 ):
     """
-    Compute projected CRPS divergence by averaging 1D quantile-CRPS divergence over:
+    Compute projected CRPS divergence components over:
     - first `max_state_dims` state coordinates
     - up to `max_pca_dims` PCA projections (if quantiles + directions are provided)
 
@@ -319,7 +344,12 @@ def compute_projected_quantile_crps(
         pca_directions (torch.Tensor or None): [T, B, D, P] or [T, B, P, D]
 
     Returns:
-        torch.Tensor: [T, B], mean projected divergence over available projections.
+        dict with keys:
+            - state_scores: [S, T, B]
+            - pca_scores: [P, T, B]
+            - state_mean: [T, B]
+            - pca_mean: [T, B]
+            - overall_mean: [T, B]
     """
     if ens_states.ndim != 4:
         raise ValueError(f"ens_states must be [T,B,N,D], got {tuple(ens_states.shape)}")
@@ -339,7 +369,8 @@ def compute_projected_quantile_crps(
         )
 
     T, B, _, D = ens_states.shape
-    score_list = []
+    state_scores = []
+    pca_scores = []
 
     n_state_dims = min(int(max_state_dims), D, int(state_truth_quantiles.shape[2]))
     for d_idx in range(n_state_dims):
@@ -348,7 +379,7 @@ def compute_projected_quantile_crps(
             truth_quantiles=state_truth_quantiles[:, :, d_idx, :],
             quantile_probs=quantile_probs,
         )
-        score_list.append(score_d)
+        state_scores.append(score_d)
 
     if pca_truth_quantiles is not None and pca_directions is not None:
         if pca_truth_quantiles.ndim != 4:
@@ -393,13 +424,71 @@ def compute_projected_quantile_crps(
                     truth_quantiles=pca_truth_quantiles[:, :, p_idx, :],
                     quantile_probs=quantile_probs,
                 )
-                score_list.append(score_p)
+                pca_scores.append(score_p)
 
-    if len(score_list) == 0:
-        return torch.full((T, B), float("nan"), device=ens_states.device, dtype=torch.float32)
+    empty_scores = torch.empty((0, T, B), device=ens_states.device, dtype=torch.float32)
+    state_scores_stacked = (
+        torch.stack(state_scores, dim=0).to(torch.float32) if len(state_scores) > 0 else empty_scores
+    )
+    pca_scores_stacked = (
+        torch.stack(pca_scores, dim=0).to(torch.float32) if len(pca_scores) > 0 else empty_scores
+    )
 
-    stacked = torch.stack(score_list, dim=0).to(torch.float32)  # [M, T, B]
-    return torch.nanmean(stacked, dim=0)
+    if state_scores_stacked.shape[0] > 0:
+        state_mean = torch.nanmean(state_scores_stacked, dim=0)
+    else:
+        state_mean = torch.full((T, B), float("nan"), device=ens_states.device, dtype=torch.float32)
+
+    if pca_scores_stacked.shape[0] > 0:
+        pca_mean = torch.nanmean(pca_scores_stacked, dim=0)
+    else:
+        pca_mean = torch.full((T, B), float("nan"), device=ens_states.device, dtype=torch.float32)
+
+    score_parts = []
+    if state_scores_stacked.shape[0] > 0:
+        score_parts.append(state_scores_stacked)
+    if pca_scores_stacked.shape[0] > 0:
+        score_parts.append(pca_scores_stacked)
+
+    if len(score_parts) == 0:
+        overall_mean = torch.full((T, B), float("nan"), device=ens_states.device, dtype=torch.float32)
+    else:
+        overall_mean = torch.nanmean(torch.cat(score_parts, dim=0), dim=0)
+
+    return {
+        "state_scores": state_scores_stacked,
+        "pca_scores": pca_scores_stacked,
+        "state_mean": state_mean,
+        "pca_mean": pca_mean,
+        "overall_mean": overall_mean,
+    }
+
+
+def compute_projected_quantile_crps(
+    ens_states,
+    state_truth_quantiles,
+    quantile_probs,
+    pca_truth_quantiles=None,
+    pca_directions=None,
+    max_state_dims=3,
+    max_pca_dims=3,
+):
+    """
+    Compute projected CRPS divergence averaged over available state/PCA projections.
+
+    Returns:
+        torch.Tensor: [T, B], mean projected divergence over available projections.
+    """
+    components = compute_projected_quantile_crps_components(
+        ens_states=ens_states,
+        state_truth_quantiles=state_truth_quantiles,
+        quantile_probs=quantile_probs,
+        pca_truth_quantiles=pca_truth_quantiles,
+        pca_directions=pca_directions,
+        max_state_dims=max_state_dims,
+        max_pca_dims=max_pca_dims,
+    )
+    return components["overall_mean"]
 
 
 def compute_ensemble_rank_histogram(
@@ -665,6 +754,7 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
         ens_tensor: [T, B, N, D]
         batch_v: [T, B, D]
         loss_type: 'l2', 'rmse', 'rmv', 'ser', 'spread_error_ratio',
+                   'ser_minus_1', 'spread_error_ratio_minus_1',
                    'rank_uniform_l1', 'rank_uniform_l2', 'rank_chi2',
                    'es', 'kes', 'wpf_ed', 'wpf_fmmd', 'wpf_ammd', 'nll'
         additional_inputs: (dict)
@@ -760,6 +850,9 @@ def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None,
 
     elif loss_type in ['ser', 'spread_error_ratio']:
         loss_values_per_element = compute_spread_error_ratio(ens_states_timed, true_states_timed)
+
+    elif loss_type in ['ser_minus_1', 'spread_error_ratio_minus_1']:
+        loss_values_per_element = compute_spread_error_ratio_minus_1(ens_states_timed, true_states_timed)
 
     elif loss_type in ['rank_uniform_l1', 'rank_uniform_l2', 'rank_chi2']:
         rank_cfg = additional_inputs if isinstance(additional_inputs, dict) else {}

@@ -27,8 +27,8 @@ echo "----------------------------------------------------"
 #   - numeric (e.g. 1.0)  => pass --sigma_y <value>
 experiments=(
     "lorenz63 square adaptive 500 64"
-    "lorenz63 arctan adaptive 500 64"
-    "lorenz63 default adaptive 500 64"
+    # "lorenz63 arctan adaptive 500 64"
+    # "lorenz63 default adaptive 500 64"
 )
 
 for exp in "${experiments[@]}"; do
@@ -45,6 +45,7 @@ for exp in "${experiments[@]}"; do
 
     cmd=(
         "$PYTHON_BIN" analyze_pf_results.py
+        --device "cpu"
         --dataset "$dataset"
         --obs_fn "$obs_fn"
         --test_steps "$test_steps"

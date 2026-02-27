@@ -27,9 +27,10 @@ from localization import dist2coeff, create_loc_mat, pairwise_distances
 from loss import (
     compute_loss,
     compute_es,
-    compute_projected_quantile_crps,
+    compute_projected_quantile_crps_components,
     compute_root_mean_variance,
     compute_spread_error_ratio,
+    compute_spread_error_ratio_minus_1,
     compute_ensemble_rank_histogram,
     sample_projection_directions,
     wasserstein2_multivariate_gaussian,
@@ -52,6 +53,8 @@ DYNAMIC_FIXED_LIMITS_3D = {
     "ks": {"xlim": (-6.0, 6.0), "ylim": (-6.0, 6.0), "zlim": (-6.0, 6.0)},
     "rossler": {"xlim": (-15.0, 15.0), "ylim": (-15.0, 15.0), "zlim": (0.0, 30.0)},
 }
+PF_CRPS_STATE_DIMS = 3
+PF_CRPS_PCA_DIMS = 3
 
 
 def _sample_true_obs_noise_like(ref_tensor: torch.Tensor, test_noise_gen: torch.Generator) -> torch.Tensor:
@@ -325,25 +328,97 @@ def _get_pf_post_pca_directions_from_covs(entry: Dict[str, Any], max_dims: int =
     return dirs.view(Tm1, B, D, k)
 
 
+def _empty_pf_crps_breakdown(
+    batch_size: int,
+    device: torch.device,
+    max_state_dims: int = PF_CRPS_STATE_DIMS,
+    max_pca_dims: int = PF_CRPS_PCA_DIMS,
+) -> Dict[str, torch.Tensor]:
+    return {
+        "overall": torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32),
+        "state_mean": torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32),
+        "pca_mean": torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32),
+        "state_dims": torch.full((batch_size, max_state_dims), float("nan"), device=device, dtype=torch.float32),
+        "pca_dims": torch.full((batch_size, max_pca_dims), float("nan"), device=device, dtype=torch.float32),
+    }
+
+
+def _append_pf_crps_breakdown(all_results: Dict[str, torch.Tensor], pf_crps_breakdown: Dict[str, torch.Tensor]) -> None:
+    all_results['pf_crps'] = torch.cat((all_results['pf_crps'], pf_crps_breakdown['overall']))
+    all_results['pf_crps_state_mean'] = torch.cat((all_results['pf_crps_state_mean'], pf_crps_breakdown['state_mean']))
+    all_results['pf_crps_pca_mean'] = torch.cat((all_results['pf_crps_pca_mean'], pf_crps_breakdown['pca_mean']))
+    all_results['pf_crps_state_dims'] = torch.cat((all_results['pf_crps_state_dims'], pf_crps_breakdown['state_dims']), dim=0)
+    all_results['pf_crps_pca_dims'] = torch.cat((all_results['pf_crps_pca_dims'], pf_crps_breakdown['pca_dims']), dim=0)
+
+
+def _get_mean_std_or_nan(data_tensor: torch.Tensor) -> Tuple[float, float]:
+    finite_mask = torch.isfinite(data_tensor)
+    if not finite_mask.any():
+        return float('nan'), float('nan')
+    return get_mean_std(data_tensor[finite_mask])
+
+
+def _add_pf_crps_summary_metrics(
+    final_metrics: Dict[str, Any],
+    all_results: Dict[str, torch.Tensor],
+    valid_B_mask: Optional[torch.Tensor],
+) -> None:
+    if valid_B_mask is None:
+        pf_total = all_results['pf_crps']
+        pf_state_mean = all_results['pf_crps_state_mean']
+        pf_pca_mean = all_results['pf_crps_pca_mean']
+        pf_state_dims = all_results['pf_crps_state_dims']
+        pf_pca_dims = all_results['pf_crps_pca_dims']
+    else:
+        pf_total = all_results['pf_crps'][valid_B_mask]
+        pf_state_mean = all_results['pf_crps_state_mean'][valid_B_mask]
+        pf_pca_mean = all_results['pf_crps_pca_mean'][valid_B_mask]
+        pf_state_dims = all_results['pf_crps_state_dims'][valid_B_mask]
+        pf_pca_dims = all_results['pf_crps_pca_dims'][valid_B_mask]
+
+    final_metrics['mean_pf_crps'], final_metrics['std_pf_crps'] = _get_mean_std_or_nan(pf_total)
+    final_metrics['mean_pf_crps_state_avg'], final_metrics['std_pf_crps_state_avg'] = _get_mean_std_or_nan(pf_state_mean)
+    final_metrics['mean_pf_crps_pca_avg'], final_metrics['std_pf_crps_pca_avg'] = _get_mean_std_or_nan(pf_pca_mean)
+
+    for d_idx in range(PF_CRPS_STATE_DIMS):
+        mean_key = f'mean_pf_crps_state_dim{d_idx + 1}'
+        std_key = f'std_pf_crps_state_dim{d_idx + 1}'
+        final_metrics[mean_key], final_metrics[std_key] = _get_mean_std_or_nan(pf_state_dims[:, d_idx])
+
+    for d_idx in range(PF_CRPS_PCA_DIMS):
+        mean_key = f'mean_pf_crps_pca_dim{d_idx + 1}'
+        std_key = f'std_pf_crps_pca_dim{d_idx + 1}'
+        final_metrics[mean_key], final_metrics[std_key] = _get_mean_std_or_nan(pf_pca_dims[:, d_idx])
+
+
 def _compute_dynamic_quantile_crps_from_pf_post(
     ens_tensor: torch.Tensor,
     pf_entry: Dict[str, Any],
-    max_state_dims: int = 3,
-    max_pca_dims: int = 3,
-) -> torch.Tensor:
+    max_state_dims: int = PF_CRPS_STATE_DIMS,
+    max_pca_dims: int = PF_CRPS_PCA_DIMS,
+    return_details: bool = False,
+) -> Any:
     """
     Compute dynamic quantile-based CRPS for one batch.
 
     Uses cached PF POST quantiles as truth and current ensemble particles as estimate.
-    Returns trajectory-level CRPS averaged over time, shape [B].
+    Returns either:
+    - trajectory-level total CRPS averaged over time, shape [B], or
+    - a dict with per-trajectory state/PCA breakdowns when `return_details=True`.
     """
+    empty_output = _empty_pf_crps_breakdown(
+        batch_size=int(ens_tensor.shape[1]),
+        device=ens_tensor.device,
+        max_state_dims=max_state_dims,
+        max_pca_dims=max_pca_dims,
+    )
     if ens_tensor.ndim != 4 or ens_tensor.shape[0] <= 1:
-        return torch.full((ens_tensor.shape[1],), float("nan"), device=ens_tensor.device, dtype=torch.float32)
+        return empty_output if return_details else empty_output["overall"]
 
     q_probs = pf_entry.get("quantile_probs", None)
     post_quantiles = pf_entry.get("post_quantiles", None)
     if q_probs is None or post_quantiles is None:
-        return torch.full((ens_tensor.shape[1],), float("nan"), device=ens_tensor.device, dtype=torch.float32)
+        return empty_output if return_details else empty_output["overall"]
 
     ens_post = ens_tensor[1:]  # align with PF post cache indexed by assimilation steps
     q_probs = torch.as_tensor(q_probs, device=ens_post.device, dtype=torch.float32)
@@ -357,9 +432,14 @@ def _compute_dynamic_quantile_crps_from_pf_post(
 
     t_use = min(int(ens_post.shape[0]), int(post_quantiles.shape[0]))
     b_use = min(int(ens_post.shape[1]), int(post_quantiles.shape[1]))
-    out = torch.full((ens_post.shape[1],), float("nan"), device=ens_post.device, dtype=torch.float32)
+    out = _empty_pf_crps_breakdown(
+        batch_size=int(ens_post.shape[1]),
+        device=ens_post.device,
+        max_state_dims=max_state_dims,
+        max_pca_dims=max_pca_dims,
+    )
     if t_use <= 0 or b_use <= 0:
-        return out
+        return out if return_details else out["overall"]
 
     ens_use = ens_post[:t_use, :b_use]
     q_state_use = post_quantiles[:t_use, :b_use]
@@ -376,7 +456,7 @@ def _compute_dynamic_quantile_crps_from_pf_post(
             dirs_use = pca_dirs[:t_use_pca, :b_use_pca]
 
     try:
-        crps_tb = compute_projected_quantile_crps(
+        crps_components = compute_projected_quantile_crps_components(
             ens_states=ens_use,
             state_truth_quantiles=q_state_use,
             quantile_probs=q_probs,
@@ -387,10 +467,28 @@ def _compute_dynamic_quantile_crps_from_pf_post(
         )
     except Exception as exc:
         print(f"Warning: failed to compute quantile CRPS from PF cache ({exc}). Returning NaN.")
-        return out
-    crps_b = torch.nanmean(crps_tb, dim=0).to(torch.float32)
-    out[:crps_b.shape[0]] = crps_b
-    return out
+        return out if return_details else out["overall"]
+
+    overall_b = torch.nanmean(crps_components["overall_mean"], dim=0).to(torch.float32)
+    state_mean_b = torch.nanmean(crps_components["state_mean"], dim=0).to(torch.float32)
+    pca_mean_b = torch.nanmean(crps_components["pca_mean"], dim=0).to(torch.float32)
+
+    b_eff = int(overall_b.shape[0])
+    out["overall"][:b_eff] = overall_b
+    out["state_mean"][:b_eff] = state_mean_b
+    out["pca_mean"][:b_eff] = pca_mean_b
+
+    state_scores = crps_components["state_scores"]
+    if state_scores.shape[0] > 0:
+        state_dim_scores = torch.nanmean(state_scores, dim=1).transpose(0, 1).to(torch.float32)
+        out["state_dims"][:b_eff, :state_dim_scores.shape[1]] = state_dim_scores
+
+    pca_scores = crps_components["pca_scores"]
+    if pca_scores.shape[0] > 0:
+        pca_dim_scores = torch.nanmean(pca_scores, dim=1).transpose(0, 1).to(torch.float32)
+        out["pca_dims"][:b_eff, :pca_dim_scores.shape[1]] = pca_dim_scores
+
+    return out if return_details else out["overall"]
 
 
 def _get_pf_cached_range_int(entry: Dict[str, Any], mode: str, range_idx: int, bidx: int, pad_int: int = 5) -> Optional[torch.Tensor]:
@@ -2582,9 +2680,14 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         'rrmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
         'spread_error_ratio': torch.empty(0, device=args.device),
+        'spread_error_ratio_minus_1': torch.empty(0, device=args.device),
         'es1': torch.empty(0, device=args.device),
         'res1': torch.empty(0, device=args.device),
         'pf_crps': torch.empty(0, device=args.device),
+        'pf_crps_state_mean': torch.empty(0, device=args.device),
+        'pf_crps_pca_mean': torch.empty(0, device=args.device),
+        'pf_crps_state_dims': torch.empty((0, PF_CRPS_STATE_DIMS), device=args.device),
+        'pf_crps_pca_dims': torch.empty((0, PF_CRPS_PCA_DIMS), device=args.device),
         'pf_rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
@@ -2808,22 +2911,31 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             res1_val = es1_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             if args.pf_verification:
-                pf_crps_val = _compute_dynamic_quantile_crps_from_pf_post(
+                pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
                     ens_tensor=ens_tensor,
                     pf_entry=cached_pf_data[batch_ind],
-                    max_state_dims=3,
-                    max_pca_dims=3,
+                    max_state_dims=PF_CRPS_STATE_DIMS,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                    return_details=True,
                 )
+                pf_crps_val = pf_crps_breakdown['overall']
                 pf_rcrps_val = pf_crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             else:
-                pf_crps_val = torch.full((B,), float('nan'), device=args.device)
+                pf_crps_breakdown = _empty_pf_crps_breakdown(
+                    batch_size=B,
+                    device=args.device,
+                    max_state_dims=PF_CRPS_STATE_DIMS,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                )
+                pf_crps_val = pf_crps_breakdown['overall']
                 pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(
-                torch.abs(compute_spread_error_ratio(ens_tensor, batch_v) - 1.0),
+            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+            spread_error_ratio_minus_1_val = torch.nanmean(
+                compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
                 dim=0,
             )
 
@@ -2843,9 +2955,12 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
+            all_results['spread_error_ratio_minus_1'] = torch.cat(
+                (all_results['spread_error_ratio_minus_1'], spread_error_ratio_minus_1_val)
+            )
             all_results['es1'] = torch.cat((all_results['es1'], es1_val))
             all_results['res1'] = torch.cat((all_results['res1'], res1_val))
-            all_results['pf_crps'] = torch.cat((all_results['pf_crps'], pf_crps_val))
+            _append_pf_crps_breakdown(all_results, pf_crps_breakdown)
             all_results['pf_rcrps'] = torch.cat((all_results['pf_rcrps'], pf_rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
                 # Use nanmean over time for PF-based metrics
@@ -3024,6 +3139,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         metrics_keys = ['mean_rmse', 'std_rmse',
                         'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
                         'mean_spread_error_ratio', 'std_spread_error_ratio',
+                        'mean_spread_error_ratio_minus_1', 'std_spread_error_ratio_minus_1',
                         'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
                         'mean_pf_crps', 'std_pf_crps',
                         'mean_pf_rcrps', 'std_pf_rcrps', 'mean_pf_cov_diff', 'std_pf_cov_diff',
@@ -3039,6 +3155,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             metrics_keys = ['mean_rmse', 'std_rmse',
                             'mean_rrmse', 'std_rrmse', 'mean_rmv', 'std_rmv',
                             'mean_spread_error_ratio', 'std_spread_error_ratio',
+                            'mean_spread_error_ratio_minus_1', 'std_spread_error_ratio_minus_1',
                             'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
                             'mean_pf_crps', 'std_pf_crps',
                             'mean_pf_rcrps', 'std_pf_rcrps', 'mean_pf_cov_diff', 'std_pf_cov_diff',
@@ -3053,9 +3170,11 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
                 all_results['spread_error_ratio'][valid_B_mask]
             )
+            final_metrics['mean_spread_error_ratio_minus_1'], final_metrics['std_spread_error_ratio_minus_1'] = get_mean_std(
+                all_results['spread_error_ratio_minus_1'][valid_B_mask]
+            )
             final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
             final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
-            final_metrics['mean_pf_crps'], final_metrics['std_pf_crps'] = get_mean_std(all_results['pf_crps'][valid_B_mask])
             final_metrics['mean_pf_rcrps'], final_metrics['std_pf_rcrps'] = get_mean_std(all_results['pf_rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
             if args.pf_verification:
@@ -3063,6 +3182,13 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 final_metrics['mean_pf_rcov_diff'], final_metrics['std_pf_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
+
+    valid_mask_for_pf = valid_B_mask if ('valid_B_mask' in locals()) and bool(valid_B_mask.any().item()) else None
+    _add_pf_crps_summary_metrics(final_metrics, all_results, valid_mask_for_pf)
+    final_metrics['mean_ser'] = final_metrics.get('mean_spread_error_ratio', float('nan'))
+    final_metrics['std_ser'] = final_metrics.get('std_spread_error_ratio', float('nan'))
+    final_metrics['mean_ser_minus_1'] = final_metrics.get('mean_spread_error_ratio_minus_1', float('nan'))
+    final_metrics['std_ser_minus_1'] = final_metrics.get('std_spread_error_ratio_minus_1', float('nan'))
 
     snr_values = all_results['snr_var']
     finite_snr_mask = torch.isfinite(snr_values)
@@ -3134,14 +3260,62 @@ def print_test_results(results):
         print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
     if 'mean_rmv' in results and 'std_rmv' in results:
         print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
-    if 'mean_spread_error_ratio' in results and 'std_spread_error_ratio' in results:
-        print(f"Spread-Error Ratio: {results['mean_spread_error_ratio']:.3f} ± {results['std_spread_error_ratio']:.3f}")
+    if 'mean_ser' in results and 'std_ser' in results:
+        print(f"SER: {results['mean_ser']:.3f} ± {results['std_ser']:.3f}")
+    elif 'mean_spread_error_ratio' in results and 'std_spread_error_ratio' in results:
+        print(f"SER: {results['mean_spread_error_ratio']:.3f} ± {results['std_spread_error_ratio']:.3f}")
+    if 'mean_ser_minus_1' in results and 'std_ser_minus_1' in results:
+        print(f"SER-1: {results['mean_ser_minus_1']:.3f} ± {results['std_ser_minus_1']:.3f}")
+    elif 'mean_spread_error_ratio_minus_1' in results and 'std_spread_error_ratio_minus_1' in results:
+        print(
+            f"SER-1: {results['mean_spread_error_ratio_minus_1']:.3f} ± "
+            f"{results['std_spread_error_ratio_minus_1']:.3f}"
+        )
     if 'mean_es1' in results and 'std_es1' in results:
         print(f"ES1: {results['mean_es1']:.3f} ± {results['std_es1']:.3f}")
     if 'mean_res1' in results and 'std_res1' in results:
         print(f"RES1: {results['mean_res1']:.3f} ± {results['std_res1']:.3f}")
     if 'mean_pf_crps' in results and 'std_pf_crps' in results:
         print(f"PF-CRPS: {results['mean_pf_crps']:.3f} ± {results['std_pf_crps']:.3f}")
+    pf_crps_state_dim_keys = [
+        key
+        for i in range(1, PF_CRPS_STATE_DIMS + 1)
+        for key in (f'mean_pf_crps_state_dim{i}', f'std_pf_crps_state_dim{i}')
+    ]
+    pf_crps_pca_dim_keys = [
+        key
+        for i in range(1, PF_CRPS_PCA_DIMS + 1)
+        for key in (f'mean_pf_crps_pca_dim{i}', f'std_pf_crps_pca_dim{i}')
+    ]
+    if all(key in results for key in pf_crps_state_dim_keys):
+        state_parts = ", ".join(
+            f"d{i}: {results[f'mean_pf_crps_state_dim{i}']:.3f} ± {results[f'std_pf_crps_state_dim{i}']:.3f}"
+            for i in range(1, PF_CRPS_STATE_DIMS + 1)
+        )
+        print(f"PF-CRPS State Dims: {state_parts}")
+    if all(key in results for key in pf_crps_pca_dim_keys):
+        pca_parts = ", ".join(
+            f"p{i}: {results[f'mean_pf_crps_pca_dim{i}']:.3f} ± {results[f'std_pf_crps_pca_dim{i}']:.3f}"
+            for i in range(1, PF_CRPS_PCA_DIMS + 1)
+        )
+        print(f"PF-CRPS PCA Dims: {pca_parts}")
+    if all(
+        key in results
+        for key in (
+            'mean_pf_crps',
+            'std_pf_crps',
+            'mean_pf_crps_state_avg',
+            'std_pf_crps_state_avg',
+            'mean_pf_crps_pca_avg',
+            'std_pf_crps_pca_avg',
+        )
+    ):
+        print(
+            "PF-CRPS Averages: "
+            f"state={results['mean_pf_crps_state_avg']:.3f} ± {results['std_pf_crps_state_avg']:.3f}, "
+            f"pca={results['mean_pf_crps_pca_avg']:.3f} ± {results['std_pf_crps_pca_avg']:.3f}, "
+            f"total={results['mean_pf_crps']:.3f} ± {results['std_pf_crps']:.3f}"
+        )
     if 'mean_pf_rcrps' in results and 'std_pf_rcrps' in results:
         print(f"PF-RCRPS: {results['mean_pf_rcrps']:.3f} ± {results['std_pf_rcrps']:.3f}")
 
@@ -3299,9 +3473,14 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         'rrmse': torch.empty(0, device=args.device),
         'rmv': torch.empty(0, device=args.device),
         'spread_error_ratio': torch.empty(0, device=args.device),
+        'spread_error_ratio_minus_1': torch.empty(0, device=args.device),
         'es1': torch.empty(0, device=args.device),
         'res1': torch.empty(0, device=args.device),
         'pf_crps': torch.empty(0, device=args.device),
+        'pf_crps_state_mean': torch.empty(0, device=args.device),
+        'pf_crps_pca_mean': torch.empty(0, device=args.device),
+        'pf_crps_state_dims': torch.empty((0, PF_CRPS_STATE_DIMS), device=args.device),
+        'pf_crps_pca_dims': torch.empty((0, PF_CRPS_PCA_DIMS), device=args.device),
         'pf_rcrps': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
@@ -3544,22 +3723,31 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1), dim=0)
             res1_val = es1_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             if args.pf_verification:
-                pf_crps_val = _compute_dynamic_quantile_crps_from_pf_post(
+                pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
                     ens_tensor=ens_tensor,
                     pf_entry=cached_pf_data[batch_ind],
-                    max_state_dims=3,
-                    max_pca_dims=3,
+                    max_state_dims=PF_CRPS_STATE_DIMS,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                    return_details=True,
                 )
+                pf_crps_val = pf_crps_breakdown['overall']
                 pf_rcrps_val = pf_crps_val / torch.mean(torch.norm(batch_v, p=2, dim=2), dim=0)
             else:
-                pf_crps_val = torch.full((B,), float('nan'), device=args.device)
+                pf_crps_breakdown = _empty_pf_crps_breakdown(
+                    batch_size=B,
+                    device=args.device,
+                    max_state_dims=PF_CRPS_STATE_DIMS,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                )
+                pf_crps_val = pf_crps_breakdown['overall']
                 pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
             rmse_val = torch.mean(torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2)), dim=0)
             rms_val = torch.mean(torch.sqrt(torch.mean((batch_v) ** 2, dim=2)), dim=0)
             rrmse_val = rmse_val / rms_val
             rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(
-                torch.abs(compute_spread_error_ratio(ens_tensor, batch_v) - 1.0),
+            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+            spread_error_ratio_minus_1_val = torch.nanmean(
+                compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
                 dim=0,
             )
 
@@ -3578,9 +3766,12 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
             all_results['rmv'] = torch.cat((all_results['rmv'], rmv_val))
             all_results['spread_error_ratio'] = torch.cat((all_results['spread_error_ratio'], spread_error_ratio_val))
+            all_results['spread_error_ratio_minus_1'] = torch.cat(
+                (all_results['spread_error_ratio_minus_1'], spread_error_ratio_minus_1_val)
+            )
             all_results['es1'] = torch.cat((all_results['es1'], es1_val))
             all_results['res1'] = torch.cat((all_results['res1'], res1_val))
-            all_results['pf_crps'] = torch.cat((all_results['pf_crps'], pf_crps_val))
+            _append_pf_crps_breakdown(all_results, pf_crps_breakdown)
             all_results['pf_rcrps'] = torch.cat((all_results['pf_rcrps'], pf_rcrps_val))
             if args.pf_verification and len(pf_rmse_list) > 0:
                 all_results['cov_diff'] = torch.cat((all_results['cov_diff'], torch.stack(cov_diff_list).mean(0)))
@@ -3737,6 +3928,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     if all_results['rrmse'].numel() == 0:
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
                         'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
+                        'mean_spread_error_ratio_minus_1', 'std_spread_error_ratio_minus_1',
                         'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
                         'mean_pf_crps', 'std_pf_crps', 'mean_pf_rcrps', 'std_pf_rcrps',
                         'mean_pf_cov_diff', 'std_pf_cov_diff', 'mean_pf_rcov_diff', 'std_pf_rcov_diff',
@@ -3750,6 +3942,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         if not valid_B_mask.any():
             metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rrmse', 'std_rrmse',
                             'mean_rmv', 'std_rmv', 'mean_spread_error_ratio', 'std_spread_error_ratio',
+                            'mean_spread_error_ratio_minus_1', 'std_spread_error_ratio_minus_1',
                             'mean_es1', 'std_es1', 'mean_res1', 'std_res1',
                             'mean_pf_crps', 'std_pf_crps', 'mean_pf_rcrps', 'std_pf_rcrps',
                             'mean_pf_cov_diff', 'std_pf_cov_diff', 'mean_pf_rcov_diff', 'std_pf_rcov_diff',
@@ -3763,9 +3956,11 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             final_metrics['mean_spread_error_ratio'], final_metrics['std_spread_error_ratio'] = get_mean_std(
                 all_results['spread_error_ratio'][valid_B_mask]
             )
+            final_metrics['mean_spread_error_ratio_minus_1'], final_metrics['std_spread_error_ratio_minus_1'] = get_mean_std(
+                all_results['spread_error_ratio_minus_1'][valid_B_mask]
+            )
             final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
             final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
-            final_metrics['mean_pf_crps'], final_metrics['std_pf_crps'] = get_mean_std(all_results['pf_crps'][valid_B_mask])
             final_metrics['mean_pf_rcrps'], final_metrics['std_pf_rcrps'] = get_mean_std(all_results['pf_rcrps'][valid_B_mask])
             final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
             if args.pf_verification:
@@ -3773,6 +3968,13 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 final_metrics['mean_pf_rcov_diff'], final_metrics['std_pf_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
                 final_metrics['mean_pf_rmse'], final_metrics['std_pf_rmse'] = get_mean_std(all_results['pf_rmse'][valid_B_mask])
                 final_metrics['mean_pf_rrmse'], final_metrics['std_pf_rrmse'] = get_mean_std(all_results['pf_rrmse'][valid_B_mask])
+
+    valid_mask_for_pf = valid_B_mask if ('valid_B_mask' in locals()) and bool(valid_B_mask.any().item()) else None
+    _add_pf_crps_summary_metrics(final_metrics, all_results, valid_mask_for_pf)
+    final_metrics['mean_ser'] = final_metrics.get('mean_spread_error_ratio', float('nan'))
+    final_metrics['std_ser'] = final_metrics.get('std_spread_error_ratio', float('nan'))
+    final_metrics['mean_ser_minus_1'] = final_metrics.get('mean_spread_error_ratio_minus_1', float('nan'))
+    final_metrics['std_ser_minus_1'] = final_metrics.get('std_spread_error_ratio_minus_1', float('nan'))
 
     snr_values = all_results['snr_var']
     finite_snr_mask = torch.isfinite(snr_values)
