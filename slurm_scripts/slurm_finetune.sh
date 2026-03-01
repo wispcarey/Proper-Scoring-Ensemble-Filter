@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Submit this script via submit_finetune.sh (sbatch)
+# Submit this script via a batch submit wrapper such as submit_highdim_finetune.sh (sbatch)
 
 #SBATCH --time=04:00:00         # walltime (adjust as needed)
 #SBATCH --nodes=1               # number of nodes
@@ -13,7 +13,7 @@
 #SBATCH -e output_record/ft.%x.%j.err      # STDERR
 
 # Description: Slurm execution script for finetune.py.
-# Input: Env vars defined in submit_finetune.sh (including optional ADAPTIVE_SIGMA_Y).
+# Input: Env vars defined in a submit wrapper (including optional OBS_FN and ADAPTIVE_SIGMA_Y).
 # Output: Fine-tuned model checkpoints and logs.
 
 # 1. Configuration (Defaults for safety)
@@ -30,7 +30,10 @@ VERSION=${VERSION:-"EtE-LRes"}
 CP_PATH=${CP_PATH:-""}
 SIGMA_Y=${SIGMA_Y:-1.0}
 LOSS_TYPE=${LOSS_TYPE:-"es"}
+OBS_FN=${OBS_FN:-"default"}
 ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"}
+NORMAL_OUTPUT=${NORMAL_OUTPUT:-"true"}
+NO_LOCALIZATION=${NO_LOCALIZATION:-"false"}
 
 ADAPTIVE_SIGMA_Y_FLAG=""
 case "${ADAPTIVE_SIGMA_Y,,}" in
@@ -39,7 +42,26 @@ case "${ADAPTIVE_SIGMA_Y,,}" in
         ;;
 esac
 
-echo "Starting Finetune: Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y, LR=$LR, Adaptive=$ADAPTIVE_SIGMA_Y"
+NORMAL_OUTPUT_FLAG=""
+case "${NORMAL_OUTPUT,,}" in
+    true|1|yes|y)
+        NORMAL_OUTPUT_FLAG="--normal_output"
+        ;;
+esac
+
+NO_LOCALIZATION_FLAG=""
+case "${DATASET,,}" in
+    lorenz63|doubling1d|complex2d)
+        NO_LOCALIZATION_FLAG="--no_localization"
+        ;;
+esac
+case "${NO_LOCALIZATION,,}" in
+    true|1|yes|y)
+        NO_LOCALIZATION_FLAG="--no_localization"
+        ;;
+esac
+
+echo "Starting Finetune: Dataset=$DATASET, Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y, LR=$LR, ObsFn=$OBS_FN, Adaptive=$ADAPTIVE_SIGMA_Y, NormalOutput=$NORMAL_OUTPUT, NoLocalization=$([ -n "$NO_LOCALIZATION_FLAG" ] && echo true || echo false)"
 echo "Checkpoint Load: $CP_PATH"
 
 # Load modules
@@ -61,6 +83,9 @@ python finetune.py \
     --learning_rate $LR \
     --cp_load_path "$CP_PATH" \
     --v $VERSION \
+    $NO_LOCALIZATION_FLAG \
+    $NORMAL_OUTPUT_FLAG \
+    --obs_fn $OBS_FN \
     --loss_type $LOSS_TYPE \
     --es_p $ES_P \
     --no_running_loss

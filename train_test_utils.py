@@ -3251,32 +3251,51 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
 
 
+def _is_finite_scalar(value):
+    """Return True when value can be treated as a finite scalar."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return False
+        value = value.item()
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_finite_metric_values(results, *keys):
+    """Return True when all requested metrics exist and are finite scalars."""
+    return all(key in results and _is_finite_scalar(results[key]) for key in keys)
+
+
+def _print_mean_std_metric(results, label, mean_key, std_key, decimals=3, skip_nan=False):
+    """Print a mean±std metric only when the required keys are available."""
+    if mean_key not in results or std_key not in results:
+        return False
+    if skip_nan and not _has_finite_metric_values(results, mean_key, std_key):
+        return False
+    print(f"{label}: {results[mean_key]:.{decimals}f} ± {results[std_key]:.{decimals}f}")
+    return True
+
+
 def print_test_results(results):
     """Pretty-print test metrics including optional timing stats (times in ms)."""
     # Core metrics
-    if 'mean_rmse' in results and 'std_rmse' in results:
-        print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
-    if 'mean_rrmse' in results and 'std_rrmse' in results:
-        print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
-    if 'mean_rmv' in results and 'std_rmv' in results:
-        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
-    if 'mean_ser' in results and 'std_ser' in results:
-        print(f"SER: {results['mean_ser']:.3f} ± {results['std_ser']:.3f}")
-    elif 'mean_spread_error_ratio' in results and 'std_spread_error_ratio' in results:
-        print(f"SER: {results['mean_spread_error_ratio']:.3f} ± {results['std_spread_error_ratio']:.3f}")
-    if 'mean_ser_minus_1' in results and 'std_ser_minus_1' in results:
-        print(f"SER-1: {results['mean_ser_minus_1']:.3f} ± {results['std_ser_minus_1']:.3f}")
-    elif 'mean_spread_error_ratio_minus_1' in results and 'std_spread_error_ratio_minus_1' in results:
-        print(
-            f"SER-1: {results['mean_spread_error_ratio_minus_1']:.3f} ± "
-            f"{results['std_spread_error_ratio_minus_1']:.3f}"
+    _print_mean_std_metric(results, "RMSE", "mean_rmse", "std_rmse")
+    _print_mean_std_metric(results, "RRMSE", "mean_rrmse", "std_rrmse")
+    _print_mean_std_metric(results, "RMV", "mean_rmv", "std_rmv")
+    if not _print_mean_std_metric(results, "SER", "mean_ser", "std_ser"):
+        _print_mean_std_metric(results, "SER", "mean_spread_error_ratio", "std_spread_error_ratio")
+    if not _print_mean_std_metric(results, "SER-1", "mean_ser_minus_1", "std_ser_minus_1"):
+        _print_mean_std_metric(
+            results,
+            "SER-1",
+            "mean_spread_error_ratio_minus_1",
+            "std_spread_error_ratio_minus_1",
         )
-    if 'mean_es1' in results and 'std_es1' in results:
-        print(f"ES1: {results['mean_es1']:.3f} ± {results['std_es1']:.3f}")
-    if 'mean_res1' in results and 'std_res1' in results:
-        print(f"RES1: {results['mean_res1']:.3f} ± {results['std_res1']:.3f}")
-    if 'mean_pf_crps' in results and 'std_pf_crps' in results:
-        print(f"PF-CRPS: {results['mean_pf_crps']:.3f} ± {results['std_pf_crps']:.3f}")
+    _print_mean_std_metric(results, "ES1", "mean_es1", "std_es1")
+    _print_mean_std_metric(results, "RES1", "mean_res1", "std_res1")
+    _print_mean_std_metric(results, "PF-CRPS", "mean_pf_crps", "std_pf_crps", skip_nan=True)
     pf_crps_state_dim_keys = [
         key
         for i in range(1, PF_CRPS_STATE_DIMS + 1)
@@ -3287,28 +3306,28 @@ def print_test_results(results):
         for i in range(1, PF_CRPS_PCA_DIMS + 1)
         for key in (f'mean_pf_crps_pca_dim{i}', f'std_pf_crps_pca_dim{i}')
     ]
-    if all(key in results for key in pf_crps_state_dim_keys):
+    if _has_finite_metric_values(results, *pf_crps_state_dim_keys):
         state_parts = ", ".join(
             f"d{i}: {results[f'mean_pf_crps_state_dim{i}']:.3f} ± {results[f'std_pf_crps_state_dim{i}']:.3f}"
             for i in range(1, PF_CRPS_STATE_DIMS + 1)
         )
         print(f"PF-CRPS State Dims: {state_parts}")
-    if all(key in results for key in pf_crps_pca_dim_keys):
+    if _has_finite_metric_values(results, *pf_crps_pca_dim_keys):
         pca_parts = ", ".join(
             f"p{i}: {results[f'mean_pf_crps_pca_dim{i}']:.3f} ± {results[f'std_pf_crps_pca_dim{i}']:.3f}"
             for i in range(1, PF_CRPS_PCA_DIMS + 1)
         )
         print(f"PF-CRPS PCA Dims: {pca_parts}")
-    if all(
-        key in results
-        for key in (
+    if _has_finite_metric_values(
+        results,
+        *(
             'mean_pf_crps',
             'std_pf_crps',
             'mean_pf_crps_state_avg',
             'std_pf_crps_state_avg',
             'mean_pf_crps_pca_avg',
             'std_pf_crps_pca_avg',
-        )
+        ),
     ):
         print(
             "PF-CRPS Averages: "
@@ -3316,25 +3335,19 @@ def print_test_results(results):
             f"pca={results['mean_pf_crps_pca_avg']:.3f} ± {results['std_pf_crps_pca_avg']:.3f}, "
             f"total={results['mean_pf_crps']:.3f} ± {results['std_pf_crps']:.3f}"
         )
-    if 'mean_pf_rcrps' in results and 'std_pf_rcrps' in results:
-        print(f"PF-RCRPS: {results['mean_pf_rcrps']:.3f} ± {results['std_pf_rcrps']:.3f}")
+    _print_mean_std_metric(results, "PF-RCRPS", "mean_pf_rcrps", "std_pf_rcrps", skip_nan=True)
 
     # Optional PF verification metrics
-    if 'mean_pf_cov_diff' in results and 'std_pf_cov_diff' in results:
-        print(f"PF-Cov-Diff: {results['mean_pf_cov_diff']:.3f} ± {results['std_pf_cov_diff']:.3f}")
-    if 'mean_pf_rcov_diff' in results and 'std_pf_rcov_diff' in results:
-        print(f"PF-RCov-Diff: {results['mean_pf_rcov_diff']:.3f} ± {results['std_pf_rcov_diff']:.3f}")
-    if 'mean_pf_rmse' in results and 'std_pf_rmse' in results:
-        print(f"PF-RMSE: {results['mean_pf_rmse']:.3f} ± {results['std_pf_rmse']:.3f}")
-    if 'mean_pf_rrmse' in results and 'std_pf_rrmse' in results:
-        print(f"PF-RRMSE: {results['mean_pf_rrmse']:.3f} ± {results['std_pf_rrmse']:.3f}")
+    _print_mean_std_metric(results, "PF-Cov-Diff", "mean_pf_cov_diff", "std_pf_cov_diff", skip_nan=True)
+    _print_mean_std_metric(results, "PF-RCov-Diff", "mean_pf_rcov_diff", "std_pf_rcov_diff", skip_nan=True)
+    _print_mean_std_metric(results, "PF-RMSE", "mean_pf_rmse", "std_pf_rmse", skip_nan=True)
+    _print_mean_std_metric(results, "PF-RRMSE", "mean_pf_rrmse", "std_pf_rrmse", skip_nan=True)
 
     # Percentage of non-NaN trajectories
     if 'no_nan_percent' in results:
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
 
-    if 'mean_snr_var' in results and 'std_snr_var' in results:
-        print(f"SNR_var: {results['mean_snr_var']:.3f} ± {results['std_snr_var']:.3f}")
+    _print_mean_std_metric(results, "SNR_var", "mean_snr_var", "std_snr_var")
 
     if 'rank_freq_range' in results:
         rank_total = results.get('rank_total_samples', 0)
@@ -4504,32 +4517,20 @@ def print_test_results_v2(results):
                         and their calculated values. It checks for the
                         existence of keys before printing.
     """
-    if 'mean_rmse' in results and 'std_rmse' in results:
-        print(f"RMSE: {results['mean_rmse']:.3f} ± {results['std_rmse']:.3f}")
+    _print_mean_std_metric(results, "RMSE", "mean_rmse", "std_rmse", skip_nan=True)
+    _print_mean_std_metric(results, "RRMSE", "mean_rrmse", "std_rrmse", skip_nan=True)
+    _print_mean_std_metric(results, "RMV", "mean_rmv", "std_rmv", skip_nan=True)
+    _print_mean_std_metric(results, "ES1", "mean_es1", "std_es1", skip_nan=True)
+    _print_mean_std_metric(results, "RES1", "mean_res1", "std_res1", skip_nan=True)
+    _print_mean_std_metric(results, "W2", "mean_w2_diff", "std_w2_diff", skip_nan=True)
         
-    if 'mean_rrmse' in results and 'std_rrmse' in results:
-        print(f"RRMSE: {results['mean_rrmse']:.3f} ± {results['std_rrmse']:.3f}")
-        
-    if 'mean_rmv' in results and 'std_rmv' in results:
-        print(f"RMV: {results['mean_rmv']:.3f} ± {results['std_rmv']:.3f}")
-        
-    if 'mean_es1' in results and 'std_es1' in results:
-        print(f"ES1: {results['mean_es1']:.3f} ± {results['std_es1']:.3f}")
-        
-    if 'mean_res1' in results and 'std_res1' in results:
-        print(f"RES1: {results['mean_res1']:.3f} ± {results['std_res1']:.3f}")
-        
-    if 'mean_w2_diff' in results and 'std_w2_diff' in results:
-        print(f"W2: {results['mean_w2_diff']:.3f} ± {results['std_w2_diff']:.3f}")
-        
-    if 'no_nan_percent' in results:
+    if 'no_nan_percent' in results and _is_finite_scalar(results['no_nan_percent']):
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
         
-    if 'min_m_norm' in results and 'max_m_norm' in results:
+    if _has_finite_metric_values(results, 'min_m_norm', 'max_m_norm'):
         print(f"Min initial norm: {results['min_m_norm']:.2f}, Max initial norm: {results['max_m_norm']:.2f}")
 
-    if 'mean_snr_var' in results and 'std_snr_var' in results:
-        print(f"SNR_var: {results['mean_snr_var']:.3f} ± {results['std_snr_var']:.3f}")
+    _print_mean_std_metric(results, "SNR_var", "mean_snr_var", "std_snr_var", skip_nan=True)
     
 
 ### test gt uncertainty 
