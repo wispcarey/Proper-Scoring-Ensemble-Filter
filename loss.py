@@ -328,6 +328,7 @@ def compute_projected_quantile_crps_components(
     quantile_probs,
     pca_truth_quantiles=None,
     pca_directions=None,
+    pca_projection_offsets=None,
     max_state_dims=3,
     max_pca_dims=3,
 ):
@@ -342,6 +343,8 @@ def compute_projected_quantile_crps_components(
         quantile_probs (torch.Tensor): [K]
         pca_truth_quantiles (torch.Tensor or None): [T, B, P, K]
         pca_directions (torch.Tensor or None): [T, B, D, P] or [T, B, P, D]
+        pca_projection_offsets (torch.Tensor or None): [T, B, D], offsets subtracted
+            from ens_states before PCA projection to match centered PCA-score quantiles.
 
     Returns:
         dict with keys:
@@ -415,9 +418,22 @@ def compute_projected_quantile_crps_components(
         dirs_tb_dp = dirs_tb_dp.to(device=ens_states.device, dtype=ens_states.dtype)
         dirs_tb_dp = dirs_tb_dp / torch.clamp(torch.norm(dirs_tb_dp, dim=2, keepdim=True), min=1e-12)
 
+        ens_for_proj = ens_states
+        if pca_projection_offsets is not None:
+            offsets = torch.as_tensor(
+                pca_projection_offsets,
+                device=ens_states.device,
+                dtype=ens_states.dtype,
+            )
+            if offsets.shape != (T, B, D):
+                raise ValueError(
+                    f"pca_projection_offsets must be [T,B,D]={ (T, B, D) }, got {tuple(offsets.shape)}"
+                )
+            ens_for_proj = ens_states - offsets.unsqueeze(2)
+
         n_pca_dims = min(int(max_pca_dims), int(pca_truth_quantiles.shape[2]), int(dirs_tb_dp.shape[3]))
         if n_pca_dims > 0:
-            proj = torch.einsum("tbnd,tbdp->tbnp", ens_states, dirs_tb_dp[:, :, :, :n_pca_dims])
+            proj = torch.einsum("tbnd,tbdp->tbnp", ens_for_proj, dirs_tb_dp[:, :, :, :n_pca_dims])
             for p_idx in range(n_pca_dims):
                 score_p = compute_quantile_crps_1d(
                     ens_samples=proj[:, :, :, p_idx],
@@ -470,6 +486,7 @@ def compute_projected_quantile_crps(
     quantile_probs,
     pca_truth_quantiles=None,
     pca_directions=None,
+    pca_projection_offsets=None,
     max_state_dims=3,
     max_pca_dims=3,
 ):
@@ -485,6 +502,7 @@ def compute_projected_quantile_crps(
         quantile_probs=quantile_probs,
         pca_truth_quantiles=pca_truth_quantiles,
         pca_directions=pca_directions,
+        pca_projection_offsets=pca_projection_offsets,
         max_state_dims=max_state_dims,
         max_pca_dims=max_pca_dims,
     )
@@ -522,9 +540,7 @@ def compute_ensemble_rank_histogram(
             - total_samples: int
             - num_bins: int
             - num_projections: int
-            - uniform_l1: float
-            - uniform_l2: float
-            - chi2: float
+            - freq_var: float
     """
     if ens_states.ndim != 4 or true_states.ndim != 3:
         raise ValueError(
@@ -572,9 +588,7 @@ def compute_ensemble_rank_histogram(
             "total_samples": 0,
             "num_bins": int(N + 1),
             "num_projections": P,
-            "uniform_l1": float("nan"),
-            "uniform_l2": float("nan"),
-            "chi2": float("nan"),
+            "freq_var": float("nan"),
         }
 
     ens_valid = ens_states[finite_mask]    # [K, N, D]
@@ -609,17 +623,10 @@ def compute_ensemble_rank_histogram(
 
     total_samples = int(counts.sum().item())
     probs = counts.to(torch.float32) / max(total_samples, 1)
-    uniform = torch.full_like(probs, 1.0 / float(N + 1))
-
     if total_samples <= 0:
-        uniform_l1 = float("nan")
-        uniform_l2 = float("nan")
-        chi2 = float("nan")
+        freq_var = float("nan")
     else:
-        uniform_l1 = float(torch.sum(torch.abs(probs - uniform)).item())
-        uniform_l2 = float(torch.sqrt(torch.mean((probs - uniform) ** 2)).item())
-        expected = float(total_samples) / float(N + 1)
-        chi2 = float(torch.sum((counts.to(torch.float32) - expected) ** 2 / max(expected, 1e-12)).item())
+        freq_var = float(torch.var(probs, unbiased=False).item())
 
     return {
         "counts": counts.detach().cpu(),
@@ -627,9 +634,7 @@ def compute_ensemble_rank_histogram(
         "total_samples": total_samples,
         "num_bins": int(N + 1),
         "num_projections": P,
-        "uniform_l1": uniform_l1,
-        "uniform_l2": uniform_l2,
-        "chi2": chi2,
+        "freq_var": freq_var,
     }
 
 #######################################################

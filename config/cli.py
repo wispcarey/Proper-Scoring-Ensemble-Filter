@@ -78,6 +78,14 @@ def int_or_none_or_default(value):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid value: {value}")
 
+def int_or_none(value):
+    if isinstance(value, str) and value.lower() == "none":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}")
+
 def parse_list_type(s):
     return s.split(',')
 
@@ -432,6 +440,8 @@ def get_parameters(extra_arg_adder=None):
     # PF-related settings (kept together)
     parser.add_argument('--pf_verification', action='store_true',
                         help='Use particle filter to approximate true filtering distribution')
+    parser.add_argument('--pf_verification_seed', type=int_or_none, default=42,
+                        help="PF cache seed used only for --pf_verification. Use 'none' to load the averaged PF cache.")
     parser.add_argument('--pf_N', type=int, default=1000,
                         help='Number of particles for PF')
     parser.add_argument('--pf_save_figure', action='store_true',

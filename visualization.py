@@ -1684,6 +1684,12 @@ def plot_and_test_point_clouds(
     prior_pca_quantiles: Optional[torch.Tensor] = None,
     post_pca_quantiles: Optional[torch.Tensor] = None,
     scatter_size_scale: float = 1.0,
+    prior_pca_source_tensor: Optional[torch.Tensor] = None,
+    posterior_pca_source_tensor: Optional[torch.Tensor] = None,
+    prior_pca_mean: Optional[torch.Tensor] = None,
+    post_pca_mean: Optional[torch.Tensor] = None,
+    prior_pca_basis: Optional[torch.Tensor] = None,
+    post_pca_basis: Optional[torch.Tensor] = None,
 ):
     """
     PF visualization for non-ring datasets (dim>=3):
@@ -1704,6 +1710,18 @@ def plot_and_test_point_clouds(
         prior_tensor = prior_tensor.cpu()
     if posterior_tensor.is_cuda:
         posterior_tensor = posterior_tensor.cpu()
+    if prior_pca_source_tensor is not None and prior_pca_source_tensor.is_cuda:
+        prior_pca_source_tensor = prior_pca_source_tensor.cpu()
+    if posterior_pca_source_tensor is not None and posterior_pca_source_tensor.is_cuda:
+        posterior_pca_source_tensor = posterior_pca_source_tensor.cpu()
+    if prior_pca_mean is not None and isinstance(prior_pca_mean, torch.Tensor) and prior_pca_mean.is_cuda:
+        prior_pca_mean = prior_pca_mean.cpu()
+    if post_pca_mean is not None and isinstance(post_pca_mean, torch.Tensor) and post_pca_mean.is_cuda:
+        post_pca_mean = post_pca_mean.cpu()
+    if prior_pca_basis is not None and isinstance(prior_pca_basis, torch.Tensor) and prior_pca_basis.is_cuda:
+        prior_pca_basis = prior_pca_basis.cpu()
+    if post_pca_basis is not None and isinstance(post_pca_basis, torch.Tensor) and post_pca_basis.is_cuda:
+        post_pca_basis = post_pca_basis.cpu()
     if history_traj is not None and history_traj.is_cuda:
         history_traj = history_traj.cpu()
     if true_state is not None and isinstance(true_state, torch.Tensor) and true_state.is_cuda:
@@ -1722,6 +1740,19 @@ def plot_and_test_point_clouds(
         raise ValueError(f"PF 3D plotter expects at least 3 dims, got D={Dp} and D={Dq}.")
     if Dp != Dq:
         raise ValueError(f"State dim mismatch between prior and posterior: {Dp} vs {Dq}.")
+
+    prior_pca_source_full = prior_tensor if prior_pca_source_tensor is None else prior_pca_source_tensor
+    post_pca_source_full = posterior_tensor if posterior_pca_source_tensor is None else posterior_pca_source_tensor
+    if prior_pca_source_full.ndim != 3 or post_pca_source_full.ndim != 3:
+        raise ValueError(
+            f"PCA source tensors must have shape (B, N, D), got {tuple(prior_pca_source_full.shape)} "
+            f"and {tuple(post_pca_source_full.shape)}."
+        )
+    if prior_pca_source_full.shape[0] != Bp or post_pca_source_full.shape[0] != Bq:
+        raise ValueError(
+            f"PCA source batch mismatch: {prior_pca_source_full.shape[0]} vs {Bp}, "
+            f"{post_pca_source_full.shape[0]} vs {Bq}."
+        )
 
     # For dim>3, this visualization intentionally uses the first 3 dims.
     prior_tensor = prior_tensor[..., :3]
@@ -1779,6 +1810,51 @@ def plot_and_test_point_clouds(
             return None
         return np.stack([lo, hi], axis=1)
 
+    def _range2d_from_cached(range_t: Optional[torch.Tensor]) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        if range_t is None:
+            return None
+        r_np = torch.as_tensor(range_t).detach().cpu().numpy()
+        if (
+            r_np.ndim != 2
+            or r_np.shape[0] < 2
+            or r_np.shape[1] < 2
+            or not np.isfinite(r_np[:2, :2]).all()
+            or not np.all(r_np[:2, 1] > r_np[:2, 0])
+        ):
+            return None
+        return (
+            (float(r_np[0, 0]), float(r_np[0, 1])),
+            (float(r_np[1, 0]), float(r_np[1, 1])),
+        )
+
+    def _parse_pca_transform(
+        mean_t: Optional[torch.Tensor],
+        basis_t: Optional[torch.Tensor],
+        source_dim: int,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if mean_t is None or basis_t is None:
+            return None
+        mean_np = torch.as_tensor(mean_t).detach().cpu().numpy().astype(np.float64).reshape(-1)
+        basis_np = torch.as_tensor(basis_t).detach().cpu().numpy().astype(np.float64)
+        if mean_np.size != int(source_dim):
+            return None
+        if basis_np.ndim != 2 or basis_np.shape[0] != int(source_dim) or basis_np.shape[1] < 1:
+            return None
+        basis_np = basis_np[:, : min(2, basis_np.shape[1])]
+        if basis_np.shape[1] < 2:
+            pad = np.zeros((basis_np.shape[0], 2 - basis_np.shape[1]), dtype=np.float64)
+            basis_np = np.concatenate([basis_np, pad], axis=1)
+        return mean_np, basis_np
+
+    def _limits_from_projected_points(points_xy: np.ndarray) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        pts = np.asarray(points_xy, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] < 2:
+            return ((-1.0, 1.0), (-1.0, 1.0))
+        return (
+            _integer_axis_limits(pts[:, 0], pad=0),
+            _integer_axis_limits(pts[:, 1], pad=0),
+        )
+
     fixed_limits = PF_FIXED_RANGES_3D[dataset]
     projection_specs = [
         ("xy", 0, 1, "x", "y", fixed_limits["xlim"], fixed_limits["ylim"]),
@@ -1824,7 +1900,7 @@ def plot_and_test_point_clouds(
         prior_contour = prior_contour_ds.numpy()
         post_contour = post_contour_ds.numpy()
 
-        # Shared PCA basis from combined cloud.
+        # Legacy shared PCA basis from the displayed 3D state cloud.
         all_full = torch.cat([prior_full, post_full], dim=0).numpy()
         pca_mean, pca_basis = _fit_pca_2d(all_full)
         prior_scatter_pca = _project_pca_2d(prior_scatter, pca_mean, pca_basis)
@@ -1834,6 +1910,104 @@ def plot_and_test_point_clouds(
         true_pca = None
         if true_xyz is not None and len(true_xyz) >= 3 and np.all(np.isfinite(true_xyz[:3])):
             true_pca = _project_pca_2d(np.asarray(true_xyz[:3], dtype=np.float64).reshape(1, 3), pca_mean, pca_basis)[0]
+
+        # Optional cached PF PCA transform (test-time only): center by cached PF mean
+        # and project using cached PF eigenvectors so CRPS and PCA12 plots share the
+        # same coordinate system.
+        prior_pca_full_item = prior_pca_source_full[i, :, :]
+        post_pca_full_item = post_pca_source_full[i, :, :]
+        prior_pca_for_vis = _sample_points(prior_pca_full_item, num_samples_plot)
+        post_pca_for_vis = _sample_points(post_pca_full_item, num_samples_plot)
+        prior_pca_scatter_ds, _ = _prepare_scatter_points(prior_pca_for_vis, max_points=PF_MAX_SCATTER_POINTS)
+        post_pca_scatter_ds, _ = _prepare_scatter_points(post_pca_for_vis, max_points=PF_MAX_SCATTER_POINTS)
+        prior_pca_contour_ds, _ = _prepare_scatter_points(prior_pca_for_vis, max_points=PF_MAX_CONTOUR_POINTS)
+        post_pca_contour_ds, _ = _prepare_scatter_points(post_pca_for_vis, max_points=PF_MAX_CONTOUR_POINTS)
+        prior_pca_scatter_src = prior_pca_scatter_ds.numpy()
+        post_pca_scatter_src = post_pca_scatter_ds.numpy()
+        prior_pca_contour_src = prior_pca_contour_ds.numpy()
+        post_pca_contour_src = post_pca_contour_ds.numpy()
+
+        true_state_full_np = None
+        if true_state is not None:
+            ts_full = torch.as_tensor(true_state).detach().cpu()
+            if ts_full.ndim == 1:
+                true_state_full_np = ts_full.numpy().astype(np.float64)
+            elif ts_full.ndim == 2:
+                if ts_full.shape[0] == B:
+                    true_state_full_np = ts_full[i].numpy().astype(np.float64)
+                elif ts_full.shape[0] > 0:
+                    true_state_full_np = ts_full[0].numpy().astype(np.float64)
+
+        fixed_xyz = {
+            "xlim": fixed_limits["xlim"],
+            "ylim": fixed_limits["ylim"],
+            "zlim": fixed_limits["zlim"],
+        }
+
+        prior_cached_transform = _parse_pca_transform(
+            prior_pca_mean,
+            prior_pca_basis,
+            source_dim=int(prior_pca_full_item.shape[-1]),
+        )
+        post_cached_transform = _parse_pca_transform(
+            post_pca_mean,
+            post_pca_basis,
+            source_dim=int(post_pca_full_item.shape[-1]),
+        )
+
+        prior_scatter_pca_custom = None
+        prior_contour_pca_custom = None
+        prior_true_pca_custom = None
+        prior_fixed_pca_custom = None
+        prior_adapt_pca_custom = _range2d_from_cached(prior_pca_range_int)
+        if prior_cached_transform is not None:
+            prior_mean_np, prior_basis_np = prior_cached_transform
+            prior_scatter_pca_custom = _project_pca_2d(prior_pca_scatter_src, prior_mean_np, prior_basis_np)
+            prior_contour_pca_custom = _project_pca_2d(prior_pca_contour_src, prior_mean_np, prior_basis_np)
+            if true_state_full_np is not None and true_state_full_np.size == prior_mean_np.size:
+                prior_true_pca_custom = _project_pca_2d(
+                    true_state_full_np.reshape(1, -1),
+                    prior_mean_np,
+                    prior_basis_np,
+                )[0]
+            if prior_mean_np.size >= 3 and prior_basis_np.shape[0] >= 3:
+                prior_fixed_pca_custom = _pca_limits_from_xyz_ranges(
+                    xyz_limits=fixed_xyz,
+                    mean=prior_mean_np[:3],
+                    basis=prior_basis_np[:3, :2],
+                    pad=0,
+                )
+            if prior_fixed_pca_custom is None:
+                prior_fixed_pca_custom = _limits_from_projected_points(prior_contour_pca_custom)
+            if prior_adapt_pca_custom is None:
+                prior_adapt_pca_custom = _limits_from_projected_points(prior_contour_pca_custom)
+
+        post_scatter_pca_custom = None
+        post_contour_pca_custom = None
+        post_true_pca_custom = None
+        post_fixed_pca_custom = None
+        post_adapt_pca_custom = _range2d_from_cached(post_pca_range_int)
+        if post_cached_transform is not None:
+            post_mean_np, post_basis_np = post_cached_transform
+            post_scatter_pca_custom = _project_pca_2d(post_pca_scatter_src, post_mean_np, post_basis_np)
+            post_contour_pca_custom = _project_pca_2d(post_pca_contour_src, post_mean_np, post_basis_np)
+            if true_state_full_np is not None and true_state_full_np.size == post_mean_np.size:
+                post_true_pca_custom = _project_pca_2d(
+                    true_state_full_np.reshape(1, -1),
+                    post_mean_np,
+                    post_basis_np,
+                )[0]
+            if post_mean_np.size >= 3 and post_basis_np.shape[0] >= 3:
+                post_fixed_pca_custom = _pca_limits_from_xyz_ranges(
+                    xyz_limits=fixed_xyz,
+                    mean=post_mean_np[:3],
+                    basis=post_basis_np[:3, :2],
+                    pad=0,
+                )
+            if post_fixed_pca_custom is None:
+                post_fixed_pca_custom = _limits_from_projected_points(post_contour_pca_custom)
+            if post_adapt_pca_custom is None:
+                post_adapt_pca_custom = _limits_from_projected_points(post_contour_pca_custom)
         prior_marker_size_2d, prior_marker_alpha_2d = _adaptive_scatter_style(
             n_points=prior_scatter.shape[0],
             is_3d=False,
@@ -1877,6 +2051,11 @@ def plot_and_test_point_clouds(
                 prior_contour,
                 prior_scatter_pca,
                 prior_contour_pca,
+                prior_scatter_pca_custom,
+                prior_contour_pca_custom,
+                prior_true_pca_custom,
+                prior_fixed_pca_custom,
+                prior_adapt_pca_custom,
                 "blue",
                 "Predictive (prior) distribution",
                 prior_ratio_str,
@@ -1893,6 +2072,11 @@ def plot_and_test_point_clouds(
                 post_contour,
                 post_scatter_pca,
                 post_contour_pca,
+                post_scatter_pca_custom,
+                post_contour_pca_custom,
+                post_true_pca_custom,
+                post_fixed_pca_custom,
+                post_adapt_pca_custom,
                 "red",
                 "Filtering (posterior) distribution",
                 post_ratio_str,
@@ -1926,8 +2110,13 @@ def plot_and_test_point_clouds(
             mode_tag,
             mode_points_scatter,
             mode_points_contour,
-            mode_points_pca_scatter,
-            mode_points_pca_contour,
+            mode_points_pca_scatter_default,
+            mode_points_pca_contour_default,
+            mode_points_pca_scatter_custom,
+            mode_points_pca_contour_custom,
+            mode_true_pca_custom,
+            mode_fixed_pca_custom,
+            mode_adapt_pca_custom,
             mode_color,
             mode_label,
             mode_ratio,
@@ -1938,11 +2127,6 @@ def plot_and_test_point_clouds(
             mode_quantiles,
             mode_pca_quantiles,
         ) in mode_specs:
-            fixed_xyz = {
-                "xlim": fixed_limits["xlim"],
-                "ylim": fixed_limits["ylim"],
-                "zlim": fixed_limits["zlim"],
-            }
             fixed_pca_xlim, fixed_pca_ylim = _pca_limits_from_xyz_ranges(
                 xyz_limits=fixed_xyz,
                 mean=pca_mean,
@@ -1952,6 +2136,17 @@ def plot_and_test_point_clouds(
 
             adapt_xyz = adaptive_limits
             adapt_pca_xlim, adapt_pca_ylim = shared_adapt_pca_xlim, shared_adapt_pca_ylim
+            mode_points_pca_scatter = mode_points_pca_scatter_default
+            mode_points_pca_contour = mode_points_pca_contour_default
+            mode_true_pca = true_pca
+            if mode_points_pca_scatter_custom is not None and mode_points_pca_contour_custom is not None:
+                mode_points_pca_scatter = mode_points_pca_scatter_custom
+                mode_points_pca_contour = mode_points_pca_contour_custom
+                mode_true_pca = mode_true_pca_custom
+                if mode_fixed_pca_custom is not None:
+                    fixed_pca_xlim, fixed_pca_ylim = mode_fixed_pca_custom
+                if mode_adapt_pca_custom is not None:
+                    adapt_pca_xlim, adapt_pca_ylim = mode_adapt_pca_custom
 
             range_modes = [
                 ("fixed", {"xlim": fixed_limits["xlim"], "ylim": fixed_limits["ylim"], "zlim": fixed_limits["zlim"]}, fixed_pca_xlim, fixed_pca_ylim),
@@ -2028,9 +2223,9 @@ def plot_and_test_point_clouds(
                             zorder=4,
                             label=mode_label,
                         )
-                    if true_pca is not None and np.all(np.isfinite(true_pca)):
+                    if mode_true_pca is not None and np.all(np.isfinite(mode_true_pca)):
                         ax_pca.scatter(
-                            true_pca[0], true_pca[1],
+                            mode_true_pca[0], mode_true_pca[1],
                             marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state'
                         )
                     ax_pca.set_xlim(lim_pca_x)
@@ -2135,31 +2330,44 @@ def plot_and_test_point_clouds(
                         plt.close(fig_mix)
 
                     fig_mix_pca, ax_mix_pca = plt.subplots(figsize=(7.2, 6.2))
+                    mix_prior_pca = prior_contour_pca
+                    mix_post_pca = post_contour_pca
+                    mix_true_pca = true_pca
+                    mix_lim_pca_x, mix_lim_pca_y = lim_pca_x, lim_pca_y
+                    if post_cached_transform is not None:
+                        post_mean_np, post_basis_np = post_cached_transform
+                        mix_prior_pca = _project_pca_2d(prior_pca_contour_src, post_mean_np, post_basis_np)
+                        mix_post_pca = _project_pca_2d(post_pca_contour_src, post_mean_np, post_basis_np)
+                        mix_true_pca = post_true_pca_custom
+                        if range_tag == "fixed" and post_fixed_pca_custom is not None:
+                            mix_lim_pca_x, mix_lim_pca_y = post_fixed_pca_custom
+                        elif range_tag == "adaptive" and post_adapt_pca_custom is not None:
+                            mix_lim_pca_x, mix_lim_pca_y = post_adapt_pca_custom
                     _draw_density_contours_2d(
                         ax=ax_mix_pca,
-                        points_xy=prior_contour_pca,
-                        xlim=lim_pca_x,
-                        ylim=lim_pca_y,
+                        points_xy=mix_prior_pca,
+                        xlim=mix_lim_pca_x,
+                        ylim=mix_lim_pca_y,
                         point_color="blue",
                         grid_bins=contour_grid_bins,
                         alpha_scale=mixed_alpha_scale,
                     )
                     _draw_density_contours_2d(
                         ax=ax_mix_pca,
-                        points_xy=post_contour_pca,
-                        xlim=lim_pca_x,
-                        ylim=lim_pca_y,
+                        points_xy=mix_post_pca,
+                        xlim=mix_lim_pca_x,
+                        ylim=mix_lim_pca_y,
                         point_color="red",
                         grid_bins=contour_grid_bins,
                         alpha_scale=mixed_alpha_scale,
                     )
-                    if true_pca is not None and np.all(np.isfinite(true_pca)):
+                    if mix_true_pca is not None and np.all(np.isfinite(mix_true_pca)):
                         ax_mix_pca.scatter(
-                            true_pca[0], true_pca[1],
+                            mix_true_pca[0], mix_true_pca[1],
                             marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state'
                         )
-                    ax_mix_pca.set_xlim(lim_pca_x)
-                    ax_mix_pca.set_ylim(lim_pca_y)
+                    ax_mix_pca.set_xlim(mix_lim_pca_x)
+                    ax_mix_pca.set_ylim(mix_lim_pca_y)
                     if legend_in_figure:
                         ax_mix_pca.set_xlabel("PC1")
                         ax_mix_pca.set_ylabel("PC2")
