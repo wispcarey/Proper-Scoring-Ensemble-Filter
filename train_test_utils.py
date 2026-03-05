@@ -659,6 +659,343 @@ def _compute_dynamic_quantile_crps_from_pf_post(
     return out if return_details else out["overall"]
 
 
+def _compute_energy_score_step(
+    ens_step: torch.Tensor,
+    true_step: torch.Tensor,
+    norm_p: float = 1,
+) -> torch.Tensor:
+    """Compute ES for one time step with inputs [B,N,D] and [B,D]."""
+    if ens_step.ndim != 3 or true_step.ndim != 2:
+        raise ValueError(
+            f"Expected ens_step [B,N,D] and true_step [B,D], got "
+            f"{tuple(ens_step.shape)} and {tuple(true_step.shape)}"
+        )
+
+    B, N, _ = ens_step.shape
+    if true_step.shape[0] != B:
+        raise ValueError(
+            f"Batch mismatch: ens_step batch={B}, true_step batch={true_step.shape[0]}"
+        )
+    if N <= 1:
+        return torch.zeros(B, device=ens_step.device, dtype=ens_step.dtype)
+
+    true_expanded = true_step.unsqueeze(1)
+    dist_to_true = torch.norm(ens_step - true_expanded, p=2, dim=-1)
+    if norm_p != 1:
+        dist_to_true = torch.pow(dist_to_true, norm_p)
+    term_obs = torch.mean(dist_to_true, dim=1)
+
+    pairwise_dist = torch.cdist(ens_step, ens_step, p=2)
+    if norm_p != 1:
+        pairwise_dist = torch.pow(pairwise_dist, norm_p)
+    term_pair_expectation = torch.mean(pairwise_dist, dim=(1, 2))
+
+    return term_obs - 0.5 * term_pair_expectation
+
+
+def _prepare_pf_running_metric_cache(
+    pf_entry: Dict[str, Any],
+    device: torch.device,
+    ens_dtype: torch.dtype,
+    max_pca_dims: int = PF_CRPS_PCA_DIMS,
+) -> Dict[str, Optional[torch.Tensor]]:
+    """Materialize PF cache tensors once per batch for running test metrics."""
+    out: Dict[str, Optional[torch.Tensor]] = {
+        "q_probs": None,
+        "post_quantiles": None,
+        "post_pca_quantiles": None,
+        "pca_dirs": None,
+        "post_means": None,
+    }
+
+    q_probs = pf_entry.get("quantile_probs", None)
+    post_quantiles = pf_entry.get("post_quantiles", None)
+    if q_probs is None or post_quantiles is None:
+        return out
+
+    out["q_probs"] = torch.as_tensor(q_probs, device=device, dtype=torch.float32)
+    out["post_quantiles"] = torch.as_tensor(post_quantiles, device=device, dtype=torch.float32)
+
+    post_pca_quantiles = pf_entry.get("post_pca_quantiles", None)
+    if post_pca_quantiles is not None:
+        out["post_pca_quantiles"] = torch.as_tensor(post_pca_quantiles, device=device, dtype=torch.float32)
+
+    pca_dirs = _get_pf_post_pca_directions_from_covs(pf_entry, max_dims=max_pca_dims)
+    if pca_dirs is not None:
+        out["pca_dirs"] = pca_dirs.to(device=device, dtype=ens_dtype)
+
+    post_means = _get_pf_cached_post_means(pf_entry)
+    if post_means is not None:
+        out["post_means"] = torch.as_tensor(post_means, device=device, dtype=ens_dtype)
+
+    return out
+
+
+def _compute_dynamic_quantile_crps_from_pf_post_step(
+    ens_step: torch.Tensor,
+    pf_metric_cache: Dict[str, Optional[torch.Tensor]],
+    step_idx: int,
+    max_state_dims: int = PF_CRPS_STATE_DIMS,
+    max_pca_dims: int = PF_CRPS_PCA_DIMS,
+    return_details: bool = False,
+) -> Any:
+    """Stepwise version of PF-CRPS used by running test metrics."""
+    out = _empty_pf_crps_breakdown(
+        batch_size=int(ens_step.shape[0]),
+        device=ens_step.device,
+        max_state_dims=max_state_dims,
+        max_pca_dims=max_pca_dims,
+    )
+    if ens_step.ndim != 3:
+        return out if return_details else out["overall"]
+    if not torch.isfinite(ens_step).all(dim=(1, 2)).any():
+        return out if return_details else out["overall"]
+
+    q_probs = pf_metric_cache.get("q_probs", None)
+    post_quantiles = pf_metric_cache.get("post_quantiles", None)
+    if q_probs is None or post_quantiles is None:
+        return out if return_details else out["overall"]
+
+    if not (0 <= int(step_idx) < int(post_quantiles.shape[0])):
+        return out if return_details else out["overall"]
+
+    b_use = min(int(ens_step.shape[0]), int(post_quantiles.shape[1]))
+    if b_use <= 0:
+        return out if return_details else out["overall"]
+
+    ens_use = ens_step[:b_use].unsqueeze(0)
+    q_state_use = post_quantiles[step_idx:step_idx + 1, :b_use]
+    q_pca_use = None
+    dirs_use = None
+    pca_offsets_use = None
+
+    post_pca_quantiles = pf_metric_cache.get("post_pca_quantiles", None)
+    pca_dirs = pf_metric_cache.get("pca_dirs", None)
+    post_means = pf_metric_cache.get("post_means", None)
+    if (
+        post_pca_quantiles is not None
+        and pca_dirs is not None
+        and post_means is not None
+        and 0 <= int(step_idx) < int(post_pca_quantiles.shape[0])
+        and 0 <= int(step_idx) < int(pca_dirs.shape[0])
+        and 0 <= int(step_idx) < int(post_means.shape[0])
+    ):
+        b_use_pca = min(
+            b_use,
+            int(post_pca_quantiles.shape[1]),
+            int(pca_dirs.shape[1]),
+            int(post_means.shape[1]),
+        )
+        if b_use_pca > 0:
+            ens_use = ens_step[:b_use_pca].unsqueeze(0)
+            q_state_use = post_quantiles[step_idx:step_idx + 1, :b_use_pca]
+            q_pca_use = post_pca_quantiles[step_idx:step_idx + 1, :b_use_pca]
+            dirs_use = pca_dirs[step_idx:step_idx + 1, :b_use_pca]
+            pca_offsets_use = post_means[step_idx:step_idx + 1, :b_use_pca]
+
+    try:
+        crps_components = compute_projected_quantile_crps_components(
+            ens_states=ens_use,
+            state_truth_quantiles=q_state_use,
+            quantile_probs=q_probs,
+            pca_truth_quantiles=q_pca_use,
+            pca_directions=dirs_use,
+            pca_projection_offsets=pca_offsets_use,
+            max_state_dims=max_state_dims,
+            max_pca_dims=max_pca_dims,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to compute stepwise quantile CRPS from PF cache ({exc}). Returning NaN.")
+        return out if return_details else out["overall"]
+
+    overall_b = crps_components["overall_mean"][0].to(torch.float32)
+    state_mean_b = crps_components["state_mean"][0].to(torch.float32)
+    pca_mean_b = crps_components["pca_mean"][0].to(torch.float32)
+
+    b_eff = int(overall_b.shape[0])
+    out["overall"][:b_eff] = overall_b
+    out["state_mean"][:b_eff] = state_mean_b
+    out["pca_mean"][:b_eff] = pca_mean_b
+
+    state_scores = crps_components["state_scores"]
+    if state_scores.shape[0] > 0:
+        state_dim_scores = state_scores[:, 0, :].transpose(0, 1).to(torch.float32)
+        out["state_dims"][:b_eff, :state_dim_scores.shape[1]] = state_dim_scores
+
+    pca_scores = crps_components["pca_scores"]
+    if pca_scores.shape[0] > 0:
+        pca_dim_scores = pca_scores[:, 0, :].transpose(0, 1).to(torch.float32)
+        out["pca_dims"][:b_eff, :pca_dim_scores.shape[1]] = pca_dim_scores
+
+    return out if return_details else out["overall"]
+
+
+def _init_running_test_batch_metrics() -> Dict[str, List[torch.Tensor]]:
+    return {
+        "rmse": [],
+        "rms": [],
+        "rmv": [],
+        "spread_error_ratio": [],
+        "spread_error_ratio_minus_1": [],
+        "es1": [],
+        "truth_norm": [],
+        "pf_crps": [],
+        "pf_crps_state_mean": [],
+        "pf_crps_pca_mean": [],
+        "pf_crps_state_dims": [],
+        "pf_crps_pca_dims": [],
+    }
+
+
+def _record_running_test_batch_step(
+    metric_store: Dict[str, List[torch.Tensor]],
+    ens_step: torch.Tensor,
+    true_step: torch.Tensor,
+    pf_crps_breakdown: Optional[Dict[str, torch.Tensor]] = None,
+) -> None:
+    """Record one step of test metrics without storing the full trajectory ensemble."""
+    if ens_step.ndim != 3 or true_step.ndim != 2:
+        raise ValueError(
+            f"Expected ens_step [B,N,D] and true_step [B,D], got "
+            f"{tuple(ens_step.shape)} and {tuple(true_step.shape)}"
+        )
+
+    step_ens = ens_step.unsqueeze(0)
+    step_truth = true_step.unsqueeze(0)
+    finite_rows = torch.isfinite(ens_step).all(dim=(1, 2))
+    if not finite_rows.any():
+        nan_vec = torch.full((ens_step.shape[0],), float("nan"), device=ens_step.device, dtype=torch.float32)
+        rms_step = torch.sqrt(torch.mean(true_step ** 2, dim=-1))
+        truth_norm_step = torch.norm(true_step, p=2, dim=-1)
+
+        metric_store["rmse"].append(nan_vec)
+        metric_store["rms"].append(rms_step.to(torch.float32))
+        metric_store["rmv"].append(nan_vec)
+        metric_store["spread_error_ratio"].append(nan_vec)
+        metric_store["spread_error_ratio_minus_1"].append(nan_vec)
+        metric_store["es1"].append(nan_vec)
+        metric_store["truth_norm"].append(truth_norm_step.to(torch.float32))
+
+        if pf_crps_breakdown is not None:
+            metric_store["pf_crps"].append(pf_crps_breakdown["overall"].to(torch.float32))
+            metric_store["pf_crps_state_mean"].append(pf_crps_breakdown["state_mean"].to(torch.float32))
+            metric_store["pf_crps_pca_mean"].append(pf_crps_breakdown["pca_mean"].to(torch.float32))
+            metric_store["pf_crps_state_dims"].append(pf_crps_breakdown["state_dims"].to(torch.float32))
+            metric_store["pf_crps_pca_dims"].append(pf_crps_breakdown["pca_dims"].to(torch.float32))
+        return
+
+    ens_mean = torch.mean(ens_step, dim=1)
+    rmse_step = torch.sqrt(torch.mean((ens_mean - true_step) ** 2, dim=-1))
+    rms_step = torch.sqrt(torch.mean(true_step ** 2, dim=-1))
+    rmv_step = compute_root_mean_variance(step_ens)[0]
+    ser_step = compute_spread_error_ratio(step_ens, step_truth)[0]
+    ser_minus_1_step = compute_spread_error_ratio_minus_1(step_ens, step_truth)[0]
+    es1_step = _compute_energy_score_step(ens_step=ens_step, true_step=true_step, norm_p=1).to(torch.float32)
+    truth_norm_step = torch.norm(true_step, p=2, dim=-1)
+
+    metric_store["rmse"].append(rmse_step.to(torch.float32))
+    metric_store["rms"].append(rms_step.to(torch.float32))
+    metric_store["rmv"].append(rmv_step.to(torch.float32))
+    metric_store["spread_error_ratio"].append(ser_step.to(torch.float32))
+    metric_store["spread_error_ratio_minus_1"].append(ser_minus_1_step.to(torch.float32))
+    metric_store["es1"].append(es1_step)
+    metric_store["truth_norm"].append(truth_norm_step.to(torch.float32))
+
+    if pf_crps_breakdown is not None:
+        metric_store["pf_crps"].append(pf_crps_breakdown["overall"].to(torch.float32))
+        metric_store["pf_crps_state_mean"].append(pf_crps_breakdown["state_mean"].to(torch.float32))
+        metric_store["pf_crps_pca_mean"].append(pf_crps_breakdown["pca_mean"].to(torch.float32))
+        metric_store["pf_crps_state_dims"].append(pf_crps_breakdown["state_dims"].to(torch.float32))
+        metric_store["pf_crps_pca_dims"].append(pf_crps_breakdown["pca_dims"].to(torch.float32))
+
+
+def _finalize_running_test_batch_metrics(
+    metric_store: Dict[str, List[torch.Tensor]],
+    batch_size: int,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Convert stepwise metric lists back into the trajectory-level summaries used by test code."""
+    def _stack_steps(key: str) -> torch.Tensor:
+        values = metric_store.get(key, [])
+        if len(values) == 0:
+            return torch.empty((0, batch_size), device=device, dtype=torch.float32)
+        return torch.stack(values, dim=0).to(device=device, dtype=torch.float32)
+
+    def _stack_steps_with_tail(key: str, tail_shape: Tuple[int, ...]) -> torch.Tensor:
+        values = metric_store.get(key, [])
+        if len(values) == 0:
+            return torch.empty((0, batch_size, *tail_shape), device=device, dtype=torch.float32)
+        return torch.stack(values, dim=0).to(device=device, dtype=torch.float32)
+
+    rmse_steps = _stack_steps("rmse")
+    rms_steps = _stack_steps("rms")
+    rmv_steps = _stack_steps("rmv")
+    ser_steps = _stack_steps("spread_error_ratio")
+    ser_minus_1_steps = _stack_steps("spread_error_ratio_minus_1")
+    es1_steps = _stack_steps("es1")
+    truth_norm_steps = _stack_steps("truth_norm")
+
+    rrmse_step_vals, rrmse_val = _compute_relative_metric_variants(
+        step_metric=rmse_steps,
+        step_reference=rms_steps,
+    )
+    res1_step_vals, res1_val = _compute_relative_metric_variants(
+        step_metric=es1_steps,
+        step_reference=truth_norm_steps,
+    )
+
+    pf_crps_steps = _stack_steps("pf_crps")
+    if pf_crps_steps.shape[0] > 0:
+        pf_crps_breakdown = _empty_pf_crps_breakdown(
+            batch_size=batch_size,
+            device=device,
+            max_state_dims=PF_CRPS_STATE_DIMS,
+            max_pca_dims=PF_CRPS_PCA_DIMS,
+        )
+        pf_crps_breakdown["overall"] = torch.nanmean(pf_crps_steps, dim=0)
+        pf_crps_breakdown["state_mean"] = torch.nanmean(_stack_steps("pf_crps_state_mean"), dim=0)
+        pf_crps_breakdown["pca_mean"] = torch.nanmean(_stack_steps("pf_crps_pca_mean"), dim=0)
+        pf_crps_breakdown["state_dims"] = torch.nanmean(
+            _stack_steps_with_tail("pf_crps_state_dims", (PF_CRPS_STATE_DIMS,)),
+            dim=0,
+        )
+        pf_crps_breakdown["pca_dims"] = torch.nanmean(
+            _stack_steps_with_tail("pf_crps_pca_dims", (PF_CRPS_PCA_DIMS,)),
+            dim=0,
+        )
+    else:
+        pf_crps_breakdown = _empty_pf_crps_breakdown(
+            batch_size=batch_size,
+            device=device,
+            max_state_dims=PF_CRPS_STATE_DIMS,
+            max_pca_dims=PF_CRPS_PCA_DIMS,
+        )
+
+    pf_rcrps_val = _safe_relative_ratio(
+        pf_crps_breakdown["overall"],
+        torch.mean(truth_norm_steps, dim=0),
+    )
+
+    return {
+        "rmse_steps": rmse_steps,
+        "rms_steps": rms_steps,
+        "rrmse_step_vals": rrmse_step_vals,
+        "rrmse_val": rrmse_val,
+        "rmse_val": torch.mean(rmse_steps, dim=0),
+        "rms_val": torch.mean(rms_steps, dim=0),
+        "rmv_val": torch.nanmean(rmv_steps, dim=0),
+        "spread_error_ratio_val": torch.nanmean(ser_steps, dim=0),
+        "spread_error_ratio_minus_1_val": torch.nanmean(ser_minus_1_steps, dim=0),
+        "es1_steps": es1_steps,
+        "es1_val": torch.mean(es1_steps, dim=0),
+        "truth_norm_steps": truth_norm_steps,
+        "res1_step_vals": res1_step_vals,
+        "res1_val": res1_val,
+        "pf_crps_breakdown": pf_crps_breakdown,
+        "pf_rcrps_val": pf_rcrps_val,
+    }
+
+
 def _get_pf_cached_range_int(entry: Dict[str, Any], mode: str, range_idx: int, bidx: int, pad_int: int = 5) -> Optional[torch.Tensor]:
     key_int = f"{mode}_range_int"
     if key_int in entry:
@@ -2854,6 +3191,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     cached_pf_data = None
     if args.pf_verification:
         cached_pf_data = _load_cached_pf_avg_results(loader=loader, args=args)
+    use_running_metrics = bool(getattr(args, "running_loss", True))
 
     # Aggregated results
     all_results = {
@@ -2934,7 +3272,18 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 ens_v_a[~active_mask] = torch.nan  # keep shapes; mark inactive with NaN
 
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
-            ens_list = [ens_v_a]
+            need_trajectory_cache = (not use_running_metrics) or plot_figures
+            running_metric_store = _init_running_test_batch_metrics() if use_running_metrics else None
+            pf_metric_cache = None
+            if args.pf_verification and use_running_metrics:
+                pf_metric_cache = _prepare_pf_running_metric_cache(
+                    pf_entry=cached_pf_data[batch_ind],
+                    device=args.device,
+                    ens_dtype=ens_v_a.dtype,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                )
+
+            ens_list = [ens_v_a] if need_trajectory_cache else None
             if plot_prior_enabled:
                 ens_f_list = [torch.full_like(ens_v_a, float('nan'))]  # no prior at t=0
             loc_records = []
@@ -2968,13 +3317,49 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
             snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
             all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
 
+            if use_running_metrics:
+                _record_running_test_batch_step(
+                    metric_store=running_metric_store,
+                    ens_step=ens_v_a,
+                    true_step=batch_v[0],
+                )
+                rank_stats_step0 = compute_ensemble_rank_histogram(
+                    ens_states=ens_v_a.unsqueeze(0),
+                    true_states=batch_v[0].unsqueeze(0),
+                    projection_directions=rank_projection_dirs.to(device=ens_v_a.device, dtype=ens_v_a.dtype),
+                    num_projections=rank_num_projections,
+                    tie_break=rank_tie_break,
+                    seed=rank_projection_seed + batch_ind * max(1, len(batch_v)),
+                )
+                rank_counts_total += rank_stats_step0["counts"].to(dtype=torch.int64)
+                rank_total_samples += int(rank_stats_step0["total_samples"])
+
             # Time loop
             for i in range(len(batch_v) - 1):
                 # Early bail: if no active trajectories remain, append a NaN step to keep time length and continue
                 if not active_mask.any():
-                    ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if need_trajectory_cache:
+                        ens_list.append(torch.full_like(ens_v_a, float('nan')))
                     if plot_prior_enabled:
                         ens_f_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if use_running_metrics:
+                        nan_ens_step = torch.full_like(ens_v_a, float('nan'))
+                        pf_crps_step = None
+                        if args.pf_verification:
+                            pf_crps_step = _compute_dynamic_quantile_crps_from_pf_post_step(
+                                ens_step=nan_ens_step,
+                                pf_metric_cache=pf_metric_cache if pf_metric_cache is not None else {},
+                                step_idx=i,
+                                max_state_dims=PF_CRPS_STATE_DIMS,
+                                max_pca_dims=PF_CRPS_PCA_DIMS,
+                                return_details=True,
+                            )
+                        _record_running_test_batch_step(
+                            metric_store=running_metric_store,
+                            ens_step=nan_ens_step,
+                            true_step=batch_v[i + 1],
+                            pf_crps_breakdown=pf_crps_step,
+                        )
                     continue  # keep T length for plotting/metrics
 
                 # -------- Forecast step (not timed here) --------
@@ -3038,7 +3423,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
                 # Move to next analysis state
                 ens_v_a = ens_v_a_next
-                ens_list.append(ens_v_a)
+                if need_trajectory_cache:
+                    ens_list.append(ens_v_a)
 
                 # PF verification: compute only for current active subset, scatter back
                 if args.pf_verification and idx_active.numel() > 0:
@@ -3086,63 +3472,115 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     cov_diff_list.append(cov_diff_full)
                     rcov_diff_list.append(rcov_diff_full)
 
-            # Stack ensembles over time: [T, B, N, d]
-            ens_tensor = torch.stack(ens_list)
-            ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
-            
-            # Metrics (NaNs are handled later by masks)
-            rmse_steps = torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2))
-            rms_steps = torch.sqrt(torch.mean((batch_v) ** 2, dim=2))
-            rrmse_step_vals, rrmse_val = _compute_relative_metric_variants(
-                step_metric=rmse_steps,
-                step_reference=rms_steps,
-            )
+                if use_running_metrics:
+                    pf_crps_step = None
+                    if args.pf_verification:
+                        pf_crps_step = _compute_dynamic_quantile_crps_from_pf_post_step(
+                            ens_step=ens_v_a,
+                            pf_metric_cache=pf_metric_cache if pf_metric_cache is not None else {},
+                            step_idx=i,
+                            max_state_dims=PF_CRPS_STATE_DIMS,
+                            max_pca_dims=PF_CRPS_PCA_DIMS,
+                            return_details=True,
+                        )
+                    _record_running_test_batch_step(
+                        metric_store=running_metric_store,
+                        ens_step=ens_v_a,
+                        true_step=batch_v[i + 1],
+                        pf_crps_breakdown=pf_crps_step,
+                    )
+                    rank_stats_step = compute_ensemble_rank_histogram(
+                        ens_states=ens_v_a.unsqueeze(0),
+                        true_states=batch_v[i + 1].unsqueeze(0),
+                        projection_directions=rank_projection_dirs.to(device=ens_v_a.device, dtype=ens_v_a.dtype),
+                        num_projections=rank_num_projections,
+                        tie_break=rank_tie_break,
+                        seed=rank_projection_seed + batch_ind * max(1, len(batch_v)) + (i + 1),
+                    )
+                    rank_counts_total += rank_stats_step["counts"].to(dtype=torch.int64)
+                    rank_total_samples += int(rank_stats_step["total_samples"])
 
-            es1_steps = compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1)
-            es1_val = torch.mean(es1_steps, dim=0)
-            truth_norm_steps = torch.norm(batch_v, p=2, dim=2)
-            res1_step_vals, res1_val = _compute_relative_metric_variants(
-                step_metric=es1_steps,
-                step_reference=truth_norm_steps,
-            )
-            if args.pf_verification:
-                pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
-                    ens_tensor=ens_tensor,
-                    pf_entry=cached_pf_data[batch_ind],
-                    max_state_dims=PF_CRPS_STATE_DIMS,
-                    max_pca_dims=PF_CRPS_PCA_DIMS,
-                    return_details=True,
-                )
-                pf_crps_val = pf_crps_breakdown['overall']
-                pf_rcrps_val = _safe_relative_ratio(pf_crps_val, torch.mean(truth_norm_steps, dim=0))
-            else:
-                pf_crps_breakdown = _empty_pf_crps_breakdown(
+            # Stack ensembles over time: [T, B, N, d]
+            ens_tensor = torch.stack(ens_list) if need_trajectory_cache else None
+            ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
+
+            if use_running_metrics:
+                running_batch_metrics = _finalize_running_test_batch_metrics(
+                    metric_store=running_metric_store,
                     batch_size=B,
                     device=args.device,
-                    max_state_dims=PF_CRPS_STATE_DIMS,
-                    max_pca_dims=PF_CRPS_PCA_DIMS,
                 )
-                pf_crps_val = pf_crps_breakdown['overall']
-                pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
-            rmse_val = torch.mean(rmse_steps, dim=0)
-            rms_val = torch.mean(rms_steps, dim=0)
-            rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
-            spread_error_ratio_minus_1_val = torch.nanmean(
-                compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
-                dim=0,
-            )
+                rmse_steps = running_batch_metrics["rmse_steps"]
+                rms_steps = running_batch_metrics["rms_steps"]
+                rrmse_step_vals = running_batch_metrics["rrmse_step_vals"]
+                rrmse_val = running_batch_metrics["rrmse_val"]
+                es1_steps = running_batch_metrics["es1_steps"]
+                es1_val = running_batch_metrics["es1_val"]
+                truth_norm_steps = running_batch_metrics["truth_norm_steps"]
+                res1_step_vals = running_batch_metrics["res1_step_vals"]
+                res1_val = running_batch_metrics["res1_val"]
+                pf_crps_breakdown = running_batch_metrics["pf_crps_breakdown"]
+                pf_crps_val = pf_crps_breakdown["overall"]
+                pf_rcrps_val = running_batch_metrics["pf_rcrps_val"]
+                rmse_val = running_batch_metrics["rmse_val"]
+                rms_val = running_batch_metrics["rms_val"]
+                rmv_val = running_batch_metrics["rmv_val"]
+                spread_error_ratio_val = running_batch_metrics["spread_error_ratio_val"]
+                spread_error_ratio_minus_1_val = running_batch_metrics["spread_error_ratio_minus_1_val"]
+            else:
+                # Metrics (NaNs are handled later by masks)
+                rmse_steps = torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2))
+                rms_steps = torch.sqrt(torch.mean((batch_v) ** 2, dim=2))
+                rrmse_step_vals, rrmse_val = _compute_relative_metric_variants(
+                    step_metric=rmse_steps,
+                    step_reference=rms_steps,
+                )
 
-            rank_stats_batch = compute_ensemble_rank_histogram(
-                ens_states=ens_tensor,
-                true_states=batch_v,
-                projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
-                num_projections=rank_num_projections,
-                tie_break=rank_tie_break,
-                seed=rank_projection_seed + batch_ind,
-            )
-            rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
-            rank_total_samples += int(rank_stats_batch["total_samples"])
+                es1_steps = compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1)
+                es1_val = torch.mean(es1_steps, dim=0)
+                truth_norm_steps = torch.norm(batch_v, p=2, dim=2)
+                res1_step_vals, res1_val = _compute_relative_metric_variants(
+                    step_metric=es1_steps,
+                    step_reference=truth_norm_steps,
+                )
+                if args.pf_verification:
+                    pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
+                        ens_tensor=ens_tensor,
+                        pf_entry=cached_pf_data[batch_ind],
+                        max_state_dims=PF_CRPS_STATE_DIMS,
+                        max_pca_dims=PF_CRPS_PCA_DIMS,
+                        return_details=True,
+                    )
+                    pf_crps_val = pf_crps_breakdown['overall']
+                    pf_rcrps_val = _safe_relative_ratio(pf_crps_val, torch.mean(truth_norm_steps, dim=0))
+                else:
+                    pf_crps_breakdown = _empty_pf_crps_breakdown(
+                        batch_size=B,
+                        device=args.device,
+                        max_state_dims=PF_CRPS_STATE_DIMS,
+                        max_pca_dims=PF_CRPS_PCA_DIMS,
+                    )
+                    pf_crps_val = pf_crps_breakdown['overall']
+                    pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
+                rmse_val = torch.mean(rmse_steps, dim=0)
+                rms_val = torch.mean(rms_steps, dim=0)
+                rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
+                spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+                spread_error_ratio_minus_1_val = torch.nanmean(
+                    compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
+                    dim=0,
+                )
+
+                rank_stats_batch = compute_ensemble_rank_histogram(
+                    ens_states=ens_tensor,
+                    true_states=batch_v,
+                    projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
+                    num_projections=rank_num_projections,
+                    tie_break=rank_tie_break,
+                    seed=rank_projection_seed + batch_ind,
+                )
+                rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
+                rank_total_samples += int(rank_stats_batch["total_samples"])
             
             # Aggregate metrics
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
@@ -3215,7 +3653,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                             compare_plot = pf_post_means
                             ens_plot = ens_plot[1:]
                             obs_plot = obs_plot[1:]
-                            step_offset = 0
+                            # After dropping the t=0 initialization frame, keep displayed
+                            # step labels aligned with the original 1-based trajectory steps.
+                            step_offset = 1
                         else:
                             step_offset = 0
 
@@ -3290,7 +3730,9 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                 compare_plot = pf_post_means
                 ens_plot = ens_plot[1:]
                 obs_plot = obs_plot[1:]
-                step_offset = 0
+                # After dropping the t=0 initialization frame, keep displayed
+                # step labels aligned with the original 1-based trajectory steps.
+                step_offset = 1
             else:
                 step_offset = 0
 
@@ -3316,7 +3758,7 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     observations=observations[1:],
                     fig_name=fig_name + "_prior",
                     save_pdf=save_pdf,
-                    step_offset=0,
+                    step_offset=1,
                     ens_color='tab:blue',
                     ring_plot_history=False,
                     enable_highdim_slices=True,
@@ -3668,6 +4110,7 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     cached_pf_data = None
     if args.pf_verification:
         cached_pf_data = _load_cached_pf_avg_results(loader=loader, args=args)
+    use_running_metrics = bool(getattr(args, "running_loss", True))
 
     # Aggregated results
     all_results = {
@@ -3745,7 +4188,18 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 # Fill NaNs for the deactivated ones to keep shapes consistent
                 ens_v_a[~active_mask] = torch.nan
 
-            ens_list = [ens_v_a]
+            need_trajectory_cache = (not use_running_metrics) or plot_figures
+            running_metric_store = _init_running_test_batch_metrics() if use_running_metrics else None
+            pf_metric_cache = None
+            if args.pf_verification and use_running_metrics:
+                pf_metric_cache = _prepare_pf_running_metric_cache(
+                    pf_entry=cached_pf_data[batch_ind],
+                    device=args.device,
+                    ens_dtype=ens_v_a.dtype,
+                    max_pca_dims=PF_CRPS_PCA_DIMS,
+                )
+
+            ens_list = [ens_v_a] if need_trajectory_cache else None
             if plot_prior_enabled:
                 ens_f_list = [torch.full_like(ens_v_a, float('nan'))]  # no prior at t=0
             cov_diff_list, rcov_diff_list, pf_rmse_list = [], [], []
@@ -3779,13 +4233,49 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
             snr_var_batch = _compute_traj_snr_var_from_hvalues(h_tensor, args.sigma_y)
             all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
 
+            if use_running_metrics:
+                _record_running_test_batch_step(
+                    metric_store=running_metric_store,
+                    ens_step=ens_v_a,
+                    true_step=batch_v[0],
+                )
+                rank_stats_step0 = compute_ensemble_rank_histogram(
+                    ens_states=ens_v_a.unsqueeze(0),
+                    true_states=batch_v[0].unsqueeze(0),
+                    projection_directions=rank_projection_dirs.to(device=ens_v_a.device, dtype=ens_v_a.dtype),
+                    num_projections=rank_num_projections,
+                    tie_break=rank_tie_break,
+                    seed=rank_projection_seed + batch_ind * max(1, len(batch_v)),
+                )
+                rank_counts_total += rank_stats_step0["counts"].to(dtype=torch.int64)
+                rank_total_samples += int(rank_stats_step0["total_samples"])
+
             # Time loop
             for i in tqdm(range(len(batch_v) - 1), desc="Processing", unit="item"):
                 # Early exit if no active trajectories remain
                 if not active_mask.any():
-                    ens_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if need_trajectory_cache:
+                        ens_list.append(torch.full_like(ens_v_a, float('nan')))
                     if plot_prior_enabled:
                         ens_f_list.append(torch.full_like(ens_v_a, float('nan')))
+                    if use_running_metrics:
+                        nan_ens_step = torch.full_like(ens_v_a, float('nan'))
+                        pf_crps_step = None
+                        if args.pf_verification:
+                            pf_crps_step = _compute_dynamic_quantile_crps_from_pf_post_step(
+                                ens_step=nan_ens_step,
+                                pf_metric_cache=pf_metric_cache if pf_metric_cache is not None else {},
+                                step_idx=i,
+                                max_state_dims=PF_CRPS_STATE_DIMS,
+                                max_pca_dims=PF_CRPS_PCA_DIMS,
+                                return_details=True,
+                            )
+                        _record_running_test_batch_step(
+                            metric_store=running_metric_store,
+                            ens_step=nan_ens_step,
+                            true_step=batch_v[i + 1],
+                            pf_crps_breakdown=pf_crps_step,
+                        )
                     # Record a zero-duration placeholder for clarity? No: skip to avoid bias
                     continue
 
@@ -3876,7 +4366,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 ens_v_a = ens_v_a_next
 
                 # Append for metrics (inactive remain NaN)
-                ens_list.append(ens_v_a)
+                if need_trajectory_cache:
+                    ens_list.append(ens_v_a)
 
                 # PF verification (compute only on currently active trajectories)
                 if args.pf_verification and idx_active.numel() > 0:
@@ -3910,6 +4401,34 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     cov_diff_list.append(cov_diff_full)
                     rcov_diff_list.append(rcov_diff_full)
 
+                if use_running_metrics:
+                    pf_crps_step = None
+                    if args.pf_verification:
+                        pf_crps_step = _compute_dynamic_quantile_crps_from_pf_post_step(
+                            ens_step=ens_v_a,
+                            pf_metric_cache=pf_metric_cache if pf_metric_cache is not None else {},
+                            step_idx=i,
+                            max_state_dims=PF_CRPS_STATE_DIMS,
+                            max_pca_dims=PF_CRPS_PCA_DIMS,
+                            return_details=True,
+                        )
+                    _record_running_test_batch_step(
+                        metric_store=running_metric_store,
+                        ens_step=ens_v_a,
+                        true_step=batch_v[i + 1],
+                        pf_crps_breakdown=pf_crps_step,
+                    )
+                    rank_stats_step = compute_ensemble_rank_histogram(
+                        ens_states=ens_v_a.unsqueeze(0),
+                        true_states=batch_v[i + 1].unsqueeze(0),
+                        projection_directions=rank_projection_dirs.to(device=ens_v_a.device, dtype=ens_v_a.dtype),
+                        num_projections=rank_num_projections,
+                        tie_break=rank_tie_break,
+                        seed=rank_projection_seed + batch_ind * max(1, len(batch_v)) + (i + 1),
+                    )
+                    rank_counts_total += rank_stats_step["counts"].to(dtype=torch.int64)
+                    rank_total_samples += int(rank_stats_step["total_samples"])
+
                 # ---- NEW: stop timing and record ----
                 t1 = time.perf_counter()
                 duration = t1 - t0  # seconds
@@ -3921,61 +4440,85 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                 # If no active, we skip weighting to avoid bias
 
             # Stack ensembles over time: [T, B, N, d]
-            ens_tensor = torch.stack(ens_list)
+            ens_tensor = torch.stack(ens_list) if need_trajectory_cache else None
             ens_prior_tensor = torch.stack(ens_f_list) if plot_prior_enabled else None
 
-            rmse_steps = torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2))
-            rms_steps = torch.sqrt(torch.mean((batch_v) ** 2, dim=2))
-            rrmse_step_vals, rrmse_val = _compute_relative_metric_variants(
-                step_metric=rmse_steps,
-                step_reference=rms_steps,
-            )
-
-            es1_steps = compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1)
-            es1_val = torch.mean(es1_steps, dim=0)
-            truth_norm_steps = torch.norm(batch_v, p=2, dim=2)
-            res1_step_vals, res1_val = _compute_relative_metric_variants(
-                step_metric=es1_steps,
-                step_reference=truth_norm_steps,
-            )
-            if args.pf_verification:
-                pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
-                    ens_tensor=ens_tensor,
-                    pf_entry=cached_pf_data[batch_ind],
-                    max_state_dims=PF_CRPS_STATE_DIMS,
-                    max_pca_dims=PF_CRPS_PCA_DIMS,
-                    return_details=True,
-                )
-                pf_crps_val = pf_crps_breakdown['overall']
-                pf_rcrps_val = _safe_relative_ratio(pf_crps_val, torch.mean(truth_norm_steps, dim=0))
-            else:
-                pf_crps_breakdown = _empty_pf_crps_breakdown(
+            if use_running_metrics:
+                running_batch_metrics = _finalize_running_test_batch_metrics(
+                    metric_store=running_metric_store,
                     batch_size=B,
                     device=args.device,
-                    max_state_dims=PF_CRPS_STATE_DIMS,
-                    max_pca_dims=PF_CRPS_PCA_DIMS,
                 )
-                pf_crps_val = pf_crps_breakdown['overall']
-                pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
-            rmse_val = torch.mean(rmse_steps, dim=0)
-            rms_val = torch.mean(rms_steps, dim=0)
-            rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
-            spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
-            spread_error_ratio_minus_1_val = torch.nanmean(
-                compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
-                dim=0,
-            )
+                rmse_steps = running_batch_metrics["rmse_steps"]
+                rms_steps = running_batch_metrics["rms_steps"]
+                rrmse_step_vals = running_batch_metrics["rrmse_step_vals"]
+                rrmse_val = running_batch_metrics["rrmse_val"]
+                es1_steps = running_batch_metrics["es1_steps"]
+                es1_val = running_batch_metrics["es1_val"]
+                truth_norm_steps = running_batch_metrics["truth_norm_steps"]
+                res1_step_vals = running_batch_metrics["res1_step_vals"]
+                res1_val = running_batch_metrics["res1_val"]
+                pf_crps_breakdown = running_batch_metrics["pf_crps_breakdown"]
+                pf_crps_val = pf_crps_breakdown["overall"]
+                pf_rcrps_val = running_batch_metrics["pf_rcrps_val"]
+                rmse_val = running_batch_metrics["rmse_val"]
+                rms_val = running_batch_metrics["rms_val"]
+                rmv_val = running_batch_metrics["rmv_val"]
+                spread_error_ratio_val = running_batch_metrics["spread_error_ratio_val"]
+                spread_error_ratio_minus_1_val = running_batch_metrics["spread_error_ratio_minus_1_val"]
+            else:
+                rmse_steps = torch.sqrt(torch.mean((ens_tensor.mean(dim=2) - batch_v) ** 2, dim=2))
+                rms_steps = torch.sqrt(torch.mean((batch_v) ** 2, dim=2))
+                rrmse_step_vals, rrmse_val = _compute_relative_metric_variants(
+                    step_metric=rmse_steps,
+                    step_reference=rms_steps,
+                )
 
-            rank_stats_batch = compute_ensemble_rank_histogram(
-                ens_states=ens_tensor,
-                true_states=batch_v,
-                projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
-                num_projections=rank_num_projections,
-                tie_break=rank_tie_break,
-                seed=rank_projection_seed + batch_ind,
-            )
-            rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
-            rank_total_samples += int(rank_stats_batch["total_samples"])
+                es1_steps = compute_es(ens_states=ens_tensor, true_states=batch_v, norm_p=1)
+                es1_val = torch.mean(es1_steps, dim=0)
+                truth_norm_steps = torch.norm(batch_v, p=2, dim=2)
+                res1_step_vals, res1_val = _compute_relative_metric_variants(
+                    step_metric=es1_steps,
+                    step_reference=truth_norm_steps,
+                )
+                if args.pf_verification:
+                    pf_crps_breakdown = _compute_dynamic_quantile_crps_from_pf_post(
+                        ens_tensor=ens_tensor,
+                        pf_entry=cached_pf_data[batch_ind],
+                        max_state_dims=PF_CRPS_STATE_DIMS,
+                        max_pca_dims=PF_CRPS_PCA_DIMS,
+                        return_details=True,
+                    )
+                    pf_crps_val = pf_crps_breakdown['overall']
+                    pf_rcrps_val = _safe_relative_ratio(pf_crps_val, torch.mean(truth_norm_steps, dim=0))
+                else:
+                    pf_crps_breakdown = _empty_pf_crps_breakdown(
+                        batch_size=B,
+                        device=args.device,
+                        max_state_dims=PF_CRPS_STATE_DIMS,
+                        max_pca_dims=PF_CRPS_PCA_DIMS,
+                    )
+                    pf_crps_val = pf_crps_breakdown['overall']
+                    pf_rcrps_val = torch.full((B,), float('nan'), device=args.device)
+                rmse_val = torch.mean(rmse_steps, dim=0)
+                rms_val = torch.mean(rms_steps, dim=0)
+                rmv_val = torch.nanmean(compute_root_mean_variance(ens_tensor), dim=0)
+                spread_error_ratio_val = torch.nanmean(compute_spread_error_ratio(ens_tensor, batch_v), dim=0)
+                spread_error_ratio_minus_1_val = torch.nanmean(
+                    compute_spread_error_ratio_minus_1(ens_tensor, batch_v),
+                    dim=0,
+                )
+
+                rank_stats_batch = compute_ensemble_rank_histogram(
+                    ens_states=ens_tensor,
+                    true_states=batch_v,
+                    projection_directions=rank_projection_dirs.to(device=ens_tensor.device, dtype=ens_tensor.dtype),
+                    num_projections=rank_num_projections,
+                    tie_break=rank_tie_break,
+                    seed=rank_projection_seed + batch_ind,
+                )
+                rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
+                rank_total_samples += int(rank_stats_batch["total_samples"])
 
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
