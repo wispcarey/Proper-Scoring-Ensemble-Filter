@@ -8,7 +8,7 @@
 # bash submit_grid_search_benchmark.sh
 #
 # Optional environment overrides:
-# TIME_LIMIT=2-00:00:00
+# DEFAULT_TIME_LIMIT=2-00:00:00
 # ENSEMBLE_SIZES="5 10 15 20 40 60 100"
 # GRID_SEARCH_NUM_SEEDS=4
 # SEED=42
@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="$SCRIPT_DIR/slurm_grid_search_benchmark.sh"
 
-TIME_LIMIT="${TIME_LIMIT:-2-00:00:00}"
+DEFAULT_TIME_LIMIT="${DEFAULT_TIME_LIMIT:-2-00:00:00}"
 ENSEMBLE_SIZES="${ENSEMBLE_SIZES:-5 10 15 20 40 60 100}"
 GRID_SEARCH_NUM_SEEDS="${GRID_SEARCH_NUM_SEEDS:-4}"
 SEED="${SEED:-42}"
@@ -40,6 +40,16 @@ validate_positive_int() {
 
 validate_positive_int "$GRID_SEARCH_NUM_SEEDS" "GRID_SEARCH_NUM_SEEDS"
 validate_positive_int "$SEED" "SEED"
+
+resolve_time_limit() {
+    local dataset="$1"
+    case "$dataset" in
+        lorenz63) echo "1-00:00:00" ;;
+        doubling1d) echo "0-18:00:00" ;;
+        lorenz96) echo "2-00:00:00" ;;
+        *) echo "$DEFAULT_TIME_LIMIT" ;;
+    esac
+}
 
 # Format per trial:
 # DATASET METHOD OBS_FN
@@ -79,14 +89,15 @@ for trial in "${TRIALS[@]}"; do
     fi
 
     job_name="gs-$(sanitize_token "$dataset")-$(sanitize_token "$method")-$(sanitize_token "$obs_fn")"
+    time_limit="$(resolve_time_limit "$dataset")"
 
     echo "Submitting: $job_name"
     echo "  DATASET=$dataset METHOD=$method OBS_FN=$obs_fn"
-    echo "  ENSEMBLE_SIZES=$ENSEMBLE_SIZES GRID_SEARCH_NUM_SEEDS=$GRID_SEARCH_NUM_SEEDS SEED=$SEED"
+    echo "  ENSEMBLE_SIZES=$ENSEMBLE_SIZES GRID_SEARCH_NUM_SEEDS=$GRID_SEARCH_NUM_SEEDS SEED=$SEED TIME_LIMIT=$time_limit"
 
     sbatch \
         -J "$job_name" \
-        --time="$TIME_LIMIT" \
+        --time="$time_limit" \
         --cpus-per-task="$CPUS_PER_TASK" \
         --export=ALL,DATASET="$dataset",METHOD="$method",OBS_FN="$obs_fn",ENSEMBLE_SIZES="$ENSEMBLE_SIZES",GRID_SEARCH_NUM_SEEDS="$GRID_SEARCH_NUM_SEEDS",SEED="$SEED",CPU_WORKERS="$CPU_WORKERS",ADAPTIVE_SIGMA_Y=true \
         "$SLURM_SCRIPT"
