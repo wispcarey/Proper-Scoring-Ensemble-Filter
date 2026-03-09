@@ -1,15 +1,18 @@
 import os
+import math
 import torch
-import torch.nn as nn
 import pandas as pd
 import numpy as np
 import time
-import hashlib
-import json
 
 from config.benchmark_gridsearch_info import get_benchmark_gridsearch_config
 from config.cli import get_parameters
-from utils import setup_optimizer_and_scheduler, load_checkpoint
+from grid_search_benchmark import (
+    _build_setting_signature,
+    _get_search_metric_info,
+    _make_setting_id,
+    _serialize_obs_inds,
+)
 from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 from train_test_utils import test_ClassicFilter, print_test_results
 
@@ -25,8 +28,51 @@ def _safe_int_or_none(value):
     return int(value)
 
 
-def _build_search_metric_label(args):
-    return "PF-SED" if getattr(args, "pf_verification", False) else "RES1-traj"
+TORCH_GRID_LOOKUP_COLUMNS = [
+    "dataset",
+    "method",
+    "N",
+    "sigma_y",
+    "obs_fn",
+    "obs_inds",
+    "obs_dim",
+    "obs_fn_out_dim",
+    "obs_fn_seed",
+    "obs_custom_fn_path",
+    "adaptive_sigma_y",
+    "no_localization",
+    "localization_fn",
+    "pf_verification",
+    "pf_verification_seed",
+    "pf_N",
+    "search_metric",
+    "grid_search_num_seeds",
+    "test_steps",
+    "test_traj_num",
+    "seed",
+    "test_random_seed",
+    "seed_obs",
+]
+TORCH_GRID_BOOL_COLUMNS = {
+    "adaptive_sigma_y",
+    "no_localization",
+    "pf_verification",
+}
+TORCH_GRID_INT_COLUMNS = {
+    "N",
+    "obs_dim",
+    "obs_fn_out_dim",
+    "obs_fn_seed",
+    "pf_verification_seed",
+    "pf_N",
+    "grid_search_num_seeds",
+    "test_steps",
+    "test_traj_num",
+    "seed",
+    "test_random_seed",
+    "seed_obs",
+}
+TORCH_GRID_FLOAT_COLUMNS = {"sigma_y"}
 
 
 def _build_torch_grid_signature(args):
@@ -36,40 +82,116 @@ def _build_torch_grid_signature(args):
         ensemble_size=args.N,
         force_no_localization=bool(getattr(args, "no_localization", False)),
     )
-    return {
-        "dataset": str(args.dataset),
-        "method": str(args.v),
-        "N": int(args.N),
-        "sigma_y": None if args.sigma_y is None else float(args.sigma_y),
-        "obs_fn": str(getattr(args, "obs_fn", "identity")),
-        "obs_inds": [] if getattr(args, "obs_inds", None) is None else [
-            int(v) for v in torch.as_tensor(args.obs_inds, dtype=torch.long).reshape(-1).tolist()
-        ],
-        "obs_dim": None if getattr(args, "obs_dim", None) is None else int(args.obs_dim),
-        "obs_fn_out_dim": None
-        if getattr(args, "obs_fn_out_dim", None) is None
-        else int(args.obs_fn_out_dim),
-        "obs_fn_seed": _safe_int_or_none(getattr(args, "obs_fn_seed", None)),
-        "obs_custom_fn_path": getattr(args, "obs_custom_fn_path", None),
-        "adaptive_sigma_y": bool(getattr(args, "adaptive_sigma_y", False)),
-        "no_localization": bool(grid_cfg.get("localization_fn") is None),
-        "localization_fn": grid_cfg.get("localization_fn"),
-        "pf_verification": bool(getattr(args, "pf_verification", False)),
-        "pf_verification_seed": _safe_int_or_none(getattr(args, "pf_verification_seed", None)),
-        "pf_N": None if getattr(args, "pf_N", None) is None else int(args.pf_N),
-        "search_metric": _build_search_metric_label(args),
-        "grid_search_num_seeds": int(getattr(args, "grid_search_num_seeds", 4)),
-        "test_steps": None if getattr(args, "test_steps", None) is None else int(args.test_steps),
-        "test_traj_num": None if getattr(args, "test_traj_num", None) is None else int(args.test_traj_num),
-        "seed": _safe_int_or_none(getattr(args, "seed", None)),
-        "test_random_seed": _safe_int_or_none(getattr(args, "test_random_seed", None)),
-        "seed_obs": _safe_int_or_none(getattr(args, "seed_obs", None)),
+    _, search_metric_label = _get_search_metric_info(args)
+    return _build_setting_signature(
+        args=args,
+        localization_fn=grid_cfg.get("localization_fn"),
+        search_metric_label=search_metric_label,
+        effective_no_localization=(grid_cfg.get("localization_fn") is None),
+    )
+
+
+def _csv_cell_is_missing(value):
+    if value is None:
+        return True
+    if pd.isna(value):
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"", "nan", "none"}:
+        return True
+    return False
+
+
+def _parse_csv_bool(value):
+    if _csv_cell_is_missing(value):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"Unsupported boolean value in torch-grid CSV: {value}")
+
+
+def _normalize_lookup_value(column, value):
+    if column == "obs_inds":
+        return _serialize_obs_inds(value)
+    if column in TORCH_GRID_BOOL_COLUMNS:
+        return None if value is None else bool(value)
+    if column in TORCH_GRID_INT_COLUMNS:
+        return _safe_int_or_none(value)
+    if column in TORCH_GRID_FLOAT_COLUMNS:
+        return None if value is None else float(value)
+    return None if value is None else str(value)
+
+
+def _row_matches_lookup_signature(row, lookup_values):
+    for column, expected in lookup_values.items():
+        if column not in row.index:
+            return False
+        actual = row[column]
+        if column == "obs_inds":
+            actual_norm = "" if _csv_cell_is_missing(actual) else str(actual).strip()
+            if actual_norm != expected:
+                return False
+            continue
+        if column in TORCH_GRID_BOOL_COLUMNS:
+            if _parse_csv_bool(actual) != expected:
+                return False
+            continue
+        if column in TORCH_GRID_INT_COLUMNS:
+            actual_int = None if _csv_cell_is_missing(actual) else _safe_int_or_none(actual)
+            if actual_int != expected:
+                return False
+            continue
+        if column in TORCH_GRID_FLOAT_COLUMNS:
+            actual_float = None if _csv_cell_is_missing(actual) else float(actual)
+            if actual_float is None or expected is None:
+                if actual_float != expected:
+                    return False
+            elif not math.isclose(actual_float, expected, rel_tol=0.0, abs_tol=1e-12):
+                return False
+            continue
+        actual_text = None if _csv_cell_is_missing(actual) else str(actual)
+        if actual_text != expected:
+            return False
+    return True
+
+
+def _find_matching_torch_grid_row(df, signature, setting_id):
+    missing_columns = [column for column in TORCH_GRID_LOOKUP_COLUMNS if column not in df.columns]
+    if missing_columns:
+        raise KeyError(
+            "Torch-grid CSV is missing required setting columns: "
+            + ", ".join(missing_columns)
+        )
+
+    lookup_values = {
+        column: _normalize_lookup_value(column, signature.get(column))
+        for column in TORCH_GRID_LOOKUP_COLUMNS
     }
+    mask = df.apply(lambda row: _row_matches_lookup_signature(row, lookup_values), axis=1)
+    matches = df.loc[mask].copy()
+    if matches.empty:
+        if "setting_id" in df.columns:
+            setting_id_matches = df[df["setting_id"].astype(str) == str(setting_id)].copy()
+            if not setting_id_matches.empty:
+                return setting_id_matches.iloc[0], "setting_id"
+        lookup_summary = ", ".join(
+            f"{column}={lookup_values[column]!r}" for column in TORCH_GRID_LOOKUP_COLUMNS
+        )
+        raise KeyError(
+            f"No torch grid-search row matched the current setting in CSV. "
+            f"Expected {{{lookup_summary}}} with setting_id={setting_id}."
+        )
 
+    if "setting_id" in matches.columns:
+        exact_matches = matches[matches["setting_id"].astype(str) == str(setting_id)]
+        if not exact_matches.empty:
+            return exact_matches.iloc[0], "settings+setting_id"
 
-def _make_setting_id(signature):
-    signature_json = json.dumps(signature, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha1(signature_json.encode("utf-8")).hexdigest()[:12]
+    return matches.iloc[0], "settings"
 
 def get_benchmarks(args, source='dapper'):
     """
@@ -106,20 +228,14 @@ def get_benchmarks(args, source='dapper'):
         signature = _build_torch_grid_signature(args)
         setting_id = _make_setting_id(signature)
         df = pd.read_csv(dataset_csv_path)
-        if "setting_id" not in df.columns:
-            raise KeyError(f"'setting_id' column is missing from {dataset_csv_path}.")
-
-        match = df[df["setting_id"].astype(str) == str(setting_id)]
-        if match.empty:
-            raise KeyError(
-                f"No torch grid-search row matched setting_id={setting_id} in {dataset_csv_path}."
-            )
-
-        row = match.iloc[0]
+        row, match_source = _find_matching_torch_grid_row(df=df, signature=signature, setting_id=setting_id)
         infl = row.get("best_infl", np.nan)
         loc_radius = row.get("best_loc_radius", np.nan)
 
-        print(f"Loading benchmarks from: {dataset_csv_path} (setting_id={setting_id})")
+        print(
+            f"Loading benchmarks from: {dataset_csv_path} "
+            f"(match={match_source}, setting_id={setting_id}, sigma_y={signature['sigma_y']})"
+        )
         return infl, loc_radius
 
     else:

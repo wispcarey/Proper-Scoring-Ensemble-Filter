@@ -2,6 +2,12 @@
 
 cd ..
 
+PYTHON_BIN="/home/bhchen/miniconda3/bin/python"
+
+# evaluate_benchmark.py now defaults to loading best infl/loc from
+# save/torch_grid_search/<dataset>.csv by matching the full experiment setting.
+# When --adaptive_sigma_y is enabled, the lookup uses the adapted sigma_y value.
+
 # Rossler
 # dataset="rossler"
 # sigma_y=1
@@ -33,7 +39,7 @@ dataset="lorenz63"
 sigma_y=2.0
 seed=42
 # methods=("EnKF" "ESRF" "iEnKS-PertObs") 
-methods=("EnKF" "ESRF") 
+methods=("EnKF" "ESRF" "iEnKS-PertObs" "iEnKS-Sqrt" "iEnKS-Order1") 
 obs_fns=("identity" "arctan")
 
 # --- Evaluation Loop ---
@@ -41,7 +47,7 @@ for obs_fn in "${obs_fns[@]}"; do
     for N in 10 15 20 40 60 100; do
         for method in "${methods[@]}"; do
             echo "Running evaluation for obs_fn=$obs_fn, N=$N and method=$method"
-            python evaluate_benchmark.py \
+            "$PYTHON_BIN" evaluate_benchmark.py \
                 --device cuda \
                 --dataset "$dataset" \
                 --N "$N" \
