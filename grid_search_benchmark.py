@@ -724,12 +724,18 @@ if __name__ == "__main__":
     grid_seed_values = _build_grid_seed_values(eval_args)
 
     os.makedirs(SAVE_ROOT, exist_ok=True)
-    if _csv_has_setting_id(dataset_csv_path, setting_id):
+    setting_exists = _csv_has_setting_id(dataset_csv_path, setting_id)
+    if setting_exists and not bool(getattr(eval_args, "grid_search_overwrite", False)):
         print(
             f"Skip grid search because the identical setting already exists in "
             f"{dataset_csv_path} (setting_id={setting_id})."
         )
         raise SystemExit(0)
+    if setting_exists and bool(getattr(eval_args, "grid_search_overwrite", False)):
+        print(
+            f"Overwrite existing grid search result for setting_id={setting_id} in "
+            f"{dataset_csv_path}."
+        )
 
     with redirect_output(
         save_output=not eval_args.normal_output,

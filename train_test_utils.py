@@ -4356,11 +4356,12 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                             coords_obs=coords_obs_runtime, localization_domain=loc_domain_runtime)
 
                     elif args.v.startswith('iEnKS'):
+                        ienks_radius = None if loc_radius is None else float(loc_radius)
                         E_smoothed_at_start, _ = ensemble_kalman_filter_analysis(
                             ens_v_f_active,
                             **common_enkf_args,
                             method=args.v,
-                            localization_radius=None,
+                            localization_radius=ienks_radius,
                             coords_state=coords_state_runtime,
                             coords_obs=coords_obs_runtime, 
                             localization_domain=loc_domain_runtime,

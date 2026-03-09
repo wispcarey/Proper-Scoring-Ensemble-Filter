@@ -12,23 +12,43 @@ LOW_DIM_SEARCH_SPECS_BY_N = {
 }
 
 L96_LOCAL_SEARCH_SPECS_BY_N = {
-    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.5, "loc_min": 0.001},
+    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
     20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 0.8, "loc_min": 0.001},
-    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 0.6, "loc_min": 0.001},
-    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 0.5, "loc_min": 0.001},
+    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
+}
+
+L96_IENKS_LOCAL_SEARCH_SPECS_BY_N = {
+    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
 }
 
 KS_LOCAL_SEARCH_SPECS_BY_N = {
-    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 4.0, "loc_min": 0.001},
-    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 4.0, "loc_min": 0.001},
-    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
-    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 1.5, "loc_min": 0.001},
-    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 1.2, "loc_min": 0.001},
-    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
+}
+
+KS_IENKS_LOCAL_SEARCH_SPECS_BY_N = {
+    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
+    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
+    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
 }
 
 
@@ -72,19 +92,19 @@ L96_METHOD_GRIDSEARCH_INFO = {
         "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
     },
     "iEnKS-PertObs": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(L96_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "iEnKS-Sqrt": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(L96_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "iEnKS-Order1": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(L96_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "LETKF": {
         "use_localization": True,
@@ -105,19 +125,19 @@ KS_METHOD_GRIDSEARCH_INFO = {
         "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
     },
     "iEnKS-PertObs": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "iEnKS-Sqrt": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "iEnKS-Order1": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
+        "use_localization": True,
+        "localization_fn": "GC",
+        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
     },
     "LETKF": {
         "use_localization": True,

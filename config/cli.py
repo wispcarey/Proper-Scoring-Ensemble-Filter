@@ -485,6 +485,9 @@ def get_parameters(extra_arg_adder=None):
     parser.add_argument('--grid_search_num_seeds', type=int, default=4,
                         help='Number of random seeds averaged for each benchmark grid-search parameter pair. '
                              'Seeds are generated as base --seed, --seed+1, ... and do not affect --pf_verification_seed.')
+    parser.add_argument('--grid_search_overwrite', action='store_true',
+                        help='Re-run benchmark grid search even if an identical setting_id already exists, '
+                             'overwriting the previous .pt result and CSV row.')
 
 
     # others

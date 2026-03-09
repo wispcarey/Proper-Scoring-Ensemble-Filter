@@ -65,6 +65,7 @@ ENSEMBLE_SIZES_RAW="${ENSEMBLE_SIZES:-5 10 15 20 40 60 100}"
 GRID_SEARCH_NUM_SEEDS="${GRID_SEARCH_NUM_SEEDS:-4}"
 CPU_WORKERS="${CPU_WORKERS:-64}"
 ADAPTIVE_SIGMA_Y="$(parse_bool "${ADAPTIVE_SIGMA_Y:-true}")"
+GRID_SEARCH_OVERWRITE="$(parse_bool "${GRID_SEARCH_OVERWRITE:-true}")"
 
 case "$DATASET" in
     lorenz63|doubling1d)
@@ -126,6 +127,7 @@ echo "USE_PF_VERIFICATION: $USE_PF_VERIFICATION"
 echo "PF_N: $PF_N"
 echo "CPU_WORKERS: $CPU_WORKERS"
 echo "GRID_SEARCH_NUM_SEEDS: $GRID_SEARCH_NUM_SEEDS"
+echo "GRID_SEARCH_OVERWRITE: $GRID_SEARCH_OVERWRITE"
 echo "SLURM_CPUS_PER_TASK: ${SLURM_CPUS_PER_TASK:-unset}"
 echo "----------------------------------------------------"
 
@@ -150,6 +152,9 @@ for N in "${ENSEMBLE_SIZES[@]}"; do
 
     if [ "$ADAPTIVE_SIGMA_Y" = "true" ]; then
         cmd+=(--adaptive_sigma_y)
+    fi
+    if [ "$GRID_SEARCH_OVERWRITE" = "true" ]; then
+        cmd+=(--grid_search_overwrite)
     fi
     if [ "$DISABLE_LOCALIZATION" = "true" ]; then
         cmd+=(--no_localization)
