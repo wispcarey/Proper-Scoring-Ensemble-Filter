@@ -12,7 +12,6 @@
 #
 # Usage:
 # bash submit_benchmark_test.sh
-# bash submit_benchmark_test.sh a100
 
 set -euo pipefail
 
@@ -21,7 +20,7 @@ SLURM_SCRIPT="$SCRIPT_DIR/slurm_benchmark_test.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/benchmark_test/out"
 ERROR_DIR="$SCRIPT_DIR/benchmark_test/err"
-GPU_TYPE="${1:-p100}"
+GPU_TYPE="p100"
 
 DEFAULT_TIME_LIMIT="${DEFAULT_TIME_LIMIT:-06:00:00}"
 ENSEMBLE_SIZES="${ENSEMBLE_SIZES:-10 15 20 40 60 100}"
@@ -83,19 +82,33 @@ esac
 # Format per entry:
 # DATASET SIGMA_Y OBS_FN METHODS USE_LOCALIZATION PF_VERIFICATION ADAPTIVE_SIGMA_Y
 # METHODS uses '+' inside one field, so one job can run a small method group.
+# EXPERIMENTS=(
+#     "lorenz63 2.0 identity EnKF+ESRF false true true"
+#     "lorenz63 2.0 identity iEnKS-PertObs false true true"
+#     "lorenz63 2.0 identity iEnKS-Sqrt false true true"
+#     "lorenz63 2.0 identity iEnKS-Order1 false true true"
+#     "lorenz63 2.0 arctan EnKF+ESRF false true true"
+#     "lorenz63 2.0 arctan iEnKS-PertObs false true true"
+#     "lorenz63 2.0 arctan iEnKS-Sqrt false true true"
+#     "lorenz63 2.0 arctan iEnKS-Order1 false true true"
+#     "lorenz63 2.0 square EnKF+ESRF false true true"
+#     "lorenz63 2.0 square iEnKS-PertObs false true true"
+#     "lorenz63 2.0 square iEnKS-Sqrt false true true"
+#     "lorenz63 2.0 square iEnKS-Order1 false true true"
+# )
 EXPERIMENTS=(
-    "lorenz63 2.0 identity EnKF+ESRF false true true"
-    "lorenz63 2.0 identity iEnKS-PertObs false true true"
-    "lorenz63 2.0 identity iEnKS-Sqrt false true true"
-    "lorenz63 2.0 identity iEnKS-Order1 false true true"
-    "lorenz63 2.0 arctan EnKF+ESRF false true true"
-    "lorenz63 2.0 arctan iEnKS-PertObs false true true"
-    "lorenz63 2.0 arctan iEnKS-Sqrt false true true"
-    "lorenz63 2.0 arctan iEnKS-Order1 false true true"
-    "lorenz63 2.0 square EnKF+ESRF false true true"
-    "lorenz63 2.0 square iEnKS-PertObs false true true"
-    "lorenz63 2.0 square iEnKS-Sqrt false true true"
-    "lorenz63 2.0 square iEnKS-Order1 false true true"
+    "lorenz96 1.0 identity EnKF+ESRF true false true"
+    "lorenz96 1.0 identity LETKF true false true"
+    "lorenz96 1.0 identity iEnKS-PertObs true false true"
+    "lorenz96 1.0 identity iEnKS-Sqrt true false true"
+    "lorenz96 1.0 arctan EnKF+ESRF true false true"
+    "lorenz96 1.0 arctan LETKF true false true"
+    "lorenz96 1.0 arctan iEnKS-PertObs true false true"
+    "lorenz96 1.0 arctan iEnKS-Sqrt true false true"
+    "lorenz96 1.0 square EnKF+ESRF true false true"
+    "lorenz96 1.0 square LETKF true false true"
+    "lorenz96 1.0 square iEnKS-PertObs true false true"
+    "lorenz96 1.0 square iEnKS-Sqrt true false true"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
