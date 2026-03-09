@@ -1,40 +1,142 @@
 #!/bin/bash
 
-cd ..
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
 
+PYTHON_BIN="/home/bhchen/miniconda3/bin/python"
 dataset="lorenz96"
 seed=42
+ensemble_sizes=(5 10 15 20 40 60 100)
+obs_fn_suffixes=(square_root identity cos2pi square arctan tanh sin cube linear custom)
 
-# Define experiments as triplets: "MethodName Checkpoint_Path Sigma_Y"
-# Format: "MethodName Path/To/Checkpoint SigmaValue"
+# Define experiments as pairs: "Results_Subdir Trial_Dirname"
+# Format: "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
 experiments=(
-    "CorrTerms save/lorenz96_EtE_LRes/2026-01-14_18-05lorenz96_0.7_10_60_8192_nl2_joint_CorrTerms/cp_1000.pth 0.7"
-    "CorrTerms save/lorenz96_EtE_LRes/2026-01-14_18-04lorenz96_0.7_10_60_8192_es_joint_CorrTerms/cp_1000.pth 0.7"
-    "CorrTerms save/lorenz96_EtE_LRes/2026-01-14_01-24lorenz96_1.0_10_60_8192_es_joint_CorrTerms/cp_1000.pth 1.0"
-    "EtE-LRes save/lorenz96_EtE_LRes/2026-01-14_18-05lorenz96_0.7_10_60_8192_es_joint_EtE-LRes/cp_1000.pth 0.7"
+    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_CorrTermsNone_arctan"
+    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan"
+    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan"
+    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan"
+    "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square"
+    "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square"
+    "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square"
+    "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square"
+    "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity"
+    "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity"
+    "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity"
+    "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
 )
-# Loop 1: Iterate through configuration
+
+resolve_results_dir() {
+    local results_subdir="$1"
+    if [[ "$results_subdir" == save/* ]]; then
+        printf '%s\n' "$results_subdir"
+    else
+        printf 'save/%s\n' "$results_subdir"
+    fi
+}
+
+infer_method() {
+    local trial_name="$1"
+    if [[ "$trial_name" == *"CorrTerms"* ]]; then
+        printf 'CorrTerms\n'
+        return 0
+    fi
+    if [[ "$trial_name" == *"EtE-LRes"* ]]; then
+        printf 'EtE-LRes\n'
+        return 0
+    fi
+    return 1
+}
+
+infer_obs_fn() {
+    local trial_name="$1"
+    local obs_fn
+    for obs_fn in "${obs_fn_suffixes[@]}"; do
+        if [[ "$trial_name" == *"_${obs_fn}" ]]; then
+            printf '%s\n' "$obs_fn"
+            return 0
+        fi
+    done
+    printf 'default\n'
+}
+
+is_tuned_trial() {
+    local trial_name="$1"
+    [[ "$trial_name" == *"_tuned"* ]]
+}
+
 for exp in "${experiments[@]}"; do
-    # Extract version, path, and specific sigma_y
-    read -r v cp_path current_sigma_y <<< "$exp"
-    
+    read -r results_subdir trial_name <<< "$exp"
+
+    results_dir="$(resolve_results_dir "$results_subdir")"
+    trial_dir="${results_dir}/${trial_name}"
+
+    if [ ! -d "$results_dir" ]; then
+        echo "Skipping missing results directory: $results_dir" >&2
+        continue
+    fi
+
+    if [ ! -d "$trial_dir" ]; then
+        echo "Skipping missing trial directory: $trial_dir" >&2
+        continue
+    fi
+
+    if ! v="$(infer_method "$trial_name")"; then
+        echo "Skipping trial with unknown method: $trial_dir" >&2
+        continue
+    fi
+
+    current_obs_fn="$(infer_obs_fn "$trial_name")"
+
+    if is_tuned_trial "$trial_name"; then
+        checkpoint_mode="finetuned"
+    else
+        checkpoint_mode="base"
+    fi
+
     echo "=================================================="
     echo "Evaluating Method: $v"
-    echo "Checkpoint: $cp_path"
-    echo "Sigma Y: $current_sigma_y"
+    echo "Results Dir: $results_dir"
+    echo "Trial Dir: $trial_dir"
+    echo "Checkpoint Mode: $checkpoint_mode"
+    echo "Sigma Y: default from config/dataset_info.py"
+    echo "Obs Fn: $current_obs_fn"
     echo "=================================================="
 
-    # Loop 2: Iterate through N
-    for N in 5 10 15 20 40 60 100; do
-        python evaluate.py \
-        --dataset $dataset \
-        --N $N \
-        --sigma_y $current_sigma_y \
-        --seed $seed \
-        --v $v \
-        --normal_output \
-        --test_steps 500 \
-        --sigma_reg None \
-        --cp_load_path "$cp_path"
+    for N in "${ensemble_sizes[@]}"; do
+        if [ "$checkpoint_mode" = "finetuned" ]; then
+            cp_path="${trial_dir}/ft_cp_${N}_20.pth"
+        else
+            cp_path="${trial_dir}/cp_1000.pth"
+        fi
+
+        if [ ! -f "$cp_path" ]; then
+            echo "Skipping missing checkpoint: $cp_path" >&2
+            continue
+        fi
+
+        cmd=(
+            "$PYTHON_BIN" evaluate.py
+            --dataset "$dataset"
+            --N "$N"
+            --seed "$seed"
+            --v "$v"
+            --obs_fn "$current_obs_fn"
+            --adaptive_sigma_y
+            --normal_output
+            --test_steps 500
+            --sigma_reg None
+            --cp_load_path "$cp_path"
+        )
+
+        if [ "$checkpoint_mode" = "finetuned" ]; then
+            cmd+=(
+                --sigma_ens 5
+                --suffix "sigma_ens_5"
+            )
+        fi
+
+        "${cmd[@]}"
     done
 done
