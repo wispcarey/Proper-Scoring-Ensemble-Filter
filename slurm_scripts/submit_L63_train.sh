@@ -6,6 +6,7 @@
 
 # Target Slurm script
 SLURM_SCRIPT="slurm_L63_train.sh"
+GPU_TYPE="${1:-p100}"
 
 # Default values
 DEF_DATASET="lorenz63"
@@ -138,6 +139,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     # Submit using --export=ALL
     sbatch -J "$JOB_NAME" \
        --time="$TIME_LIMIT" \
+       --gres="gpu:${GPU_TYPE}:1" \
        --export=ALL \
        $SLURM_SCRIPT
 done

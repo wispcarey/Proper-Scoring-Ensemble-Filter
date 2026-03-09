@@ -7,28 +7,53 @@ seed=42
 
 # Define experiments as quartets: "MethodName Checkpoint_Path Sigma_Y Obs_Fn"
 # Format: "MethodName Path/To/Checkpoint SigmaValue ObsFn"
-experiments=(
-    # "CorrTerms save/lorenz63_EtE_LRes/2026-01-14_18-04lorenz63_0.7_10_60_8192_nl2_joint_CorrTerms/cp_1000.pth 0.7"
-    # "EtE-LRes save/lorenz63_EtE_LRes/2026-01-14_17-49lorenz63_0.7_10_60_8192_es_joint_EtE-LRes/cp_1000.pth 0.7"
-    # "CorrTerms save/lorenz63_EtE_LRes/2026-01-14_18-04lorenz63_0.7_10_60_8192_es_joint_CorrTerms/cp_1000.pth 0.7"
-    # "CorrTerms save/lorenz63_EtE_LRes/2026-01-14_01-06lorenz63_1.0_10_60_8192_es_joint_CorrTerms/cp_1000.pth 1.0"
-    "EtE-LRes save/lorenz63_obs_fn_square/2026-02-22_20-23lorenz63_16.97_10_60_8192_es_joint_EtE-LResNone_square/cp_1000.pth adaptive square"
-    # "EtE-LRes save/lorenz63_obs_fn_square/2026-02-22_20-23lorenz63_16.97_10_60_8192_nl2_joint_EtE-LResNone_square/cp_1000.pth adaptive square"
-    # "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_es_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
-    # "CorrTerms save/lorenz63_obs_fn_square/2026-02-22_20-24lorenz63_16.97_10_60_8192_nl2_joint_CorrTermsNone_square/cp_1000.pth adaptive square"
+results_root="save/lorenz63_results"
+obs_fn_list=("identity")
 
-)
+contains_obs_fn() {
+    local candidate="$1"
+    local allowed
+    for allowed in "${obs_fn_list[@]}"; do
+        if [ "$allowed" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
-# experiments=(
-#     "EtE-LRes save/lorenz63_wpf/2026-01-21_14-42lorenz63_1.0_10_60_8192_wpf_ed_joint_EtE-LRes/cp_300.pth 1.0"
-#     "EtE-LRes save/lorenz63_wpf/2026-01-21_14-53lorenz63_1.0_10_60_8192_wpf_ammd_joint_EtE-LRes/cp_300.pth 1.0"
-#     "EtE-LRes save/lorenz63_wpf/2026-01-21_19-39lorenz63_1.0_10_60_8192_es_wpf_ed_joint_EtE-LRes/cp_300.pth 1.0"
-#     "EtE-LRes save/lorenz63_wpf/2026-01-21_19-39lorenz63_1.0_10_60_8192_es_wpf_ammd_joint_EtE-LRes/cp_300.pth 1.0"
-#     "CorrTerms save/lorenz63_wpf/2026-01-21_14-53lorenz63_1.0_10_60_8192_wpf_ed_joint_CorrTerms/cp_300.pth 1.0"
-#     "CorrTerms save/lorenz63_wpf/2026-01-21_14-53lorenz63_1.0_10_60_8192_wpf_ammd_joint_CorrTerms/cp_300.pth 1.0"
-#     "CorrTerms save/lorenz63_wpf/2026-01-21_19-39lorenz63_1.0_10_60_8192_es_wpf_ed_joint_CorrTerms/cp_300.pth 1.0"
-#     "CorrTerms save/lorenz63_wpf/2026-01-21_19-39lorenz63_1.0_10_60_8192_es_wpf_ammd_joint_CorrTerms/cp_300.pth 1.0"
-# )
+experiments=()
+while IFS= read -r cp_path; do
+    run_dir="$(dirname "$cp_path")"
+    run_name="$(basename "$run_dir")"
+
+    if [[ "$run_name" == *"EtE-LRes"* ]]; then
+        v="EtE-LRes"
+    elif [[ "$run_name" == *"CorrTerms"* ]]; then
+        v="CorrTerms"
+    else
+        echo "Skipping unknown method directory: $run_name"
+        continue
+    fi
+
+    if [[ "$run_name" == *"None_"* ]]; then
+        obs_fn="${run_name##*None_}"
+    else
+        echo "Skipping directory with unrecognized obs_fn pattern: $run_name"
+        continue
+    fi
+
+    if ! contains_obs_fn "$obs_fn"; then
+        echo "Skipping obs_fn not in allowlist: $run_name"
+        continue
+    fi
+
+    experiments+=("$v $cp_path adaptive $obs_fn")
+done < <(find "$results_root" -mindepth 2 -maxdepth 2 -type f -name 'cp_1000.pth' | sort)
+
+if [ "${#experiments[@]}" -eq 0 ]; then
+    echo "No experiments found under $results_root"
+    exit 1
+fi
 
 # Loop 1: Iterate through configuration
 for exp in "${experiments[@]}"; do

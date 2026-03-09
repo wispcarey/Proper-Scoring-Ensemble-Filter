@@ -7,6 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="$SCRIPT_DIR/slurm_pf_doubling1d.sh"
+GPU_TYPE="${1:-p100}"
 
 validate_bool() {
     local v="$1"
@@ -62,6 +63,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     echo "Submitting: $job_name (DRAW_FIGURE=$draw_figure, PF_N=$pf_n)"
 
     sbatch -J "$job_name" \
+        --gres="gpu:${GPU_TYPE}:1" \
         --export=ALL,DRAW_FIGURE="$draw_figure",PF_N="$pf_n" \
         "$SLURM_SCRIPT"
 done

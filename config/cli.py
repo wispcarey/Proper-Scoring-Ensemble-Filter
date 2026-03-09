@@ -476,6 +476,15 @@ def get_parameters(extra_arg_adder=None):
                         help='Seed for fixed projection directions in rank evaluation (None => fallback to --seed).')
     parser.add_argument('--rank_tie_break', type=str, default='random', choices=['random', 'midpoint'],
                         help='Tie handling in projected rank: random (recommended) or midpoint.')
+    parser.add_argument('--disable_tqdm', action='store_true',
+                        help='Disable tqdm progress bars. Useful for parallel runs and cleaner logs.')
+
+    # grid search settings
+    parser.add_argument('--grid_search_cpu_workers', type=int, default=32,
+                        help='Number of CPU worker processes used by benchmark grid search when --device cpu.')
+    parser.add_argument('--grid_search_num_seeds', type=int, default=4,
+                        help='Number of random seeds averaged for each benchmark grid-search parameter pair. '
+                             'Seeds are generated as base --seed, --seed+1, ... and do not affect --pf_verification_seed.')
 
 
     # others
@@ -495,6 +504,11 @@ def get_parameters(extra_arg_adder=None):
         extra_arg_adder(parser)
 
     args = parser.parse_args()
+
+    if args.grid_search_cpu_workers < 1:
+        raise ValueError("--grid_search_cpu_workers must be >= 1.")
+    if args.grid_search_num_seeds < 1:
+        raise ValueError("--grid_search_num_seeds must be >= 1.")
 
     if not isinstance(args.test_plot_index, (list, tuple)):
         args.test_plot_index = parse_test_plot_index(args.test_plot_index)
@@ -625,6 +639,7 @@ def get_parameters(extra_arg_adder=None):
             args.use_data_parallel = False
             print(f"Do not Use DataParallel")
     else:
+        args.device = torch.device("cpu")
         print("Use CPU")
         args.use_data_parallel = False
 

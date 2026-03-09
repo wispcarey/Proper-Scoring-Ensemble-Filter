@@ -6,6 +6,7 @@
 
 # Target Slurm script
 SLURM_SCRIPT="slurm_linear_toy.sh"
+GPU_TYPE="${1:-p100}"
 
 # Default values
 DEFAULT_HIDDEN_DIM=16
@@ -45,5 +46,5 @@ for exp in "${EXPERIMENTS[@]}"; do
     echo "Submitting job: Loss=$loss, Epochs=$epochs, LR=$lr, Dim=$dim, Hidden=$hidden_dim, Suffix=$suffix, Adaptive=$adaptive_sigma_y"
 
     # Submit using --export to pass variables
-    sbatch --export=ALL,EPOCHS=$epochs,LOSS_TYPE=$loss,LR=$lr,DIM=$dim,HIDDEN_DIM=$hidden_dim,ADAPTIVE_SIGMA_Y=$adaptive_sigma_y,SUFFIX=$suffix $SLURM_SCRIPT
+    sbatch --gres="gpu:${GPU_TYPE}:1" --export=ALL,EPOCHS=$epochs,LOSS_TYPE=$loss,LR=$lr,DIM=$dim,HIDDEN_DIM=$hidden_dim,ADAPTIVE_SIGMA_Y=$adaptive_sigma_y,SUFFIX=$suffix $SLURM_SCRIPT
 done

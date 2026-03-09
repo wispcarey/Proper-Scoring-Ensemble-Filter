@@ -1,13 +1,16 @@
+import os
 import torch
 import numpy as np
 from typing import Optional, List, Tuple, Dict, Any
 
+import matplotlib
+if os.environ.get("DISPLAY", "") == "":
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-import os
 
 
 from argparse import Namespace 
@@ -73,6 +76,108 @@ def _save_horizontal_legend_image(
         labelspacing=0.4 * scale,
         frameon=frameon,
     )
+    legend_handle_list = getattr(legend, "legend_handles", None)
+    if legend_handle_list is None:
+        legend_handle_list = getattr(legend, "legendHandles", [])
+    for handle in legend_handle_list:
+        if isinstance(handle, Line2D):
+            handle.set_linewidth(max(1.0, handle.get_linewidth() * scale))
+            if handle.get_markersize() > 0:
+                handle.set_markersize(handle.get_markersize() * scale)
+
+    fig.tight_layout(pad=0.02)
+    fig.savefig(f"{prefix}_legend.png", dpi=dpi, bbox_inches='tight', pad_inches=pad_inches)
+    if save_pdf:
+        fig.savefig(f"{prefix}_legend.pdf", bbox_inches='tight', pad_inches=pad_inches)
+    plt.close(fig)
+
+
+def _save_two_row_legend_image(
+    prefix: str,
+    top_handles: List,
+    top_labels: List[str],
+    bottom_handles: List,
+    bottom_labels: List[str],
+    save_pdf: bool = False,
+    dpi: int = 200,
+    fontsize: int = 11,
+    frameon: bool = True,
+    scale: float = 1.45,
+    pad_inches: float = 0.02,
+) -> None:
+    """Save one standalone legend image with two rows in a single legend frame."""
+    def _dedup(handles: List, labels: List[str]) -> Tuple[List, List[str]]:
+        out_handles: List = []
+        out_labels: List[str] = []
+        seen = set()
+        for handle, label in zip(handles, labels):
+            if not label or label in seen:
+                continue
+            out_handles.append(handle)
+            out_labels.append(label)
+            seen.add(label)
+        return out_handles, out_labels
+
+    top_h, top_l = _dedup(top_handles, top_labels)
+    bot_h, bot_l = _dedup(bottom_handles, bottom_labels)
+    if len(top_h) == 0 and len(bot_h) == 0:
+        return
+    if len(top_h) == 0 or len(bot_h) == 0:
+        _save_horizontal_legend_image(
+            prefix=prefix,
+            handles=top_h if len(top_h) > 0 else bot_h,
+            labels=top_l if len(top_l) > 0 else bot_l,
+            save_pdf=save_pdf,
+            dpi=dpi,
+            fontsize=fontsize,
+            frameon=frameon,
+            scale=scale,
+            pad_inches=pad_inches,
+        )
+        return
+
+    scale = float(max(scale, 0.5))
+    ncols = max(len(top_h), len(bot_h))
+    fig_w = max(4.5 * scale, 2.2 * ncols * scale)
+    fig_h = 1.9 * scale
+    scaled_fontsize = max(1, int(round(float(fontsize) * scale)))
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    ax = fig.add_subplot(111)
+    ax.axis('off')
+
+    blank_handle = Line2D([0], [0], linestyle='None', marker='None', alpha=0.0)
+    row_top_handles = [top_h[j] if j < len(top_h) else blank_handle for j in range(ncols)]
+    row_top_labels = [top_l[j] if j < len(top_l) else " " for j in range(ncols)]
+    row_bot_handles = [bot_h[j] if j < len(bot_h) else blank_handle for j in range(ncols)]
+    row_bot_labels = [bot_l[j] if j < len(bot_l) else " " for j in range(ncols)]
+
+    # Matplotlib legend with ncol fills entries in column-major order.
+    # Interleave row-1/row-2 items per column so display reads left-to-right by rows.
+    handles: List = []
+    labels: List[str] = []
+    for col in range(ncols):
+        handles.append(row_top_handles[col])
+        labels.append(row_top_labels[col])
+        handles.append(row_bot_handles[col])
+        labels.append(row_bot_labels[col])
+
+    legend = ax.legend(
+        handles,
+        labels,
+        loc='center',
+        ncol=ncols,
+        fontsize=scaled_fontsize,
+        markerscale=scale,
+        handlelength=2.0 * scale,
+        handleheight=0.8 * scale,
+        borderpad=0.35 * scale,
+        columnspacing=1.2 * scale,
+        handletextpad=0.7 * scale,
+        labelspacing=0.55 * scale,
+        frameon=frameon,
+    )
+
     legend_handle_list = getattr(legend, "legend_handles", None)
     if legend_handle_list is None:
         legend_handle_list = getattr(legend, "legendHandles", [])
@@ -1046,6 +1151,79 @@ def _save_separate_legend(
         prefix=prefix,
         handles=handles,
         labels=labels,
+        save_pdf=False,
+        dpi=dpi,
+        fontsize=11,
+        frameon=True,
+    )
+
+
+def _save_combined_prior_post_legend(
+    prefix: str,
+    include_obs: bool = False,
+    include_history: bool = False,
+    include_true_state: bool = True,
+    dpi: int = 200,
+) -> None:
+    """Save one combined legend where predictive/filtering density stays on row 2."""
+    top_handles: List = [
+        Line2D(
+            [0], [0],
+            marker='o', linestyle='None',
+            markerfacecolor='blue', markeredgecolor='none', markersize=8,
+            label='predictive ensemble',
+        ),
+        Line2D(
+            [0], [0],
+            marker='o', linestyle='None',
+            markerfacecolor='red', markeredgecolor='white', markersize=8,
+            label='filtered ensemble',
+        ),
+    ]
+    if include_obs:
+        top_handles.append(
+            Line2D(
+                [0], [0],
+                marker='*', linestyle='None',
+                markerfacecolor='orange', markeredgecolor='black', markersize=14,
+                label='Observation',
+            )
+        )
+    if include_history:
+        top_handles.append(
+            Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='History trajectory')
+        )
+    if include_true_state:
+        top_handles.append(
+            Line2D(
+                [0], [0],
+                marker='x', linestyle='None',
+                color='black', markeredgecolor='black', markersize=10,
+                label='True state',
+            )
+        )
+
+    bottom_handles: List = [
+        Line2D(
+            [0], [0],
+            marker='o', linestyle='None',
+            markerfacecolor='blue', markeredgecolor='none', markersize=8,
+            label='predictive density',
+        ),
+        Line2D(
+            [0], [0],
+            marker='o', linestyle='None',
+            markerfacecolor='red', markeredgecolor='white', markersize=8,
+            label='filtering density',
+        ),
+    ]
+
+    _save_two_row_legend_image(
+        prefix=prefix,
+        top_handles=top_handles,
+        top_labels=[h.get_label() for h in top_handles],
+        bottom_handles=bottom_handles,
+        bottom_labels=[h.get_label() for h in bottom_handles],
         save_pdf=False,
         dpi=dpi,
         fontsize=11,
@@ -2483,6 +2661,7 @@ def plot_and_test_point_clouds(
         legend_dir = os.path.dirname(prefix) or "."
         legend_prefix_prior = os.path.join(legend_dir, f"{dataset}_prior")
         legend_prefix_post = os.path.join(legend_dir, f"{dataset}_post")
+        legend_prefix_combined = os.path.join(legend_dir, f"{dataset}_prior_post_combined")
         _save_separate_legend(
             legend_prefix_prior,
             include_prior=True,
@@ -2490,6 +2669,13 @@ def plot_and_test_point_clouds(
             include_obs=False,
             include_history=False,
             include_true_state=(true_state is not None),
+        )
+        _save_combined_prior_post_legend(
+            legend_prefix_combined,
+            include_obs=False,
+            include_history=False,
+            include_true_state=(true_state is not None),
+            dpi=200,
         )
         _save_separate_legend(
             legend_prefix_post,
@@ -3100,6 +3286,31 @@ def plot_and_test_point_clouds_ring(
             prefix=legend_prefix,
             handles=legend_handles,
             labels=legend_labels,
+            save_pdf=False,
+            dpi=150,
+            fontsize=11,
+            frameon=True,
+        )
+        combined_legend_prefix = os.path.join(legend_dir, "prior_post_density_combined")
+        combined_top_handles: List = [
+            Line2D([0], [0], marker='o', linestyle='None',
+                   markerfacecolor='blue', markeredgecolor='none', markersize=8, label='predictive ensemble'),
+            Line2D([0], [0], marker='o', linestyle='None',
+                   markerfacecolor='red', markeredgecolor='white', markersize=8, label='filtered ensemble'),
+            Line2D([0], [0], marker='x', linestyle='None',
+                   color='black', markeredgecolor='black', markersize=10, label='True state'),
+            Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0, label='Observation'),
+        ]
+        combined_bottom_handles: List = [
+            mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none', label='predictive density'),
+            mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none', label='filtering density'),
+        ]
+        _save_two_row_legend_image(
+            prefix=combined_legend_prefix,
+            top_handles=combined_top_handles,
+            top_labels=[h.get_label() for h in combined_top_handles],
+            bottom_handles=combined_bottom_handles,
+            bottom_labels=[h.get_label() for h in combined_bottom_handles],
             save_pdf=False,
             dpi=150,
             fontsize=11,

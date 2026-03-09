@@ -247,6 +247,13 @@ def compute_quantile_crps_1d(ens_samples, truth_quantiles, quantile_probs):
     represented by quantiles Q(p). The truth expectations are approximated with quadrature
     weights derived from `quantile_probs`.
 
+    Equivalences (1D):
+    - This quantity equals 0.5 * Energy Distance:
+        ED(F, G) = 2 E|X-Y| - E|X-X'| - E|Y-Y'|.
+    - In 1D, ED(F, G) = 2 * integral_{R} (F(z) - G(z))^2 dz, so this function is also
+      the 1D Cramer distance integral_{R} (F(z) - G(z))^2 dz.
+      (This differs from the classical Cramer-von Mises form that is weighted by dH.)
+
     Args:
         ens_samples (torch.Tensor): Shape [..., N], ensemble samples.
         truth_quantiles (torch.Tensor): Shape [..., K], truth quantile values.
@@ -316,6 +323,7 @@ def compute_quantile_crps_1d(ens_samples, truth_quantiles, quantile_probs):
     w_j = quad_w.view(*([1] * (q_pair.ndim - 2)), 1, k)
     term_yy = 0.5 * torch.sum(q_pair * (w_i * w_j), dim=(-2, -1))  # [...]
 
+    # 1D identity: this equals 0.5 * ED(F, G), i.e. integral (F-G)^2 dz.
     crps_div = term_xy - term_xx - term_yy
     crps_div = torch.clamp(crps_div, min=0.0)
     crps_div = crps_div.masked_fill(~valid, float("nan"))

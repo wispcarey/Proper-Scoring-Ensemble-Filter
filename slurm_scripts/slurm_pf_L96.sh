@@ -4,7 +4,7 @@
 
 #SBATCH --time=1-00:00:00     # walltime (1 days)
 #SBATCH --nodes=1           # number of nodes (1 node)
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:p100:1
 #SBATCH --partition=gpu     # use GPU partition
 #SBATCH --ntasks=1          # 1 task
 #SBATCH -J "bpf-L96"   # job name

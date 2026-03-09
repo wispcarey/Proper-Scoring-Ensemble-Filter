@@ -692,6 +692,7 @@ def _ienks_analysis(
     model_propagator=None,
     model_rhs=None,
     model_dt=None,
+    solve_with_pinv=False,
     # --- iEnKS hyperparameters ---
     upd_a='Sqrt',
     Lag=1,
@@ -715,6 +716,119 @@ def _ienks_analysis(
 
     N1 = N - 1
     X0_global, x0_global = center_ensemble(ensemble_f)
+    eye_N = torch.eye(N, device=device, dtype=dtype).unsqueeze(0)
+    _warned_discrete_solve = [False]
+    _warned_discrete_eigh = [False]
+    _warned_continuous_solve = [False]
+    _warned_continuous_eigh = [False]
+
+    def _ridge_solve_batch(A_in, B_in):
+        """
+        Solve A X = B with a robust ridge normal-equation fallback:
+            (A^T A + lambda I) X = A^T B
+        Returns:
+            out, any_failed
+        """
+        A_safe = torch.nan_to_num(A_in, nan=0.0, posinf=1e12, neginf=-1e12)
+        B_safe = torch.nan_to_num(B_in, nan=0.0, posinf=1e12, neginf=-1e12)
+        out = torch.empty_like(B_safe)
+        eye_single = torch.eye(N, device=device, dtype=dtype)
+        ridge_list = (1e-10, 1e-8, 1e-6, 1e-4, 1e-2)
+        any_failed = False
+
+        for b in range(A_safe.shape[0]):
+            Ab = A_safe[b]
+            Bb = B_safe[b]
+            rhs = Ab.transpose(-2, -1) @ Bb
+            gram = Ab.transpose(-2, -1) @ Ab
+            gram = 0.5 * (gram + gram.transpose(-2, -1))
+
+            solved = False
+            for lam in ridge_list:
+                try:
+                    evals, U = torch.linalg.eigh(gram + lam * eye_single)
+                    evals = torch.clamp(evals, min=1e-12)
+                    tmp = U.transpose(-2, -1) @ rhs
+                    out[b] = U @ (tmp / evals.unsqueeze(-1))
+                    solved = True
+                    break
+                except RuntimeError:
+                    continue
+
+            if not solved:
+                out[b] = Bb
+                any_failed = True
+
+        return out, any_failed
+
+    def _solve_left(A, Bmat):
+        if solve_with_pinv:
+            out, any_failed = _ridge_solve_batch(A, Bmat)
+            if any_failed and not _warned_discrete_solve[0]:
+                print("[WARN] iEnKS discrete solve fallback activated (ridge-eigh failed).")
+                _warned_discrete_solve[0] = True
+            return out
+        try:
+            return torch.linalg.solve(A.contiguous(), Bmat.contiguous())
+        except RuntimeError as err:
+            # Keep original path for healthy batches; only fallback on linear-algebra failure.
+            if not _warned_continuous_solve[0]:
+                print(f"[WARN] iEnKS solve failed ({err}). Falling back to ridge solve for this step.")
+                _warned_continuous_solve[0] = True
+            out, _ = _ridge_solve_batch(A, Bmat)
+            return out
+
+    def _eigh_cov(C):
+        def _stable_eigh_batch(C_in, warn_flag, warn_msg):
+            C_sym = 0.5 * (C_in + C_in.transpose(-2, -1))
+            C_sym = torch.nan_to_num(C_sym, nan=0.0, posinf=1e12, neginf=-1e12)
+            eye_single = torch.eye(N, device=device, dtype=dtype)
+            eigvals_list = []
+            eigvecs_list = []
+
+            for b in range(C_sym.shape[0]):
+                Cb = C_sym[b]
+                solved = False
+                for eps in (0.0, 1e-10, 1e-8, 1e-6, 1e-4):
+                    try:
+                        Lb, Ub = torch.linalg.eigh(Cb + eps * eye_single)
+                        eigvals_list.append(Lb)
+                        eigvecs_list.append(Ub)
+                        solved = True
+                        break
+                    except RuntimeError:
+                        continue
+
+                if not solved:
+                    eigvals_list.append(torch.ones(N, device=device, dtype=dtype))
+                    eigvecs_list.append(eye_single)
+                    if not warn_flag[0]:
+                        print(warn_msg)
+                        warn_flag[0] = True
+
+            return torch.stack(eigvals_list, dim=0), torch.stack(eigvecs_list, dim=0)
+
+        # Discrete-map path avoids robust_eigh(cond/solve stack) on CPU MKL.
+        if solve_with_pinv:
+            return _stable_eigh_batch(
+                C,
+                _warned_discrete_eigh,
+                "[WARN] iEnKS discrete eigh fallback activated (identity eigensystem used).",
+            )
+
+        eig_vals, eig_vecs = robust_eigh(C)
+        finite_mask = torch.isfinite(eig_vals).all(dim=-1) & torch.isfinite(eig_vecs).all(dim=(-2, -1))
+        if finite_mask.all():
+            return eig_vals, eig_vecs
+
+        eig_vals_fb, eig_vecs_fb = _stable_eigh_batch(
+            C,
+            _warned_continuous_eigh,
+            "[WARN] iEnKS continuous eigh fallback activated (robust_eigh produced non-finite values).",
+        )
+        eig_vals = torch.where(finite_mask.unsqueeze(-1), eig_vals, eig_vals_fb)
+        eig_vecs = torch.where(finite_mask.unsqueeze(-1).unsqueeze(-1), eig_vecs, eig_vecs_fb)
+        return eig_vals, eig_vecs
 
     def propagate_ensemble_in_window(ens_in):
         ens_flat = ens_in.view(B * N, D_state)
@@ -722,7 +836,8 @@ def _ienks_analysis(
         propagated_ens = ens_flat
         for _ in range(num_model_steps):
             propagated_ens = model_propagator(model_rhs, propagated_ens, 0, model_dt)
-        propagated_ens += torch.randn_like(propagated_ens, device=propagated_ens.device) * sigma_v
+        sigma_v_eff = 0.0 if sigma_v is None else sigma_v
+        propagated_ens += torch.randn_like(propagated_ens, device=propagated_ens.device) * sigma_v_eff
         return propagated_ens.view(B, N, D_state)
     
     # ============================================================================
@@ -731,7 +846,9 @@ def _ienks_analysis(
 
     if localization_radius is None:
         w = torch.zeros(B, N, 1, device=device, dtype=dtype)
-        T = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+        # NOTE: Use a real batched tensor (repeat) instead of expand(stride=0),
+        # which can trigger MKL/LAPACK issues for batched solves on some CPU setups.
+        T = eye_N.repeat(B, 1, 1)
         D_pert = None
 
         for iteration in range(nIter):
@@ -746,11 +863,11 @@ def _ienks_analysis(
             za = float(N1)
             # Tinv = torch.linalg.inv(T)
             # Y_iter = Tinv @ Y_eff
-            Y_iter = torch.linalg.solve(T, Y_eff)
+            Y_iter = _solve_left(T, Y_eff)
             
-            C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * torch.eye(N, device=device).unsqueeze(0)
+            C_tilde = (Y_iter @ Y_iter.transpose(-2, -1)) + za * eye_N
 
-            eig_vals, U = robust_eigh(C_tilde)
+            eig_vals, U = _eigh_cov(C_tilde)
             eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
             Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
             
@@ -763,10 +880,10 @@ def _ienks_analysis(
                 if iteration == 0:
                     _D_pert = torch.randn_like(Y_eff)
                     D_pert = _D_pert - _D_pert.mean(dim=1, keepdim=True)
-                gradT = -(Y_eff + D_pert) @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+                gradT = -(Y_eff + D_pert) @ Y_iter.transpose(-2, -1) + N1 * (eye_N - T)
                 T = T + gradT @ Cow1
             elif "Order1" in upd_a:
-                gradT = -0.5 * Y_eff @ Y_iter.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T)
+                gradT = -0.5 * Y_eff @ Y_iter.transpose(-2, -1) + N1 * (eye_N - T)
                 T = T + gradT @ Cow1
             
             w_new = w + dw
@@ -801,7 +918,8 @@ def _ienks_analysis(
             sqrt_rho_bcast = torch.sqrt(rho_local_k).view(1, 1, -1)
             
             w_k = torch.zeros(B, N, 1, device=device, dtype=dtype)
-            T_k = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+            # Keep the same robust batched layout choice as the global path.
+            T_k = eye_N.repeat(B, 1, 1)
             D_pert_local = None
 
             for iteration in range(nIter):
@@ -817,10 +935,10 @@ def _ienks_analysis(
                 za = float(N1)
                 # Tinv_k = torch.linalg.inv(T_k)
                 # Y_iter_local = Tinv_k @ Y_local_eff
-                Y_iter_local = torch.linalg.solve(T_k, Y_local_eff)
+                Y_iter_local = _solve_left(T_k, Y_local_eff)
 
-                C_tilde = (Y_iter_local @ Y_iter_local.transpose(-2, -1)) + za*torch.eye(N, device=device)
-                eig_vals, U = robust_eigh(C_tilde)
+                C_tilde = (Y_iter_local @ Y_iter_local.transpose(-2, -1)) + za * eye_N
+                eig_vals, U = _eigh_cov(C_tilde)
                 eig_vals_clamped = torch.clamp(eig_vals, min=1e-9)
                 Cow1 = U @ torch.diag_embed(1.0 / eig_vals_clamped) @ U.transpose(-2, -1)
 
@@ -833,10 +951,10 @@ def _ienks_analysis(
                     if iteration == 0:
                         _D_pert_local = torch.randn_like(Y_local_eff)
                         D_pert_local = _D_pert_local - _D_pert_local.mean(dim=1, keepdim=True)
-                    gradT_k = -(Y_local_eff + D_pert_local) @ Y_iter_local.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T_k)
+                    gradT_k = -(Y_local_eff + D_pert_local) @ Y_iter_local.transpose(-2, -1) + N1 * (eye_N - T_k)
                     T_k = T_k + gradT_k @ Cow1
                 elif "Order1" in upd_a:
-                    gradT_k = -0.5 * Y_local_eff @ Y_iter_local.transpose(-2, -1) + N1 * (torch.eye(N, device=device) - T_k)
+                    gradT_k = -0.5 * Y_local_eff @ Y_iter_local.transpose(-2, -1) + N1 * (eye_N - T_k)
                     T_k = T_k + gradT_k @ Cow1
                 
                 w_k_new = w_k + dw_k
@@ -1001,6 +1119,7 @@ def ensemble_kalman_filter_analysis(
             model_rhs=model_args['rhs'],
             model_dt=model_args['dt'],
             steps_between_analyses=model_args['steps_between_analyses'],
+            solve_with_pinv=model_args.get('solve_with_pinv', False),
             # iEnKS hyperparams
             upd_a=update_type,
             Lag=ienks_lag,

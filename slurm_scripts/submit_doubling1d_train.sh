@@ -7,6 +7,7 @@
 # EXP_SETTING supports: 1d/2d (also backward-compatible with doubling1d/complex2d).
 
 SLURM_SCRIPT="slurm_doubling1d_train.sh"
+GPU_TYPE="${1:-p100}"
 
 # Default values
 DEF_EPOCHS=100
@@ -130,6 +131,7 @@ for exp in "${EXPERIMENTS[@]}"; do
 
     sbatch -J "$JOB_NAME" \
         --time="$TIME_LIMIT" \
+        --gres="gpu:${GPU_TYPE}:1" \
         --export=ALL \
         "$SLURM_SCRIPT"
 done

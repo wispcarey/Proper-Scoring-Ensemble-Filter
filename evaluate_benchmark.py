@@ -4,11 +4,72 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import time
+import hashlib
+import json
 
+from config.benchmark_gridsearch_info import get_benchmark_gridsearch_config
 from config.cli import get_parameters
 from utils import setup_optimizer_and_scheduler, load_checkpoint
 from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 from train_test_utils import test_ClassicFilter, print_test_results
+
+
+def _safe_int_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "" or stripped.lower() == "none":
+            return None
+        return int(stripped)
+    return int(value)
+
+
+def _build_search_metric_label(args):
+    return "PF-SED" if getattr(args, "pf_verification", False) else "RES1-traj"
+
+
+def _build_torch_grid_signature(args):
+    grid_cfg = get_benchmark_gridsearch_config(
+        dataset=args.dataset,
+        method=args.v,
+        ensemble_size=args.N,
+        force_no_localization=bool(getattr(args, "no_localization", False)),
+    )
+    return {
+        "dataset": str(args.dataset),
+        "method": str(args.v),
+        "N": int(args.N),
+        "sigma_y": None if args.sigma_y is None else float(args.sigma_y),
+        "obs_fn": str(getattr(args, "obs_fn", "identity")),
+        "obs_inds": [] if getattr(args, "obs_inds", None) is None else [
+            int(v) for v in torch.as_tensor(args.obs_inds, dtype=torch.long).reshape(-1).tolist()
+        ],
+        "obs_dim": None if getattr(args, "obs_dim", None) is None else int(args.obs_dim),
+        "obs_fn_out_dim": None
+        if getattr(args, "obs_fn_out_dim", None) is None
+        else int(args.obs_fn_out_dim),
+        "obs_fn_seed": _safe_int_or_none(getattr(args, "obs_fn_seed", None)),
+        "obs_custom_fn_path": getattr(args, "obs_custom_fn_path", None),
+        "adaptive_sigma_y": bool(getattr(args, "adaptive_sigma_y", False)),
+        "no_localization": bool(grid_cfg.get("localization_fn") is None),
+        "localization_fn": grid_cfg.get("localization_fn"),
+        "pf_verification": bool(getattr(args, "pf_verification", False)),
+        "pf_verification_seed": _safe_int_or_none(getattr(args, "pf_verification_seed", None)),
+        "pf_N": None if getattr(args, "pf_N", None) is None else int(args.pf_N),
+        "search_metric": _build_search_metric_label(args),
+        "grid_search_num_seeds": int(getattr(args, "grid_search_num_seeds", 4)),
+        "test_steps": None if getattr(args, "test_steps", None) is None else int(args.test_steps),
+        "test_traj_num": None if getattr(args, "test_traj_num", None) is None else int(args.test_traj_num),
+        "seed": _safe_int_or_none(getattr(args, "seed", None)),
+        "test_random_seed": _safe_int_or_none(getattr(args, "test_random_seed", None)),
+        "seed_obs": _safe_int_or_none(getattr(args, "seed_obs", None)),
+    }
+
+
+def _make_setting_id(signature):
+    signature_json = json.dumps(signature, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(signature_json.encode("utf-8")).hexdigest()[:12]
 
 def get_benchmarks(args, source='dapper'):
     """
@@ -38,26 +99,27 @@ def get_benchmarks(args, source='dapper'):
         return sigma_y_1.to_numpy(), sigma_y_0_7.to_numpy()
 
     elif source == 'torch':
-        # --- New Torch Grid Search Reading Logic ---
-        # Construct path: save/{dataset}_benchmarks/benchmark_{dataset}_{sigma}_{method}/grid_search_results_{N}.pt
-        folder_name = os.path.join(
-            "save", 
-            f"{args.dataset}_benchmarks", 
-            f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}"
-        )
-        data_path = os.path.join(folder_name, f"grid_search_results_{args.N}.pt")
-        
-        print(f"Loading benchmarks from: {data_path}")
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"Benchmark file not found: {data_path}")
+        dataset_csv_path = os.path.join("save", "torch_grid_search", f"{args.dataset}.csv")
+        if not os.path.exists(dataset_csv_path):
+            raise FileNotFoundError(f"Benchmark CSV not found: {dataset_csv_path}")
 
-        benchmark_data = torch.load(data_path, weights_only=False)
-        
-        # Extract optimal parameters
-        best_params = benchmark_data['best_params']
-        infl = best_params['infl']
-        loc_radius = best_params['loc_radius']
-        
+        signature = _build_torch_grid_signature(args)
+        setting_id = _make_setting_id(signature)
+        df = pd.read_csv(dataset_csv_path)
+        if "setting_id" not in df.columns:
+            raise KeyError(f"'setting_id' column is missing from {dataset_csv_path}.")
+
+        match = df[df["setting_id"].astype(str) == str(setting_id)]
+        if match.empty:
+            raise KeyError(
+                f"No torch grid-search row matched setting_id={setting_id} in {dataset_csv_path}."
+            )
+
+        row = match.iloc[0]
+        infl = row.get("best_infl", np.nan)
+        loc_radius = row.get("best_loc_radius", np.nan)
+
+        print(f"Loading benchmarks from: {dataset_csv_path} (setting_id={setting_id})")
         return infl, loc_radius
 
     else:
@@ -137,7 +199,7 @@ if __name__ == "__main__":
     
     # === Configuration ===
     # Set the benchmark source here: 'dapper' (CSV) or 'torch' (Grid Search .pt)
-    BENCHMARK_SOURCE = 'dapper' 
+    BENCHMARK_SOURCE = 'torch' 
     # =====================
 
     folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")

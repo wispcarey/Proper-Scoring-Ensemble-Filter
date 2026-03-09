@@ -4,6 +4,7 @@
 # Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX)
 
 SLURM_SCRIPT="slurm_highdim_train.sh"
+GPU_TYPE="${1:-p100}"
 
 # Default values
 DEF_DATASET="lorenz96"
@@ -169,6 +170,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     # Submit using --export=ALL to pass the exported environment variables
     sbatch -J "$JOB_NAME" \
            --time="$TIME_LIMIT" \
+           --gres="gpu:${GPU_TYPE}:1" \
            --export=ALL \
            "$SLURM_SCRIPT"
 done
