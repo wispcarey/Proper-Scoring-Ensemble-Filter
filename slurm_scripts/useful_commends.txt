@@ -2,6 +2,7 @@
 squeue -u bhchen -t RUNNING -h | wc -l
 squeue -u bhchen -t PENDING -h | wc -l
 squeue -u bhchen -h | wc -l
+squeue -u bhchen -h -o "%j"
 
 # -maxdepth 1: stay in current folder
 # -type d: look for directories only
