@@ -10,13 +10,18 @@
 #SBATCH -J "grid-bench"
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o slurm.%N.%j.out
-#SBATCH -e slurm.%N.%j.err
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="${REPO_ROOT:-}"
+if [ -z "$REPO_ROOT" ]; then
+    echo "Error: REPO_ROOT is not set. Submit via submit_grid_search_benchmark.sh or export REPO_ROOT explicitly." >&2
+    exit 1
+fi
+if [ ! -f "$REPO_ROOT/grid_search_benchmark.py" ]; then
+    echo "Error: REPO_ROOT='$REPO_ROOT' does not contain grid_search_benchmark.py." >&2
+    exit 1
+fi
 cd "$REPO_ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"

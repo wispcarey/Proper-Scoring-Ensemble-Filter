@@ -17,13 +17,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="$SCRIPT_DIR/slurm_grid_search_benchmark.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+OUTPUT_DIR="$SCRIPT_DIR/grid_search/out"
+ERROR_DIR="$SCRIPT_DIR/grid_search/err"
 
 DEFAULT_TIME_LIMIT="${DEFAULT_TIME_LIMIT:-2-00:00:00}"
 ENSEMBLE_SIZES="${ENSEMBLE_SIZES:-5 10 15 20 40 60 100}"
 GRID_SEARCH_NUM_SEEDS="${GRID_SEARCH_NUM_SEEDS:-4}"
 SEED="${SEED:-42}"
-CPU_WORKERS=64
+CPU_WORKERS=32
 CPUS_PER_TASK=64
+
+mkdir -p "$OUTPUT_DIR" "$ERROR_DIR"
 
 sanitize_token() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
@@ -93,12 +98,15 @@ for trial in "${TRIALS[@]}"; do
 
     echo "Submitting: $job_name"
     echo "  DATASET=$dataset METHOD=$method OBS_FN=$obs_fn"
-    echo "  ENSEMBLE_SIZES=$ENSEMBLE_SIZES GRID_SEARCH_NUM_SEEDS=$GRID_SEARCH_NUM_SEEDS SEED=$SEED TIME_LIMIT=$time_limit"
+    echo "  REPO_ROOT=$REPO_ROOT"
+    echo "  ENSEMBLE_SIZES=$ENSEMBLE_SIZES GRID_SEARCH_NUM_SEEDS=$GRID_SEARCH_NUM_SEEDS SEED=$SEED TIME_LIMIT=$time_limit CPU_WORKERS=$CPU_WORKERS"
 
     sbatch \
         -J "$job_name" \
         --time="$time_limit" \
         --cpus-per-task="$CPUS_PER_TASK" \
-        --export=ALL,DATASET="$dataset",METHOD="$method",OBS_FN="$obs_fn",ENSEMBLE_SIZES="$ENSEMBLE_SIZES",GRID_SEARCH_NUM_SEEDS="$GRID_SEARCH_NUM_SEEDS",SEED="$SEED",CPU_WORKERS="$CPU_WORKERS",ADAPTIVE_SIGMA_Y=true \
+        --output="$OUTPUT_DIR/%x.%j.out" \
+        --error="$ERROR_DIR/%x.%j.err" \
+        --export=ALL,REPO_ROOT="$REPO_ROOT",DATASET="$dataset",METHOD="$method",OBS_FN="$obs_fn",ENSEMBLE_SIZES="$ENSEMBLE_SIZES",GRID_SEARCH_NUM_SEEDS="$GRID_SEARCH_NUM_SEEDS",SEED="$SEED",CPU_WORKERS="$CPU_WORKERS",ADAPTIVE_SIGMA_Y=true \
         "$SLURM_SCRIPT"
 done
