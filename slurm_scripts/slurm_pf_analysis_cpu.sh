@@ -18,12 +18,7 @@
 set -e
 
 # Change to repo root
-REPO_ROOT="${REPO_ROOT:-/home/bhchen/LearnKalmanGain}"
-if [ ! -f "$REPO_ROOT/analyze_pf_results.py" ]; then
-    echo "Error: REPO_ROOT='$REPO_ROOT' does not contain analyze_pf_results.py." >&2
-    exit 1
-fi
-cd "$REPO_ROOT"
+cd ..
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
