@@ -2,7 +2,7 @@
 
 # Submit this script with: sbatch slurm_scripts/slurm_pf_analysis_cpu.sh
 
-#SBATCH --time=03:00:00
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -J "pf-analysis"
@@ -23,16 +23,16 @@ if [ ! -f "$REPO_ROOT/analyze_pf_results.py" ]; then
 fi
 cd "$REPO_ROOT"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/bhchen/miniconda3/bin/python}"
-if [ ! -x "$PYTHON_BIN" ]; then
-    echo "Error: required Python interpreter is not executable: $PYTHON_BIN" >&2
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Error: Python command is not available in PATH: $PYTHON_BIN" >&2
     exit 127
 fi
 
 echo "Date: $(date)"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "Host: $(hostname)"
-echo "Python: $PYTHON_BIN"
+echo "Python: $(command -v "$PYTHON_BIN")"
 echo "Device: cpu"
 echo "----------------------------------------------------"
 
