@@ -4,11 +4,14 @@ cd ..
 
 dataset="lorenz63"
 seed=42
+plot_start_step=1
+plot_interval_step=1
+plot_end_step=500
 
 # Define experiments as quartets: "MethodName Checkpoint_Path Sigma_Y Obs_Fn"
 # Format: "MethodName Path/To/Checkpoint SigmaValue ObsFn"
 results_root="save/lorenz63_results"
-obs_fn_list=("identity")
+obs_fn_list=("square")
 
 contains_obs_fn() {
     local candidate="$1"
@@ -68,9 +71,10 @@ for exp in "${experiments[@]}"; do
     echo "=================================================="
 
     # Loop 2: Iterate through N
-    for N in 5 10 15 20 40 60 100; do
+    # for N in 5 10 15 20 40 60 100; do
+    for N in 100; do
         cmd=(
-            python evaluate.py
+            /home/bhchen/miniconda3/bin/python evaluate.py
             --dataset "$dataset"
             --N "$N"
             --seed "$seed"
@@ -84,6 +88,9 @@ for exp in "${experiments[@]}"; do
             --sigma_reg None
             --cp_load_path "$cp_path"
             --save_test_figures
+            --test_snapshot_start_step "$plot_start_step"
+            --test_snapshot_interval "$plot_interval_step"
+            --test_snapshot_end_step "$plot_end_step"
         )
 
         if [ "$current_sigma_y" = "adaptive" ]; then

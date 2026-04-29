@@ -1119,12 +1119,24 @@ def _save_separate_legend(
     dpi: int = 200,
 ) -> None:
     """Create and save a standalone horizontal legend image."""
+    handle_prior_density = mpatches.Patch(
+        facecolor='blue',
+        alpha=0.22,
+        edgecolor='none',
+        label='predictive density',
+    )
     handle_prior = Line2D([0], [0], marker='o', linestyle='None',
                           markerfacecolor='blue', markeredgecolor='none', markersize=8,
-                          label='Predictive (prior) distribution')
+                          label='predictive ensemble')
+    handle_posterior_density = mpatches.Patch(
+        facecolor='red',
+        alpha=0.22,
+        edgecolor='none',
+        label='filtering density',
+    )
     handle_posterior = Line2D([0], [0], marker='o', linestyle='None',
                               markerfacecolor='red', markeredgecolor='white', markersize=8,
-                              label='Filtering (posterior) distribution')
+                              label='filtering ensemble')
     handle_obs = Line2D([0], [0], marker='*', linestyle='None',
                         markerfacecolor='orange', markeredgecolor='black', markersize=14,
                         label='Observation')
@@ -1136,15 +1148,17 @@ def _save_separate_legend(
 
     handles = []
     if include_prior:
+        handles.append(handle_prior_density)
         handles.append(handle_prior)
     if include_posterior:
+        handles.append(handle_posterior_density)
         handles.append(handle_posterior)
     if include_obs:
         handles.append(handle_obs)
-    if include_history:
-        handles.append(handle_traj)
     if include_true_state:
         handles.append(handle_true)
+    if include_history:
+        handles.append(handle_traj)
 
     labels = [h.get_label() for h in handles]
     _save_horizontal_legend_image(
@@ -1177,7 +1191,7 @@ def _save_combined_prior_post_legend(
             [0], [0],
             marker='o', linestyle='None',
             markerfacecolor='red', markeredgecolor='white', markersize=8,
-            label='filtered ensemble',
+            label='filtering ensemble',
         ),
     ]
     if include_obs:
@@ -1204,18 +1218,8 @@ def _save_combined_prior_post_legend(
         )
 
     bottom_handles: List = [
-        Line2D(
-            [0], [0],
-            marker='o', linestyle='None',
-            markerfacecolor='blue', markeredgecolor='none', markersize=8,
-            label='predictive density',
-        ),
-        Line2D(
-            [0], [0],
-            marker='o', linestyle='None',
-            markerfacecolor='red', markeredgecolor='white', markersize=8,
-            label='filtering density',
-        ),
+        mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none', label='predictive density'),
+        mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none', label='filtering density'),
     ]
 
     _save_two_row_legend_image(
@@ -2037,7 +2041,7 @@ def plot_and_test_point_clouds(
     projection_specs = [
         ("xy", 0, 1, "x", "y", fixed_limits["xlim"], fixed_limits["ylim"]),
         ("yz", 1, 2, "y", "z", fixed_limits["ylim"], fixed_limits["zlim"]),
-        ("zx", 2, 0, "z", "x", fixed_limits["zlim"], fixed_limits["xlim"]),
+        ("xz", 0, 2, "x", "z", fixed_limits["xlim"], fixed_limits["zlim"]),
     ]
 
     for i in indices_to_process:
@@ -2235,7 +2239,7 @@ def plot_and_test_point_clouds(
                 prior_fixed_pca_custom,
                 prior_adapt_pca_custom,
                 "blue",
-                "Predictive (prior) distribution",
+                "predictive ensemble",
                 prior_ratio_str,
                 prior_marker_size_2d * prior_size_scale,
                 prior_marker_alpha_2d,
@@ -2256,7 +2260,7 @@ def plot_and_test_point_clouds(
                 post_fixed_pca_custom,
                 post_adapt_pca_custom,
                 "red",
-                "Filtering (posterior) distribution",
+                "filtering ensemble",
                 post_ratio_str,
                 post_marker_size_2d * post_size_scale,
                 post_marker_alpha_2d,
@@ -2339,7 +2343,7 @@ def plot_and_test_point_clouds(
                     elif plane_tag == "yz":
                         xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
                     else:
-                        xlim_curr, ylim_curr = lim_xyz["zlim"], lim_xyz["xlim"]
+                        xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["zlim"]
                     view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
                     for plot_style in ["scatter", "contour"]:
                         plot_points = mode_points_scatter if plot_style == "scatter" else mode_points_contour
@@ -2451,7 +2455,7 @@ def plot_and_test_point_clouds(
                         elif plane_tag == "yz":
                             xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
                         else:
-                            xlim_curr, ylim_curr = lim_xyz["zlim"], lim_xyz["xlim"]
+                            xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["zlim"]
                         view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
 
                         fig_mix, ax_mix = plt.subplots(figsize=(7.2, 6.2))
@@ -2666,13 +2670,13 @@ def plot_and_test_point_clouds(
             legend_prefix_prior,
             include_prior=True,
             include_posterior=False,
-            include_obs=False,
+            include_obs=True,
             include_history=False,
             include_true_state=(true_state is not None),
         )
         _save_combined_prior_post_legend(
             legend_prefix_combined,
-            include_obs=False,
+            include_obs=True,
             include_history=False,
             include_true_state=(true_state is not None),
             dpi=200,
@@ -2681,13 +2685,359 @@ def plot_and_test_point_clouds(
             legend_prefix_post,
             include_prior=False,
             include_posterior=True,
-            include_obs=False,
+            include_obs=True,
             include_history=False,
             include_true_state=(true_state is not None),
         )
 
     print(f"Processed {len(indices_to_process)} PF point-cloud pairs with prefix '{prefix}'.")
     return distance_records
+
+
+def plot_pf_initial_distribution(
+    args: Namespace,
+    tensor: torch.Tensor,
+    num_samples_plot: int,
+    prefix: str,
+    true_state: Optional[torch.Tensor] = None,
+    plot_indices: Optional[List[int]] = None,
+    legend_in_figure: bool = True,
+    plot_cdf: bool = False,
+) -> None:
+    """
+    Save PF initialization figures using the plotting style appropriate for the model.
+
+    - dim >= 3 and supported 3D datasets: PF-style 2D/PCA/3D views for one cloud.
+    - dim in {1, 2}: ring-mapped initialization plot, optionally with phase CDF/PDF.
+    """
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    if true_state is not None and isinstance(true_state, torch.Tensor) and true_state.is_cuda:
+        true_state = true_state.cpu()
+
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected tensor shape (B, N, D), got {tuple(tensor.shape)}")
+
+    dataset = str(getattr(args, "dataset", "")).lower()
+    _, _, d_state = tensor.shape
+    if d_state >= 3 and dataset in PF_3D_SUPPORTED_DATASETS:
+        _plot_pf_initial_distribution_3d(
+            args=args,
+            tensor=tensor,
+            num_samples_plot=num_samples_plot,
+            prefix=prefix,
+            true_state=true_state,
+            plot_indices=plot_indices,
+            legend_in_figure=legend_in_figure,
+        )
+        return
+
+    plot_and_test_point_clouds_ring(
+        args=args,
+        tensor=tensor,
+        num_samples_plot=num_samples_plot,
+        prefix=prefix,
+        point_color="blue",
+        observation=None,
+        true_state=true_state,
+        plot_history=False,
+        plot_indices=plot_indices,
+        history_traj=None,
+        plot_cdf=plot_cdf,
+        legend_in_figure=legend_in_figure,
+        standalone_legend_name="init_density",
+        save_combined_prior_post_legend=False,
+    )
+
+
+def _plot_pf_initial_distribution_3d(
+    args: Namespace,
+    tensor: torch.Tensor,
+    num_samples_plot: int,
+    prefix: str,
+    true_state: Optional[torch.Tensor] = None,
+    plot_indices: Optional[List[int]] = None,
+    legend_in_figure: bool = True,
+) -> None:
+    """Save PF-style initialization views for one 3D-supported cloud."""
+    dataset = str(getattr(args, "dataset", "")).lower()
+    if dataset not in PF_3D_SUPPORTED_DATASETS:
+        raise ValueError(
+            f"PF 3D initialization plotter supports only {sorted(PF_3D_SUPPORTED_DATASETS)}, got dataset='{dataset}'."
+        )
+
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    if true_state is not None and isinstance(true_state, torch.Tensor) and true_state.is_cuda:
+        true_state = true_state.cpu()
+
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected tensor shape (B, N, D), got {tuple(tensor.shape)}")
+
+    batch_size, _, state_dim = tensor.shape
+    if state_dim < 3:
+        raise ValueError(f"PF 3D initialization plotter expects D >= 3, got D={state_dim}.")
+
+    if plot_indices is None:
+        indices_to_process = list(range(batch_size))
+    else:
+        indices_to_process = [idx for idx in plot_indices if 0 <= idx < batch_size]
+
+    if len(indices_to_process) == 0:
+        return
+
+    contour_grid_bins = int(max(16, int(getattr(args, "pf_contour_grid_bins", 200))))
+    fixed_limits = PF_FIXED_RANGES_3D[dataset]
+    projection_specs = [
+        ("xy", 0, 1, "x", "y"),
+        ("yz", 1, 2, "y", "z"),
+        ("xz", 0, 2, "x", "z"),
+    ]
+
+    for i in indices_to_process:
+        full_points = tensor[i, :, :]
+        display_points = full_points[:, :3]
+        true_xyz = _resolve_true_state_xyz(true_state=true_state, batch_idx=i, batch_size=batch_size)
+        adaptive_limits = _compute_zoomed_ranges_from_fixed_3d(
+            points_xyz=display_points.numpy(),
+            fixed_limits=fixed_limits,
+            num_splits=10,
+        )
+
+        points_for_vis = _sample_points(full_points, num_samples_plot)
+        scatter_ds, scatter_downsampled = _prepare_scatter_points(
+            points_for_vis,
+            max_points=PF_MAX_SCATTER_POINTS,
+        )
+        contour_ds, _ = _prepare_scatter_points(
+            points_for_vis,
+            max_points=PF_MAX_CONTOUR_POINTS,
+        )
+
+        scatter_xyz = scatter_ds[:, :3].numpy()
+        contour_xyz = contour_ds[:, :3].numpy()
+        marker_size_2d, marker_alpha_2d = _adaptive_scatter_style(
+            n_points=scatter_xyz.shape[0],
+            is_3d=False,
+            downsampled=scatter_downsampled,
+        )
+        marker_size_3d, marker_alpha_3d = _adaptive_scatter_style(
+            n_points=scatter_xyz.shape[0],
+            is_3d=True,
+            downsampled=scatter_downsampled,
+        )
+
+        pca_mean, pca_basis = _fit_pca_2d(full_points.numpy())
+        scatter_pca = _project_pca_2d(scatter_ds.numpy(), pca_mean, pca_basis)
+        contour_pca = _project_pca_2d(contour_ds.numpy(), pca_mean, pca_basis)
+        true_pca = None
+        if true_state is not None:
+            ts = torch.as_tensor(true_state).detach().cpu()
+            true_full = None
+            if ts.ndim == 1 and ts.numel() == state_dim:
+                true_full = ts.numpy().astype(np.float64)
+            elif ts.ndim == 2:
+                if ts.shape[0] == batch_size and ts.shape[1] == state_dim:
+                    true_full = ts[i].numpy().astype(np.float64)
+                elif ts.shape[0] > 0 and ts.shape[1] == state_dim:
+                    true_full = ts[0].numpy().astype(np.float64)
+            if true_full is not None:
+                true_pca = _project_pca_2d(true_full.reshape(1, -1), pca_mean, pca_basis)[0]
+
+        fixed_pca_xlim, fixed_pca_ylim = _pca_limits_from_xyz_ranges(
+            xyz_limits=fixed_limits,
+            mean=pca_mean[:3],
+            basis=pca_basis[:3, :2],
+            pad=0,
+        )
+        adapt_pca_xlim, adapt_pca_ylim = _pca_limits_from_xyz_ranges(
+            xyz_limits=adaptive_limits,
+            mean=pca_mean[:3],
+            basis=pca_basis[:3, :2],
+            pad=0,
+        )
+
+        range_modes = [
+            ("fixed", fixed_limits, fixed_pca_xlim, fixed_pca_ylim),
+            ("adaptive", adaptive_limits, adapt_pca_xlim, adapt_pca_ylim),
+        ]
+        for range_tag, lim_xyz, lim_pca_x, lim_pca_y in range_modes:
+            for plane_tag, dim_x, dim_y, x_label, y_label in projection_specs:
+                if plane_tag == "xy":
+                    xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["ylim"]
+                elif plane_tag == "yz":
+                    xlim_curr, ylim_curr = lim_xyz["ylim"], lim_xyz["zlim"]
+                else:
+                    xlim_curr, ylim_curr = lim_xyz["xlim"], lim_xyz["zlim"]
+                view_name = "12" if plane_tag == "xy" else ("23" if plane_tag == "yz" else "13")
+                for plot_style in ["scatter", "contour"]:
+                    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+                    _plot_pf_projection_2d(
+                        ax=ax,
+                        points=scatter_xyz if plot_style == "scatter" else contour_xyz,
+                        point_color="blue",
+                        point_label="Initialization distribution",
+                        dim_x=dim_x,
+                        dim_y=dim_y,
+                        marker_size=marker_size_2d,
+                        marker_alpha=marker_alpha_2d,
+                        true_xyz=true_xyz,
+                        xlim=xlim_curr,
+                        ylim=ylim_curr,
+                        legend_in_figure=False,
+                        dataset=dataset,
+                        contour_grid_bins=contour_grid_bins,
+                        draw_scatter=(plot_style == "scatter"),
+                        draw_contour=(plot_style == "contour"),
+                    )
+                    if legend_in_figure:
+                        ax.set_xlabel(x_label)
+                        ax.set_ylabel(y_label)
+                        ax.set_title(f"{dataset} initialization {plane_tag} ({range_tag}, {plot_style})", fontsize=10)
+                        handles = []
+                        labels = []
+                        if plot_style == "scatter":
+                            handles.append(
+                                Line2D([0], [0], marker='o', linestyle='None', markerfacecolor='blue', markeredgecolor='none', markersize=7)
+                            )
+                            labels.append("Initialization distribution")
+                        else:
+                            handles.append(mpatches.Patch(facecolor='blue', alpha=0.68, edgecolor='none'))
+                            labels.append("Initialization contour")
+                        if true_xyz is not None and np.all(np.isfinite(true_xyz[:3])):
+                            handles.append(
+                                Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10)
+                            )
+                            labels.append("True state")
+                        ax.legend(handles, labels, loc='best', fontsize=8, frameon=True)
+                    else:
+                        ax.set_xlabel("")
+                        ax.set_ylabel("")
+                        ax.set_title("")
+                    fig.tight_layout()
+                    save_path = f"{prefix}_{i}_init_{range_tag}_{view_name}.png"
+                    if plot_style == "contour":
+                        save_path = f"{prefix}_{i}_init_{range_tag}_{view_name}_contour.png"
+                    fig.savefig(save_path, bbox_inches='tight', dpi=150)
+                    plt.close(fig)
+
+            for plot_style in ["scatter", "contour"]:
+                fig_pca, ax_pca = plt.subplots(figsize=(7.2, 6.2))
+                if plot_style == "contour":
+                    _draw_density_contours_2d(
+                        ax=ax_pca,
+                        points_xy=contour_pca,
+                        xlim=lim_pca_x,
+                        ylim=lim_pca_y,
+                        point_color="blue",
+                        grid_bins=contour_grid_bins,
+                    )
+                else:
+                    ax_pca.scatter(
+                        scatter_pca[:, 0],
+                        scatter_pca[:, 1],
+                        s=float(marker_size_2d),
+                        alpha=float(min(0.98, marker_alpha_2d)),
+                        c='blue',
+                        edgecolors='none',
+                        zorder=4,
+                        label='Initialization distribution',
+                    )
+                if true_pca is not None and np.all(np.isfinite(true_pca)):
+                    ax_pca.scatter(
+                        true_pca[0], true_pca[1],
+                        marker='x', s=120, c='black', linewidths=2.0, zorder=12, label='True state'
+                    )
+                ax_pca.set_xlim(lim_pca_x)
+                ax_pca.set_ylim(lim_pca_y)
+                if legend_in_figure:
+                    ax_pca.set_xlabel("PC1")
+                    ax_pca.set_ylabel("PC2")
+                    ax_pca.set_title(f"{dataset} initialization pca12 ({range_tag}, {plot_style})", fontsize=10)
+                    handles = []
+                    labels = []
+                    if plot_style == "scatter":
+                        handles.append(
+                            Line2D([0], [0], marker='o', linestyle='None', markerfacecolor='blue', markeredgecolor='none', markersize=7)
+                        )
+                        labels.append("Initialization distribution")
+                    else:
+                        handles.append(mpatches.Patch(facecolor='blue', alpha=0.68, edgecolor='none'))
+                        labels.append("Initialization contour")
+                    if true_pca is not None and np.all(np.isfinite(true_pca)):
+                        handles.append(
+                            Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10)
+                        )
+                        labels.append("True state")
+                    ax_pca.legend(handles, labels, loc='best', fontsize=8, frameon=True)
+                else:
+                    ax_pca.set_xlabel("")
+                    ax_pca.set_ylabel("")
+                    ax_pca.set_title("")
+                fig_pca.tight_layout()
+                save_path = f"{prefix}_{i}_init_{range_tag}_PCA12.png"
+                if plot_style == "contour":
+                    save_path = f"{prefix}_{i}_init_{range_tag}_PCA12_contour.png"
+                fig_pca.savefig(save_path, bbox_inches='tight', dpi=150)
+                plt.close(fig_pca)
+
+        fig3d = plt.figure(figsize=(8.0, 8.0))
+        ax3d = fig3d.add_subplot(111, projection='3d')
+        ax3d.scatter(
+            scatter_xyz[:, 0],
+            scatter_xyz[:, 1],
+            scatter_xyz[:, 2],
+            s=float(marker_size_3d),
+            alpha=float(min(0.98, marker_alpha_3d)),
+            c='blue',
+            edgecolors='none',
+            label='Initialization distribution',
+        )
+        if true_xyz is not None and np.all(np.isfinite(true_xyz[:3])):
+            ax3d.scatter(
+                true_xyz[0], true_xyz[1], true_xyz[2],
+                marker='x', s=130, c='black', linewidths=2.0, zorder=12, label='True state',
+            )
+        ax3d.set_xlim(fixed_limits["xlim"])
+        ax3d.set_ylim(fixed_limits["ylim"])
+        ax3d.set_zlim(fixed_limits["zlim"])
+        ax3d.view_init(
+            elev=float(getattr(args, "pf_3d_elev", 25.0)),
+            azim=float(getattr(args, "pf_3d_azim", -55.0)),
+        )
+        if legend_in_figure:
+            ax3d.set_xlabel("x")
+            ax3d.set_ylabel("y")
+            ax3d.set_zlabel("z")
+            ax3d.set_title(f"{dataset} initialization 3D fixed", fontsize=11)
+            ax3d.legend(loc='best', fontsize=8, frameon=True)
+        else:
+            ax3d.set_title("")
+            ax3d.set_xlabel("")
+            ax3d.set_ylabel("")
+            ax3d.set_zlabel("")
+        fig3d.savefig(f"{prefix}_{i}_init_3d_fixed.png", bbox_inches='tight', dpi=150)
+        plt.close(fig3d)
+
+    if not legend_in_figure:
+        handles = [
+            Line2D([0], [0], marker='o', linestyle='None', markerfacecolor='blue', markeredgecolor='none', markersize=8),
+        ]
+        labels = ["Initialization distribution"]
+        if true_state is not None:
+            handles.append(
+                Line2D([0], [0], marker='x', linestyle='None', color='black', markeredgecolor='black', markersize=10)
+            )
+            labels.append("True state")
+        _save_horizontal_legend_image(
+            prefix=f"{prefix}_init_legend",
+            handles=handles,
+            labels=labels,
+            save_pdf=False,
+            dpi=150,
+            fontsize=11,
+            frameon=True,
+        )
 
 
 def _map_state_to_ring_xy(points: torch.Tensor) -> torch.Tensor:
@@ -2969,6 +3319,8 @@ def plot_and_test_point_clouds_ring(
     history_traj: Optional[torch.Tensor] = None,
     plot_cdf: bool = True,
     legend_in_figure: bool = True,
+    standalone_legend_name: Optional[str] = None,
+    save_combined_prior_post_legend: bool = True,
 ):
     """
     Visualize 1D/2D point clouds on a unit circle using 2D density estimation.
@@ -3022,10 +3374,13 @@ def plot_and_test_point_clouds_ring(
     if point_color not in {"red", "blue"}:
         point_color = "blue"
     if point_color == "blue":
+        ensemble_label = "predictive ensemble"
         density_label = "predictive density"
     elif point_color == "red":
+        ensemble_label = "filtering ensemble"
         density_label = "filtering density"
     else:
+        ensemble_label = "ensemble"
         density_label = "phase density"
 
     if plot_indices is None:
@@ -3098,9 +3453,9 @@ def plot_and_test_point_clouds_ring(
             # Small ensembles: plot all points directly.
             ax.scatter(
                 xy_plot[:, 0], xy_plot[:, 1],
-                s=50, alpha=0.55, c=point_color, edgecolors='none', label='Ensemble'
+                s=50, alpha=0.55, c=point_color, edgecolors='none', label=ensemble_label
             )
-            _add_label('Ensemble')
+            _add_label(ensemble_label)
         else:
             # Large ensembles: density view is clearer.
             cmap = 'Reds' if point_color == 'red' else 'Blues'
@@ -3268,53 +3623,83 @@ def plot_and_test_point_clouds_ring(
 
     if not legend_in_figure:
         density_color = 'red' if point_color == 'red' else 'blue'
-        legend_handles: List = [
-            Line2D([0], [0], marker='o', linestyle='None',
-                   markerfacecolor=point_color, markeredgecolor='none', markersize=8),
-            Line2D([0], [0], marker='x', linestyle='None',
-                   color='black', markeredgecolor='black', markersize=10),
-            Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0),
-            mpatches.Patch(facecolor=density_color, alpha=0.22, edgecolor='none'),
-        ]
-        legend_labels: List[str] = ['Ensemble', 'True state', 'Observation', 'Density']
+        legend_handles: List = []
+        legend_labels: List[str] = []
+
+        show_ensemble = (
+            ensemble_label in legend_labels_used
+            or 'Ensemble density' in legend_labels_used
+            or density_label in legend_labels_used
+        )
+        if show_ensemble:
+            legend_handles.append(
+                Line2D([0], [0], marker='o', linestyle='None',
+                       markerfacecolor=point_color, markeredgecolor='none', markersize=8)
+            )
+            legend_labels.append(ensemble_label)
+        if density_label in legend_labels_used:
+            legend_handles.append(
+                mpatches.Patch(facecolor=density_color, alpha=0.22, edgecolor='none')
+            )
+            legend_labels.append(density_label)
+        if 'History trajectory' in legend_labels_used:
+            legend_handles.append(
+                Line2D([0], [0], color='black', linewidth=1.5)
+            )
+            legend_labels.append('History trajectory')
+        if 'Observation' in legend_labels_used:
+            legend_handles.append(
+                Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0)
+            )
+            legend_labels.append('Observation')
+        if 'True state' in legend_labels_used:
+            legend_handles.append(
+                Line2D([0], [0], marker='x', linestyle='None',
+                       color='black', markeredgecolor='black', markersize=10)
+            )
+            legend_labels.append('True state')
 
         legend_dir = os.path.dirname(prefix) or "."
-        legend_name = "post_density" if point_color == "red" else "prior_density"
+        legend_name = standalone_legend_name
+        if not legend_name:
+            legend_name = "post_density" if point_color == "red" else "prior_density"
         legend_prefix = os.path.join(legend_dir, legend_name)
 
-        _save_horizontal_legend_image(
-            prefix=legend_prefix,
-            handles=legend_handles,
-            labels=legend_labels,
-            save_pdf=False,
-            dpi=150,
-            fontsize=11,
-            frameon=True,
-        )
-        combined_legend_prefix = os.path.join(legend_dir, "prior_post_density_combined")
-        combined_top_handles: List = [
-            Line2D([0], [0], marker='o', linestyle='None',
-                   markerfacecolor='blue', markeredgecolor='none', markersize=8, label='predictive ensemble'),
-            Line2D([0], [0], marker='o', linestyle='None',
-                   markerfacecolor='red', markeredgecolor='white', markersize=8, label='filtered ensemble'),
-            Line2D([0], [0], marker='x', linestyle='None',
-                   color='black', markeredgecolor='black', markersize=10, label='True state'),
-            Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0, label='Observation'),
-        ]
-        combined_bottom_handles: List = [
-            mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none', label='predictive density'),
-            mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none', label='filtering density'),
-        ]
-        _save_two_row_legend_image(
-            prefix=combined_legend_prefix,
-            top_handles=combined_top_handles,
-            top_labels=[h.get_label() for h in combined_top_handles],
-            bottom_handles=combined_bottom_handles,
-            bottom_labels=[h.get_label() for h in combined_bottom_handles],
-            save_pdf=False,
-            dpi=150,
-            fontsize=11,
-            frameon=True,
-        )
+        if len(legend_handles) > 0:
+            _save_horizontal_legend_image(
+                prefix=legend_prefix,
+                handles=legend_handles,
+                labels=legend_labels,
+                save_pdf=False,
+                dpi=150,
+                fontsize=11,
+                frameon=True,
+            )
+        if save_combined_prior_post_legend:
+            combined_legend_prefix = os.path.join(legend_dir, "prior_post_density_combined")
+            combined_top_handles: List = [
+                Line2D([0], [0], marker='o', linestyle='None',
+                       markerfacecolor='blue', markeredgecolor='none', markersize=8, label='predictive ensemble'),
+                Line2D([0], [0], marker='o', linestyle='None',
+                       markerfacecolor='red', markeredgecolor='white', markersize=8, label='filtering ensemble'),
+                Line2D([0], [0], marker='x', linestyle='None',
+                       color='black', markeredgecolor='black', markersize=10, label='True state'),
+                Line2D([0], [0], color='orange', linestyle='--', linewidth=2.0, label='Observation'),
+            ]
+            combined_bottom_handles: List = [
+                mpatches.Patch(facecolor='blue', alpha=0.22, edgecolor='none', label='predictive density'),
+                mpatches.Patch(facecolor='red', alpha=0.22, edgecolor='none', label='filtering density'),
+            ]
+            _save_two_row_legend_image(
+                prefix=combined_legend_prefix,
+                top_handles=combined_top_handles,
+                top_labels=[h.get_label() for h in combined_top_handles],
+                bottom_handles=combined_bottom_handles,
+                bottom_labels=[h.get_label() for h in combined_bottom_handles],
+                save_pdf=False,
+                dpi=150,
+                fontsize=11,
+                frameon=True,
+            )
 
     print(f"Processed {len(indices_to_process)} ring-mapped point clouds with prefix '{prefix}'.")

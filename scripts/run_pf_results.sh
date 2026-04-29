@@ -113,7 +113,8 @@ for seed_val in "${SEEDS[@]}"; do
             --pf_verification \
             --pf_N "$pf_n_val" \
             --sigma_reg None \
-            --pf_save_figure 
+            --pf_save_figure \
+            --suffix "quick_test"
         
         echo "Done."
         echo ""

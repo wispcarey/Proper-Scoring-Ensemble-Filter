@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import math
+from scipy.special import hyp1f1, gammaln
 from config.dataset_info import DATASET_INFO
 
 from utils import L63, L96, Rossler, rk4, etd_rk4_wrapper, CircleODE, DoubleWellODE, DoublingMap1D, ComplexSquareMap2D
@@ -19,6 +20,7 @@ from visualization import (
     plot_particle_trajectories,
     plot_and_test_point_clouds,
     plot_and_test_point_clouds_ring,
+    plot_pf_initial_distribution,
     plot_linear_kalman_vs_method_2d,
     _compute_axis_limits,
     _compute_zoomed_ranges_from_fixed_3d,
@@ -41,7 +43,6 @@ from typing import Optional, List, Tuple, Dict, Any
 
 from tqdm.auto import tqdm
 
-L63_TEST_SNAPSHOT_STEPS = [100, 200, 300, 400, 500]
 L63_FIXED_LIMITS_3D = {
     "xlim": (-22.0, 22.0),
     "ylim": (-30.0, 30.0),
@@ -82,6 +83,68 @@ def _resolve_obs_fn_for_pf_paths(args) -> str:
     if obs_fn == "default":
         return default_obs_fn
     return obs_fn
+
+
+def _get_dataset_plot_schedule(args) -> Tuple[int, int, Optional[int]]:
+    """Return dataset-aware default snapshot plotting schedule."""
+    dataset_key = str(getattr(args, "dataset", "")).lower()
+    dataset_cfg = DATASET_INFO.get(dataset_key, {})
+
+    start_step = getattr(args, "test_snapshot_start_step", None)
+    if start_step is None:
+        start_step = dataset_cfg.get("test_plot_start_step", 100)
+
+    step_interval = getattr(args, "test_snapshot_interval", None)
+    if step_interval is None:
+        step_interval = dataset_cfg.get("test_plot_step_interval", 100)
+
+    end_step = getattr(args, "test_snapshot_end_step", None)
+    if end_step is not None:
+        end_step = max(1, int(end_step))
+
+    return max(1, int(start_step)), max(1, int(step_interval)), end_step
+
+
+def _resolve_test_figure_prefix(
+    args,
+    fig_name: str,
+    default_fig_name: Optional[str] = None,
+    legacy_default_builder: Optional[Any] = None,
+) -> str:
+    """
+    Resolve the output prefix for saved test/eval figures.
+
+    - Default behavior: insert <test_figure_subdir>/ under the original fig_name directory.
+      Example: save/foo/test_20_0 -> save/foo/figures/test_20_0
+    - If test_figure_subdir == "": preserve the legacy fig_name behavior.
+    - If legacy_default_builder is provided and fig_name is left at its default name,
+      it is used only in the legacy mode above.
+    """
+    raw_fig_name = str(fig_name or default_fig_name or "figure")
+    subdir = getattr(args, "test_figure_subdir", "figures")
+    subdir = "" if subdir is None else str(subdir)
+
+    if subdir == "":
+        if (
+            legacy_default_builder is not None
+            and default_fig_name is not None
+            and raw_fig_name == str(default_fig_name)
+        ):
+            return str(legacy_default_builder())
+        return raw_fig_name
+
+    normalized_fig_name = os.path.normpath(raw_fig_name)
+    prefix_dir = os.path.dirname(normalized_fig_name)
+    prefix_name = os.path.basename(normalized_fig_name)
+    if prefix_name in {"", ".", os.path.sep}:
+        prefix_name = str(default_fig_name or "figure")
+
+    if prefix_dir in {"", "."}:
+        output_dir = os.path.join(".", subdir)
+    else:
+        output_dir = os.path.join(prefix_dir, subdir)
+    os.makedirs(output_dir, exist_ok=True)
+    return os.path.join(output_dir, prefix_name)
 
 
 def _pf_obs_fn_suffix(args) -> str:
@@ -1076,10 +1139,12 @@ def _resolve_snapshot_steps_for_plot(args, total_steps: int) -> List[int]:
     if total_steps <= 1:
         return []
     snapshot_steps = getattr(args, "test_snapshot_steps", None)
-    if snapshot_steps is None and str(getattr(args, "dataset", "")).lower() == "lorenz63":
-        snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
     if snapshot_steps is None:
-        snapshot_steps = [max(1, total_steps - 1)]
+        start_step, step_interval, end_step = _get_dataset_plot_schedule(args)
+        effective_end = total_steps - 1 if end_step is None else min(total_steps - 1, int(end_step))
+        snapshot_steps = list(range(start_step, effective_end + 1, step_interval))
+        if len(snapshot_steps) == 0:
+            snapshot_steps = [max(1, total_steps - 1)]
     valid = []
     for step in snapshot_steps:
         s = int(step)
@@ -1284,7 +1349,8 @@ def _resolve_global_plot_indices_for_batch(
 def _get_lowdim_snapshot_indices(
     total_steps: int,
     start_step: int = 100,
-    num_slices: int = 3,
+    step_interval: int = 100,
+    end_step: Optional[int] = None,
     step_offset: int = 0,
     explicit_step_labels: Optional[List[int]] = None,
 ):
@@ -1294,6 +1360,8 @@ def _get_lowdim_snapshot_indices(
 
     min_label = max(1 + step_offset, int(start_step))
     max_label = total_steps + step_offset
+    if end_step is not None:
+        max_label = min(max_label, int(end_step))
     if min_label > max_label:
         min_label = max_label
 
@@ -1309,10 +1377,10 @@ def _get_lowdim_snapshot_indices(
         if len(labels) == 0:
             labels = [max_label]
     else:
-        if max_label - min_label + 1 >= num_slices:
-            labels = np.rint(np.linspace(min_label, max_label, num_slices)).astype(int).tolist()
-        else:
-            labels = list(range(min_label, max_label + 1))
+        interval = max(1, int(step_interval))
+        labels = list(range(min_label, max_label + 1, interval))
+        if len(labels) == 0:
+            labels = [max_label]
 
     # De-duplicate while preserving order.
     dedup_labels = []
@@ -1342,10 +1410,12 @@ def _plot_last_three_steps_ring(
 ):
     """Use ring-mapped visualization for selected 3 low-dim slices."""
     T = ens_traj.shape[0]
+    start_step, step_interval, end_step = _get_dataset_plot_schedule(args)
     selected_steps = _get_lowdim_snapshot_indices(
         T,
-        start_step=100,
-        num_slices=3,
+        start_step=start_step,
+        step_interval=step_interval,
+        end_step=end_step,
         step_offset=step_offset,
         explicit_step_labels=snapshot_steps,
     )
@@ -1380,6 +1450,9 @@ def _plot_last_three_steps_lowdim_generic(
     ens_color: str = 'tab:red',
     dataset: Optional[str] = None,
     snapshot_steps: Optional[List[int]] = None,
+    snapshot_start_step: int = 100,
+    snapshot_step_interval: int = 100,
+    snapshot_end_step: Optional[int] = None,
 ):
     """Plot ensemble/true/obs snapshots for selected steps (dim <= 3, non-ring datasets)."""
     import matplotlib.pyplot as plt
@@ -1393,8 +1466,9 @@ def _plot_last_three_steps_lowdim_generic(
     density_threshold = 1000
     selected_steps = _get_lowdim_snapshot_indices(
         T,
-        start_step=100,
-        num_slices=3,
+        start_step=snapshot_start_step,
+        step_interval=snapshot_step_interval,
+        end_step=snapshot_end_step,
         step_offset=step_offset,
         explicit_step_labels=snapshot_steps,
     )
@@ -1770,8 +1844,7 @@ def _plot_test_visualizations(
         ring_point_color = "blue" if "blue" in str(ens_color).lower() else "red"
         dataset_key = str(getattr(args, "dataset", "")).lower()
         snapshot_steps = getattr(args, "test_snapshot_steps", None)
-        if snapshot_steps is None and dataset_key == "lorenz63":
-            snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
+        snapshot_start_step, snapshot_step_interval, snapshot_end_step = _get_dataset_plot_schedule(args)
         for bidx in plot_bidx_list:
             ens_traj = ens_tensor[:, bidx, :, :].detach().cpu()
             true_traj = true_tensor[:, bidx, :].detach().cpu()
@@ -1805,6 +1878,9 @@ def _plot_test_visualizations(
                     ens_color=ens_color,
                     dataset=dataset_key,
                     snapshot_steps=snapshot_steps,
+                    snapshot_start_step=snapshot_start_step,
+                    snapshot_step_interval=snapshot_step_interval,
+                    snapshot_end_step=snapshot_end_step,
                 )
 
             _plot_lowdim_traj_summary(
@@ -1829,8 +1905,7 @@ def _plot_test_visualizations(
         if enable_highdim_slices and int(args.ori_dim) >= 3:
             dataset_key = str(getattr(args, "dataset", "")).lower()
             snapshot_steps = getattr(args, "test_snapshot_steps", None)
-            if snapshot_steps is None and dataset_key == "lorenz63":
-                snapshot_steps = list(L63_TEST_SNAPSHOT_STEPS)
+            snapshot_start_step, snapshot_step_interval, snapshot_end_step = _get_dataset_plot_schedule(args)
             _plot_last_three_steps_lowdim_generic(
                 ens_traj=ens_tensor[:, bidx, :, :3],
                 true_traj=true_tensor[:, bidx, :3],
@@ -1842,6 +1917,9 @@ def _plot_test_visualizations(
                 ens_color=ens_color,
                 dataset=dataset_key,
                 snapshot_steps=snapshot_steps,
+                snapshot_start_step=snapshot_start_step,
+                snapshot_step_interval=snapshot_step_interval,
+                snapshot_end_step=snapshot_end_step,
             )
 
         plot_particle_trajectories_with_histograms(
@@ -2564,6 +2642,7 @@ def generate_and_cache_pf_results(
     NEW IN THIS VERSION:
     - Records BOTH prior (forecast) and posterior (analysis) ensemble statistics in the cache:
         {'prior_means', 'prior_covs', 'post_means', 'post_covs'}
+    - Saves timestep-0 initialization figures before the first forecast/update.
     - For 3D PF datasets, saves combined prior/posterior projection plots
       (adaptive + fixed ranges, including a fixed-range 3D scatter).
     - For ring datasets ('doubling1d', 'complex2d'), it also saves no-history counterparts.
@@ -2772,6 +2851,26 @@ def generate_and_cache_pf_results(
             pf_ens_v_a += torch.randn_like(pf_ens_v_a, device=args.device) * args.sigma_ens
             if args.dataset == "complex2d":
                 pf_ens_v_a = project_to_unit_circle(pf_ens_v_a)
+
+            if save_figure and (can_plot_3d or can_plot_ring):
+                save_folder = pf_vis_folder
+                os.makedirs(save_folder, exist_ok=True)
+                init_prefix_base = (
+                    f'{save_folder}/sigma_y{args.sigma_y}_batch{batch_size}_len{traj_len}_pfN{args.pf_N}'
+                    f'_timestep0_{args.seed}'
+                )
+                for bidx in vis_indices:
+                    gidx = batch_start_index + bidx
+                    plot_pf_initial_distribution(
+                        args=args,
+                        tensor=pf_ens_v_a[bidx:bidx + 1, :, :].detach().cpu(),
+                        num_samples_plot=100000 if can_plot_ring else 1000000,
+                        prefix=f"{init_prefix_base}_g{gidx}",
+                        true_state=batch_v[0, bidx].detach().cpu(),
+                        plot_indices=[0],
+                        legend_in_figure=getattr(args, "legend_in_figure", False),
+                        plot_cdf=pf_plot_ring_cdf,
+                    )
 
             # These will be stacked and cached per-batch
             batch_prior_means_to_cache, batch_prior_covs_to_cache = [], []
@@ -3211,6 +3310,13 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
     if hasattr(local_model, 'eval'): local_model.eval()
     if hasattr(st_model1, 'eval'): st_model1.eval()
     if hasattr(st_model2, 'eval'): st_model2.eval()
+
+    if plot_figures:
+        fig_name = _resolve_test_figure_prefix(
+            args=args,
+            fig_name=fig_name,
+            default_fig_name='example_fig',
+        )
     
     # Optional PF cache
     cached_pf_data = None
@@ -4098,12 +4204,18 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
     if getattr(args, "save_test_figures", False):
         plot_figures = True
 
-    # If plotting is enabled but fig_name is left as default, create a stable
-    # benchmark-style output path so generated figures are saved under save/.
-    if plot_figures and fig_name == 'example_fig':
-        auto_fig_dir = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
-        os.makedirs(auto_fig_dir, exist_ok=True)
-        fig_name = os.path.join(auto_fig_dir, f"test_{args.N}_0")
+    if plot_figures:
+        def _legacy_default_fig_name() -> str:
+            auto_fig_dir = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
+            os.makedirs(auto_fig_dir, exist_ok=True)
+            return os.path.join(auto_fig_dir, f"test_{args.N}_0")
+
+        fig_name = _resolve_test_figure_prefix(
+            args=args,
+            fig_name=fig_name,
+            default_fig_name='example_fig',
+            legacy_default_builder=_legacy_default_fig_name,
+        )
 
     m = args.N
     test_noise_gen = get_test_noise_generator(args)
@@ -5006,6 +5118,166 @@ def get_ens_cov(ens_v):
     cov = torch.bmm(ens_v_minus_mean.transpose(1, 2), ens_v_minus_mean) / (ens_v.shape[1] - 1)
     return cov
 
+
+def _batched_isotropic_std_from_cov(
+    cov: torch.Tensor,
+    atol: float = 1e-6,
+    rtol: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Detect whether each covariance matrix is isotropic, i.e. sigma^2 I.
+
+    Returns:
+        sigma: [B] isotropic standard deviation estimated from the diagonal mean.
+        is_isotropic: [B] boolean mask.
+    """
+    if cov.ndim != 3 or cov.shape[-1] != cov.shape[-2]:
+        raise ValueError(f"cov must have shape [B, D, D], got {tuple(cov.shape)}.")
+
+    cov_sym = 0.5 * (cov + cov.transpose(-1, -2))
+    batch_size, dim, _ = cov_sym.shape
+    diag = torch.diagonal(cov_sym, dim1=-2, dim2=-1)
+    sigma_sq = torch.clamp(diag.mean(dim=-1), min=0.0)
+
+    eye = torch.eye(dim, device=cov.device, dtype=cov.dtype).unsqueeze(0)
+    target = sigma_sq.view(batch_size, 1, 1) * eye
+    diff_max = torch.amax(torch.abs(cov_sym - target), dim=(-2, -1))
+    target_scale = torch.amax(torch.abs(target), dim=(-2, -1))
+    tol = atol + rtol * torch.maximum(target_scale, torch.ones_like(target_scale))
+    is_isotropic = diff_max <= tol
+    sigma = torch.sqrt(sigma_sq)
+    return sigma, is_isotropic
+
+
+def _sample_batched_gaussian(
+    mean: torch.Tensor,
+    cov: torch.Tensor,
+    num_samples: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Sample from a batch of multivariate Gaussians with shape [B, M, D]."""
+    if mean.ndim != 2:
+        raise ValueError(f"mean must have shape [B, D], got {tuple(mean.shape)}.")
+    if cov.ndim != 3 or cov.shape[0] != mean.shape[0] or cov.shape[-1] != mean.shape[-1]:
+        raise ValueError(
+            f"cov must have shape [B, D, D] matching mean; got mean={tuple(mean.shape)}, cov={tuple(cov.shape)}."
+        )
+
+    cov_sym = 0.5 * (cov + cov.transpose(-1, -2))
+    batch_size, dim = mean.shape
+    eye = torch.eye(dim, device=cov.device, dtype=cov.dtype).unsqueeze(0)
+
+    chol = None
+    for jitter in (0.0, 1e-8, 1e-6, 1e-4):
+        try:
+            chol = torch.linalg.cholesky(cov_sym + jitter * eye)
+            break
+        except RuntimeError:
+            continue
+
+    if chol is None:
+        eigvals, eigvecs = torch.linalg.eigh(cov_sym)
+        chol = eigvecs @ torch.diag_embed(torch.sqrt(torch.clamp(eigvals, min=1e-8)))
+
+    noise = torch.randn(
+        batch_size,
+        int(num_samples),
+        dim,
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(device=mean.device, dtype=mean.dtype)
+    return mean.unsqueeze(1) + torch.matmul(noise, chol.transpose(-1, -2))
+
+
+def _compute_particle_gaussian_energy_distance(
+    particles: torch.Tensor,
+    gaussian_mean: torch.Tensor,
+    gaussian_cov: torch.Tensor,
+    mc_samples: int = 256,
+    isotropic_atol: float = 1e-6,
+    isotropic_rtol: float = 1e-4,
+    mc_generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Compute the energy distance between particles and a Gaussian reference.
+
+    Uses the closed-form isotropic Gaussian expression when cov = sigma^2 I.
+    Falls back to a deterministic Monte Carlo estimate for general covariances.
+    """
+    if particles.ndim != 3:
+        raise ValueError(f"particles must have shape [B, N, D], got {tuple(particles.shape)}.")
+    if gaussian_mean.ndim == 3 and gaussian_mean.shape[1] == 1:
+        gaussian_mean = gaussian_mean.squeeze(1)
+    if gaussian_mean.ndim != 2:
+        raise ValueError(f"gaussian_mean must have shape [B, D], got {tuple(gaussian_mean.shape)}.")
+    if gaussian_cov.ndim != 3:
+        raise ValueError(f"gaussian_cov must have shape [B, D, D], got {tuple(gaussian_cov.shape)}.")
+
+    batch_size, _, dim = particles.shape
+    if gaussian_mean.shape != (batch_size, dim):
+        raise ValueError(
+            f"gaussian_mean must match particles batch/state dims; got mean={tuple(gaussian_mean.shape)}, "
+            f"particles={tuple(particles.shape)}."
+        )
+    if gaussian_cov.shape != (batch_size, dim, dim):
+        raise ValueError(
+            f"gaussian_cov must match particles batch/state dims; got cov={tuple(gaussian_cov.shape)}, "
+            f"particles={tuple(particles.shape)}."
+        )
+
+    particle_pair_term = torch.cdist(particles, particles).mean(dim=(1, 2))
+    cross_expectation = torch.empty(batch_size, device=particles.device, dtype=particles.dtype)
+    gaussian_self_expectation = torch.empty(batch_size, device=particles.device, dtype=particles.dtype)
+
+    sigma, iso_mask = _batched_isotropic_std_from_cov(
+        gaussian_cov,
+        atol=isotropic_atol,
+        rtol=isotropic_rtol,
+    )
+
+    if iso_mask.any():
+        idx = torch.nonzero(iso_mask, as_tuple=False).squeeze(-1)
+        particles_iso = particles.index_select(0, idx)
+        mean_iso = gaussian_mean.index_select(0, idx)
+        sigma_iso = sigma.index_select(0, idx)
+
+        delta_sq = torch.sum((particles_iso - mean_iso.unsqueeze(1)) ** 2, dim=-1)
+        delta_sq_np = delta_sq.detach().cpu().numpy().astype(np.float64)
+        sigma_np = np.maximum(sigma_iso.detach().cpu().numpy().astype(np.float64), 1e-12)
+        gamma_ratio = float(np.exp(gammaln((dim + 1) / 2.0) - gammaln(dim / 2.0)))
+        hypergeom_arg = -delta_sq_np / (2.0 * (sigma_np[:, None] ** 2))
+        cross_np = (
+            sigma_np[:, None]
+            * math.sqrt(2.0)
+            * gamma_ratio
+            * hyp1f1(-0.5, dim / 2.0, hypergeom_arg)
+        )
+        cross_np = np.real_if_close(cross_np)
+        self_np = 2.0 * sigma_np * gamma_ratio
+
+        cross_iso = torch.as_tensor(cross_np, device=particles.device, dtype=particles.dtype).mean(dim=1)
+        self_iso = torch.as_tensor(self_np, device=particles.device, dtype=particles.dtype)
+        cross_expectation.index_copy_(0, idx, cross_iso)
+        gaussian_self_expectation.index_copy_(0, idx, self_iso)
+
+    non_iso_mask = ~iso_mask
+    if non_iso_mask.any():
+        idx = torch.nonzero(non_iso_mask, as_tuple=False).squeeze(-1)
+        particles_mc = particles.index_select(0, idx)
+        mean_mc = gaussian_mean.index_select(0, idx)
+        cov_mc = gaussian_cov.index_select(0, idx)
+        mc_samples = max(2, int(mc_samples))
+        sample_y = _sample_batched_gaussian(mean_mc, cov_mc, mc_samples, generator=mc_generator)
+        sample_y_prime = _sample_batched_gaussian(mean_mc, cov_mc, mc_samples, generator=mc_generator)
+        cross_mc = torch.cdist(particles_mc, sample_y).mean(dim=(1, 2))
+        self_mc = torch.cdist(sample_y, sample_y_prime).mean(dim=(1, 2))
+        cross_expectation.index_copy_(0, idx, cross_mc)
+        gaussian_self_expectation.index_copy_(0, idx, self_mc)
+
+    ed_sq = 2.0 * cross_expectation - particle_pair_term - gaussian_self_expectation
+    return torch.sqrt(torch.clamp(ed_sq, min=0.0))
+
 def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example_fig_v2', save_pdf=False, infl=1, loc_radius=None):
     """
     Tests the data assimilation models on a linear dataset.
@@ -5019,6 +5291,16 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
     forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1, -2))
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1, -2))
     test_noise_gen = get_test_noise_generator(args)
+    ed_metric_gen = torch.Generator(device='cpu')
+    ed_metric_gen.manual_seed(int(getattr(args, 'seed', 0) or 0) + 1729)
+    ed_mc_samples = int(getattr(args, 'linear_ed_mc_samples', 256))
+
+    if plot_figures:
+        fig_name = _resolve_test_figure_prefix(
+            args=args,
+            fig_name=fig_name,
+            default_fig_name='example_fig_v2',
+        )
 
     # --- Set Models to Evaluation Mode ---
     model.eval()
@@ -5035,9 +5317,11 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         'es1': torch.empty(0, device=args.device),
         'res1': torch.empty(0, device=args.device),
         'snr_var': torch.empty(0, device=args.device),
+        'mean_diff': torch.empty(0, device=args.device),
         'cov_diff': torch.empty(0, device=args.device),
         'rcov_diff': torch.empty(0, device=args.device),
         'w2_diff': torch.empty(0, device=args.device),
+        'ed_diff': torch.empty(0, device=args.device),
     }
     loc_tensor_all_batches = None
 
@@ -5077,6 +5361,8 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             cov_diff_list = []
             rcov_diff_list = []
             w2_diff_list = []
+            ed_diff_list = []
+            mean_diff_list = []
             kalman_mean_list = [kalman_m_a.squeeze(1)]
             kalman_cov_list = [P_a]
             method_mean_list = [ens_v_a.mean(dim=1)]
@@ -5123,13 +5409,24 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 )
 
                 # --- Calculate and Store Covariance Difference ---
+                ens_mean_a = ens_v_a.mean(dim=1)
                 P_ens_a = get_ens_cov(ens_v_a)
+                mean_diff = torch.sqrt(torch.mean((ens_mean_a - kalman_m_a.squeeze(1)) ** 2, dim=-1))
                 cov_diff = torch.norm(P_ens_a - P_a, p='fro', dim=(-2, -1))
                 rcov_diff =  cov_diff / torch.norm(P_a, p='fro', dim=(-2, -1))
-                w2_diff = wasserstein2_multivariate_gaussian(mean_true=gt_v_a, cov_true=P_a, mean_sample=ens_v_a.mean(dim=1), cov_sample=P_ens_a)
+                w2_diff = wasserstein2_multivariate_gaussian(mean_true=kalman_m_a.squeeze(1), cov_true=P_a, mean_sample=ens_mean_a, cov_sample=P_ens_a)
+                ed_diff = _compute_particle_gaussian_energy_distance(
+                    particles=ens_v_a,
+                    gaussian_mean=kalman_m_a.squeeze(1),
+                    gaussian_cov=P_a,
+                    mc_samples=ed_mc_samples,
+                    mc_generator=ed_metric_gen,
+                )
+                mean_diff_list.append(mean_diff)
                 cov_diff_list.append(cov_diff)
                 rcov_diff_list.append(rcov_diff)
                 w2_diff_list.append(w2_diff)
+                ed_diff_list.append(ed_diff)
                 
                 if loc_nn_output is not None:
                     loc_records.append(loc_nn_output)
@@ -5139,7 +5436,7 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
                 gt_list.append(gt_v_a.squeeze(1))
                 kalman_mean_list.append(kalman_m_a.squeeze(1))
                 kalman_cov_list.append(P_a)
-                method_mean_list.append(ens_v_a.mean(dim=1))
+                method_mean_list.append(ens_mean_a)
                 method_cov_list.append(P_ens_a)
             
             # --- Process and Store Batch Results ---
@@ -5163,12 +5460,16 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             es1_val = torch.mean(compute_es(ens_states=ens_tensor, true_states=gt_tensor, norm_p=1), dim=0)
             res1_val = es1_val / torch.mean(torch.norm(gt_tensor, p=2, dim=-1), dim=0)
             
+            mean_diff_tensor = torch.stack(mean_diff_list, dim=0)
             cov_diff_tensor = torch.stack(cov_diff_list, dim=0)
             rcov_diff_tensor = torch.stack(rcov_diff_list, dim=0)
             w2_diff_tensor = torch.stack(w2_diff_list, dim=0)
+            ed_diff_tensor = torch.stack(ed_diff_list, dim=0)
+            mean_diff_val = mean_diff_tensor.mean(dim=0)
             cov_diff_val = cov_diff_tensor.mean(dim=0)
             rcov_diff_val = rcov_diff_tensor.mean(dim=0)
             w2_diff_val = w2_diff_tensor.mean(dim=0)
+            ed_diff_val = ed_diff_tensor.mean(dim=0)
 
             # --- Aggregate Results ---
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
@@ -5177,9 +5478,11 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
             all_results['es1'] = torch.cat((all_results['es1'], es1_val))
             all_results['res1'] = torch.cat((all_results['res1'], res1_val))
             all_results['snr_var'] = torch.cat((all_results['snr_var'], snr_var_batch))
+            all_results['mean_diff'] = torch.cat((all_results['mean_diff'], mean_diff_val))
             all_results['cov_diff'] = torch.cat((all_results['cov_diff'], cov_diff_val))
             all_results['rcov_diff'] = torch.cat((all_results['rcov_diff'], rcov_diff_val))
             all_results['w2_diff'] = torch.cat((all_results['w2_diff'], w2_diff_val))
+            all_results['ed_diff'] = torch.cat((all_results['ed_diff'], ed_diff_val))
             
             # Handle localization tensor if it exists
             if args.v != "EtE" and not args.no_localization and loc_records:
@@ -5241,8 +5544,9 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
          # Return NaNs if all results are invalid
         metrics_keys = ['mean_rmse', 'std_rmse', 'mean_rmv', 'std_rmv', 
                         'mean_rrmse', 'std_rrmse', 'mean_es1', 'std_es1',
-                        'mean_res1', 'std_res1', 'mean_cov_diff', 'std_cov_diff',
-                        'mean_rcov_diff', 'std_rcov_diff', 'mean_w2_diff', 'std_w2_diff',
+                        'mean_res1', 'std_res1', 'mean_mean_diff', 'std_mean_diff',
+                        'mean_cov_diff', 'std_cov_diff', 'mean_rcov_diff', 'std_rcov_diff',
+                        'mean_w2_diff', 'std_w2_diff', 'mean_ed_diff', 'std_ed_diff',
                         'min_m_norm', 'max_m_norm']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
@@ -5253,9 +5557,11 @@ def test_model_v2(loader, model_list, args, plot_figures=True, fig_name='example
         final_metrics['mean_rmv'], final_metrics['std_rmv'] = get_mean_std(all_results['rmv'][valid_B_mask])
         final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
         final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
+        final_metrics['mean_mean_diff'], final_metrics['std_mean_diff'] = get_mean_std(all_results['mean_diff'][valid_B_mask])
         final_metrics['mean_cov_diff'], final_metrics['std_cov_diff'] = get_mean_std(all_results['cov_diff'][valid_B_mask])
         final_metrics['mean_rcov_diff'], final_metrics['std_rcov_diff'] = get_mean_std(all_results['rcov_diff'][valid_B_mask])
         final_metrics['mean_w2_diff'], final_metrics['std_w2_diff'] = get_mean_std(all_results['w2_diff'][valid_B_mask])
+        final_metrics['mean_ed_diff'], final_metrics['std_ed_diff'] = get_mean_std(all_results['ed_diff'][valid_B_mask])
         final_metrics['min_m_norm'], final_metrics['max_m_norm'] = min_m_norm, max_m_norm
         final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
 
@@ -5296,7 +5602,9 @@ def print_test_results_v2(results):
         _print_mean_std_metric(results, "RES1", "mean_res1", "std_res1", skip_nan=True)
     elif not printed_res1_traj:
         _print_mean_std_metric(results, "RES1-traj", "mean_res1", "std_res1", skip_nan=True)
+    _print_mean_std_metric(results, "Mean-Diff", "mean_mean_diff", "std_mean_diff", skip_nan=True)
     _print_mean_std_metric(results, "W2", "mean_w2_diff", "std_w2_diff", skip_nan=True)
+    _print_mean_std_metric(results, "ED", "mean_ed_diff", "std_ed_diff", skip_nan=True)
         
     if 'no_nan_percent' in results and _is_finite_scalar(results['no_nan_percent']):
         print(f"No NAN Percentage: {results['no_nan_percent']:.2f}%")
@@ -5333,6 +5641,9 @@ def test_linear_sampling_error(loader, args, num_resamples):
     forward_fun = lambda x, A: torch.bmm(x, A.transpose(-1, -2))
     H_fun = lambda x, H: torch.bmm(x, H.transpose(-1, -2))
     test_noise_gen = get_test_noise_generator(args)
+    ed_metric_gen = torch.Generator(device='cpu')
+    ed_metric_gen.manual_seed(int(getattr(args, 'seed', 0) or 0) + 2718)
+    ed_mc_samples = int(getattr(args, 'linear_ed_mc_samples', 256))
 
     # --- Initialize Result Tensors for All Batches---
     all_results = {
@@ -5342,6 +5653,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
         'es1': torch.empty(0, device=args.device),
         'res1': torch.empty(0, device=args.device),
         'w2_diff': torch.empty(0, device=args.device),
+        'ed_diff': torch.empty(0, device=args.device),
     }
 
     with torch.no_grad():
@@ -5361,7 +5673,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
             
             # --- Lists to Store Trajectory-Averaged Data ---
             gt_list = [gt_v_a.squeeze(1)]
-            rmse_list, rmv_list, es1_list, w2_diff_list = [], [], [], []
+            rmse_list, rmv_list, es1_list, w2_diff_list, ed_diff_list = [], [], [], [], []
 
             # --- Main Assimilation Loop ---
             for i in range(args.test_steps - 1):
@@ -5384,7 +5696,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
                 gt_v_a = (gt_v_f.transpose(-1,-2) + K @ (obs_y - H_fun(gt_v_f, H)).transpose(-1,-2)).transpose(-1,-2)
 
                 # --- Resampling and Metric Calculation Loop ---
-                step_rmses, step_rmvs, step_es1s, step_w2s = [], [], [], []
+                step_rmses, step_rmvs, step_es1s, step_w2s, step_eds = [], [], [], [], []
                 L_a = torch.linalg.cholesky(P_a)
                 
                 for _ in range(num_resamples):
@@ -5409,12 +5721,21 @@ def test_linear_sampling_error(loader, args, num_resamples):
                         mean_sample=ens_mean, cov_sample=P_ens_a
                     )
                     step_w2s.append(w2)
+                    ed = _compute_particle_gaussian_energy_distance(
+                        particles=ens_v_a,
+                        gaussian_mean=gt_v_a.squeeze(1),
+                        gaussian_cov=P_a,
+                        mc_samples=ed_mc_samples,
+                        mc_generator=ed_metric_gen,
+                    )
+                    step_eds.append(ed)
 
                 # --- Average metrics over the resamples for this time step ---
                 rmse_list.append(torch.stack(step_rmses).mean(dim=0))
                 rmv_list.append(torch.stack(step_rmvs).mean(dim=0))
                 es1_list.append(torch.stack(step_es1s).mean(dim=0))
                 w2_diff_list.append(torch.stack(step_w2s).mean(dim=0))
+                ed_diff_list.append(torch.stack(step_eds).mean(dim=0))
                 
                 gt_list.append(gt_v_a.squeeze(1))
 
@@ -5425,6 +5746,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
             rmv_val = torch.stack(rmv_list).mean(dim=0)
             es1_val = torch.stack(es1_list).mean(dim=0)
             w2_diff_val = torch.stack(w2_diff_list).mean(dim=0)
+            ed_diff_val = torch.stack(ed_diff_list).mean(dim=0)
 
             rms_val = torch.sqrt(torch.mean(gt_tensor ** 2, dim=-1)).mean(dim=0)
             rrmse_val = rmse_val / rms_val
@@ -5437,6 +5759,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
             all_results['es1'] = torch.cat((all_results['es1'], es1_val))
             all_results['res1'] = torch.cat((all_results['res1'], res1_val))
             all_results['w2_diff'] = torch.cat((all_results['w2_diff'], w2_diff_val))
+            all_results['ed_diff'] = torch.cat((all_results['ed_diff'], ed_diff_val))
 
     # --- Final Metrics Calculation ---
     final_metrics = {}
@@ -5446,7 +5769,8 @@ def test_linear_sampling_error(loader, args, num_resamples):
     if not valid_B_mask.any():
         metrics_keys = ['mean_rrmse', 'std_rrmse', 'mean_rmse', 'std_rmse', 
                         'mean_rmv', 'std_rmv', 'mean_es1', 'std_es1',
-                        'mean_res1', 'std_res1', 'mean_w2_diff', 'std_w2_diff']
+                        'mean_res1', 'std_res1', 'mean_w2_diff', 'std_w2_diff',
+                        'mean_ed_diff', 'std_ed_diff']
         final_metrics = {key: float('nan') for key in metrics_keys}
         final_metrics['no_nan_percent'] = 0.0
     else:
@@ -5456,6 +5780,7 @@ def test_linear_sampling_error(loader, args, num_resamples):
         final_metrics['mean_es1'], final_metrics['std_es1'] = get_mean_std(all_results['es1'][valid_B_mask])
         final_metrics['mean_res1'], final_metrics['std_res1'] = get_mean_std(all_results['res1'][valid_B_mask])
         final_metrics['mean_w2_diff'], final_metrics['std_w2_diff'] = get_mean_std(all_results['w2_diff'][valid_B_mask])
+        final_metrics['mean_ed_diff'], final_metrics['std_ed_diff'] = get_mean_std(all_results['ed_diff'][valid_B_mask])
         final_metrics['no_nan_percent'] = torch.sum(valid_B_mask).float() / all_results['rrmse'].numel() * 100.0
 
     return final_metrics

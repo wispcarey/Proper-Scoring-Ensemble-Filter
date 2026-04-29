@@ -971,6 +971,63 @@ def _plot_multi_line(
     plt.close(fig)
 
 
+def _plot_ess_entropy_abundance(
+    x: List[int],
+    ess: List[float],
+    entropy: List[float],
+    abundance: List[float],
+    save_path: Path,
+) -> None:
+    fig, ax_left = plt.subplots(figsize=(12, 7))
+    ax_right = ax_left.twinx()
+
+    left_lines = [
+        ax_left.plot(x, ess, marker="o", label="ESS", linewidth=3.0, markersize=10)[0],
+        ax_left.plot(
+            x,
+            abundance,
+            marker="s",
+            label="Weight abundance",
+            linewidth=3.0,
+            markersize=10,
+        )[0],
+    ]
+    right_lines = [
+        ax_right.plot(
+            x,
+            entropy,
+            marker="^",
+            label="Entropy",
+            linewidth=3.0,
+            markersize=10,
+            color="tab:green",
+        )[0],
+    ]
+
+    ax_left.set_xscale("log")
+    _set_adaptive_y_scale(ax_left, [ess, abundance])
+    _set_adaptive_y_scale(ax_right, [entropy])
+
+    ax_left.set_xlabel("N (number of particles)", fontsize=26)
+    ax_left.set_ylabel("ESS / Weight abundance", fontsize=26)
+    ax_right.set_ylabel("Entropy", fontsize=26)
+    ax_left.tick_params(axis="both", labelsize=22, width=2.5, length=8)
+    ax_right.tick_params(axis="y", labelsize=22, width=2.5, length=8)
+    ax_left.grid(True, which="both", linestyle="--", alpha=0.5)
+
+    lines = left_lines + right_lines
+    ax_left.legend(
+        lines,
+        [line.get_label() for line in lines],
+        fontsize=20,
+        frameon=True,
+        loc="best",
+    )
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
 def _maybe_float(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -1145,6 +1202,8 @@ def main() -> None:
         kurt_mean_state = _new_running_tensor_stats()
         ess_mean_state = _new_running_scalar_mean()
         ess_minmax_state = _new_running_scalar_minmax()
+        entropy_mean_state = _new_running_scalar_mean()
+        entropy_minmax_state = _new_running_scalar_minmax()
         abundance_mean_state = _new_running_scalar_mean()
         abundance_minmax_state = _new_running_scalar_minmax()
         metric_records: List[PFFileMeta] = []
@@ -1181,9 +1240,12 @@ def main() -> None:
                 _update_running_tensor_stats(kurt_mean_state, torch.nanmean(kurt_x, dim=(0, 1)))
 
             ess_mean_value = _scalar_mean_over_tb(payload, ["post_ess", "ess"])
+            entropy_mean_value = _scalar_mean_over_tb(payload, ["post_weight_entropy", "weight_entropy"])
             abundance_mean_value = _scalar_mean_over_tb(payload, ["post_weight_abundance", "weight_abundance"])
             _update_running_scalar_mean(ess_mean_state, ess_mean_value)
             _update_running_scalar_minmax(ess_minmax_state, ess_mean_value)
+            _update_running_scalar_mean(entropy_mean_state, entropy_mean_value)
+            _update_running_scalar_minmax(entropy_minmax_state, entropy_mean_value)
             _update_running_scalar_mean(
                 abundance_mean_state,
                 abundance_mean_value,
@@ -1226,6 +1288,7 @@ def main() -> None:
         if kurt_mean_dims is not None and kurt_mean_dims.ndim != 1:
             kurt_mean_dims = None
         ess_mean_min, ess_mean_max = _finalize_running_scalar_minmax(ess_minmax_state)
+        entropy_mean_min, entropy_mean_max = _finalize_running_scalar_minmax(entropy_minmax_state)
         abundance_mean_min, abundance_mean_max = _finalize_running_scalar_minmax(abundance_minmax_state)
 
         row: Dict[str, Any] = {
@@ -1243,6 +1306,9 @@ def main() -> None:
             "mean_ess_mean": _finalize_running_scalar_mean(ess_mean_state),
             "min_ess_mean": ess_mean_min,
             "max_ess_mean": ess_mean_max,
+            "mean_weight_entropy_mean": _finalize_running_scalar_mean(entropy_mean_state),
+            "min_weight_entropy_mean": entropy_mean_min,
+            "max_weight_entropy_mean": entropy_mean_max,
             "mean_weight_abundance_mean": _finalize_running_scalar_mean(abundance_mean_state),
             "min_weight_abundance_mean": abundance_mean_min,
             "max_weight_abundance_mean": abundance_mean_max,
@@ -1336,6 +1402,29 @@ def main() -> None:
             ylabel="Quantile SE",
             save_path=analysis_dir / f"se_quantile_pca_dim_{base_tag}.png",
         )
+
+    _plot_ess_entropy_abundance(
+        x=available_n,
+        ess=[
+            float("nan")
+            if _maybe_float(analysis_rows[n]["mean_ess_mean"]) is None
+            else float(analysis_rows[n]["mean_ess_mean"])
+            for n in available_n
+        ],
+        entropy=[
+            float("nan")
+            if _maybe_float(analysis_rows[n]["mean_weight_entropy_mean"]) is None
+            else float(analysis_rows[n]["mean_weight_entropy_mean"])
+            for n in available_n
+        ],
+        abundance=[
+            float("nan")
+            if _maybe_float(analysis_rows[n]["mean_weight_abundance_mean"]) is None
+            else float(analysis_rows[n]["mean_weight_abundance_mean"])
+            for n in available_n
+        ],
+        save_path=analysis_dir / f"mean_ess_entropy_abundance_{base_tag}.png",
+    )
 
     _plot_multi_line_with_band(
         x=available_n,

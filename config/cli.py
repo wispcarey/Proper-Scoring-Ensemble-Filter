@@ -463,6 +463,8 @@ def get_parameters(extra_arg_adder=None):
 
     parser.add_argument('--save_test_figures', action='store_true',
                         help='save visualization figures during test/evaluation')
+    parser.add_argument('--test_figure_subdir', type=str, default='figures',
+                        help="Subdirectory inserted under the original test/eval figure directory. Default is 'figures'. Use empty string to keep the current save-path behavior.")
     parser.add_argument('--legend_in_figure', action='store_true',
                         help='Keep legend/title/x-y labels inside each figure. '
                              'If not set, figures omit them and save standalone legends.')
@@ -470,6 +472,12 @@ def get_parameters(extra_arg_adder=None):
                         help="Global trajectory index selection for test/PF plotting: e.g. '0', '0,1', or 'adaptive'.")
     parser.add_argument('--test_snapshot_steps', type=parse_snapshot_steps, default=None,
                         help="Snapshot steps for slice figures. Supports '100,200,300' and '1:2:500'.")
+    parser.add_argument('--test_snapshot_start_step', type=int_or_default, default='default',
+                        help='Start step for dataset-default snapshot plotting when --test_snapshot_steps is not provided.')
+    parser.add_argument('--test_snapshot_interval', type=int_or_default, default='default',
+                        help='Step interval for dataset-default snapshot plotting when --test_snapshot_steps is not provided.')
+    parser.add_argument('--test_snapshot_end_step', type=int_or_none, default=None,
+                        help='Optional inclusive end step for snapshot plotting when --test_snapshot_steps is not provided.')
     parser.add_argument('--rank_num_projections', type=int, default=8,
                         help='Number of fixed random projection directions for ensemble-rank evaluation.')
     parser.add_argument('--rank_projection_seed', type=int_or_none_or_default, default=None,
@@ -540,8 +548,21 @@ def get_parameters(extra_arg_adder=None):
     if args.test_steps == 'default':
         args.test_steps = dataset_config.get('test_steps')
 
+    if args.test_snapshot_start_step == 'default':
+        args.test_snapshot_start_step = dataset_config.get('test_plot_start_step', 100)
+
+    if args.test_snapshot_interval == 'default':
+        args.test_snapshot_interval = dataset_config.get('test_plot_step_interval', 100)
+
     if args.test_traj_num == 'default':
         args.test_traj_num = dataset_config.get('test_traj_num')
+
+    if args.test_snapshot_start_step is not None and int(args.test_snapshot_start_step) < 1:
+        raise ValueError("--test_snapshot_start_step must be >= 1.")
+    if args.test_snapshot_interval is not None and int(args.test_snapshot_interval) < 1:
+        raise ValueError("--test_snapshot_interval must be >= 1.")
+    if args.test_snapshot_end_step is not None and int(args.test_snapshot_end_step) < 1:
+        raise ValueError("--test_snapshot_end_step must be >= 1.")
 
     if args.train_steps == 'default':
         args.train_steps = dataset_config.get('train_steps')
