@@ -1,23 +1,35 @@
 #!/bin/bash
 
-set -e
+# Submit this script with: sbatch slurm_scripts/slurm_pf_analysis_cpu.sh
 
-cd ..
+#SBATCH --time=03:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --partition=cpu
+#SBATCH -J "pf-analysis"
+#SBATCH --mail-user=bhchen@caltech.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH -o slurm.%N.%j.out
+#SBATCH -e slurm.%N.%j.err
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_BIN="python3"
-    else
-        echo "Error: neither 'python' nor 'python3' is available in PATH." >&2
-        exit 127
-    fi
+set -euo pipefail
+
+# Change to repo root regardless of the directory used to submit the job.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+PYTHON_BIN="${PYTHON_BIN:-/home/bhchen/miniconda3/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "Error: required Python interpreter is not executable: $PYTHON_BIN" >&2
+    exit 127
 fi
 
 echo "Date: $(date)"
-echo "Job ID: $SLURM_JOB_ID"
+echo "Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "Host: $(hostname)"
-echo "Python: $(command -v "$PYTHON_BIN")"
+echo "Python: $PYTHON_BIN"
+echo "Device: cpu"
 echo "----------------------------------------------------"
 
 # Format:
@@ -27,9 +39,9 @@ echo "----------------------------------------------------"
 #   - numeric (e.g. 1.0)  => pass --sigma_y <value>
 experiments=(
     "lorenz63 square adaptive 500 64"
-    # "lorenz63 arctan adaptive 500 64"
-    # "lorenz63 default adaptive 500 64"
-    # "doubling1d default adaptive 200 64"
+    "lorenz63 arctan adaptive 500 64"
+    "lorenz63 default adaptive 500 64"
+    "doubling1d default adaptive 200 64"
 )
 
 for exp in "${experiments[@]}"; do

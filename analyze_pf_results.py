@@ -17,10 +17,10 @@ ANALYSIS_DEVICE = torch.device("cpu")
 
 
 # Built-in PF particle counts (do not use args.N).
-PF_N_LIST: List[int] = [500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
+PF_M_LIST: List[int] = [500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
 
 PF_FILE_PATTERN = re.compile(
-    r"^pf_results_sigma_y_(?P<sigma>[^_]+)_batch_(?P<batch>\d+)_len_(?P<seq_len>\d+)_pfN_(?P<pf_N>\d+)_(?P<seed>\d+)(?P<obs_suffix>_[^.]+)?\.pt$"
+    r"^pf_results_sigma_y_(?P<sigma>[^_]+)_batch_(?P<batch>\d+)_len_(?P<seq_len>\d+)_pfN_(?P<pf_M>\d+)_(?P<seed>\d+)(?P<obs_suffix>_[^.]+)?\.pt$"
 )
 
 AVERAGE_KEYS = {
@@ -61,7 +61,7 @@ class PFFileMeta:
     sigma: str
     batch: int
     seq_len: int
-    pf_N: int
+    pf_M: int
     seed: int
     obs_suffix: str
 
@@ -100,7 +100,7 @@ def _parse_pf_file(path: Path) -> Optional[PFFileMeta]:
         sigma=str(m.group("sigma")),
         batch=int(m.group("batch")),
         seq_len=int(m.group("seq_len")),
-        pf_N=int(m.group("pf_N")),
+        pf_M=int(m.group("pf_M")),
         seed=int(m.group("seed")),
         obs_suffix=str(m.group("obs_suffix") or ""),
     )
@@ -904,12 +904,16 @@ def _plot_line(
     title: str,
     ylabel: str,
     save_path: Path,
+    force_log_y: bool = False,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(11, 7))
+    fig, ax = plt.subplots(figsize=(10, 7))
     ax.plot(x, y, marker="o", linewidth=3.0, markersize=10)
     ax.set_xscale("log")
-    _set_adaptive_y_scale(ax, [y])
-    ax.set_xlabel("N (number of particles)", fontsize=26)
+    if force_log_y:
+        _set_log_y_scale(ax, [y])
+    else:
+        _set_adaptive_y_scale(ax, [y])
+    ax.set_xlabel("M (number of particles)", fontsize=26)
     ax.set_ylabel(ylabel, fontsize=26)
     ax.tick_params(axis="both", labelsize=22, width=2.5, length=8)
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -926,8 +930,9 @@ def _plot_multi_line_with_band(
     title: str,
     ylabel: str,
     save_path: Path,
+    force_log_y: bool = False,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(10, 7))
     all_series: List[List[float]] = []
     for name, y in centers.items():
         y_low = lowers[name]
@@ -936,8 +941,11 @@ def _plot_multi_line_with_band(
         ax.fill_between(x, y_low, y_high, alpha=0.2)
         all_series.extend([y, y_low, y_high])
     ax.set_xscale("log")
-    _set_adaptive_y_scale(ax, all_series)
-    ax.set_xlabel("N (number of particles)", fontsize=26)
+    if force_log_y:
+        _set_log_y_scale(ax, all_series)
+    else:
+        _set_adaptive_y_scale(ax, all_series)
+    ax.set_xlabel("M (number of particles)", fontsize=26)
     ax.set_ylabel(ylabel, fontsize=26)
     ax.tick_params(axis="both", labelsize=22, width=2.5, length=8)
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -953,15 +961,22 @@ def _plot_multi_line(
     title: str,
     ylabel: str,
     save_path: Path,
+    force_log_y: bool = False,
+    force_linear_y: bool = False,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(10, 7))
     all_series: List[List[float]] = []
     for name, y in series.items():
         ax.plot(x, y, marker="o", label=name, linewidth=3.0, markersize=10)
         all_series.append(y)
     ax.set_xscale("log")
-    _set_adaptive_y_scale(ax, all_series)
-    ax.set_xlabel("N (number of particles)", fontsize=26)
+    if force_linear_y:
+        ax.set_yscale("linear")
+    elif force_log_y:
+        _set_log_y_scale(ax, all_series)
+    else:
+        _set_adaptive_y_scale(ax, all_series)
+    ax.set_xlabel("M (number of particles)", fontsize=26)
     ax.set_ylabel(ylabel, fontsize=26)
     ax.tick_params(axis="both", labelsize=22, width=2.5, length=8)
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -978,7 +993,7 @@ def _plot_ess_entropy_abundance(
     abundance: List[float],
     save_path: Path,
 ) -> None:
-    fig, ax_left = plt.subplots(figsize=(12, 7))
+    fig, ax_left = plt.subplots(figsize=(10, 7))
     ax_right = ax_left.twinx()
 
     left_lines = [
@@ -1008,7 +1023,7 @@ def _plot_ess_entropy_abundance(
     _set_adaptive_y_scale(ax_left, [ess, abundance])
     _set_adaptive_y_scale(ax_right, [entropy])
 
-    ax_left.set_xlabel("N (number of particles)", fontsize=26)
+    ax_left.set_xlabel("M (number of particles)", fontsize=26)
     ax_left.set_ylabel("ESS / Weight abundance", fontsize=26)
     ax_right.set_ylabel("Entropy", fontsize=26)
     ax_left.tick_params(axis="both", labelsize=22, width=2.5, length=8)
@@ -1066,6 +1081,27 @@ def _set_adaptive_y_scale(ax: Any, series_list: Sequence[Sequence[float]]) -> No
     ax.set_yscale("log" if (v_max / v_min) >= 10.0 else "linear")
 
 
+def _set_log_y_scale(ax: Any, series_list: Sequence[Sequence[float]]) -> None:
+    finite_vals: List[float] = []
+    for series in series_list:
+        for v in series:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if math.isfinite(fv) and fv > 0.0:
+                finite_vals.append(fv)
+
+    ax.set_yscale("log", nonpositive="mask")
+    if len(finite_vals) == 0:
+        return
+
+    v_min = min(finite_vals)
+    v_max = max(finite_vals)
+    if v_min == v_max:
+        ax.set_ylim(v_min / 2.0, v_max * 2.0)
+
+
 def _default_from_dataset(dataset: str, key: str, fallback: int) -> int:
     cfg = DATASET_INFO.get(str(dataset).lower(), {})
     try:
@@ -1118,9 +1154,9 @@ def main() -> None:
     print(f"[INFO] analysis_device={ANALYSIS_DEVICE}")
     print(f"[INFO] filter: batch={test_traj_num}, len={test_steps}, accepted_suffixes={accepted_suffixes}")
     print(f"[INFO] target sigma_y from args={target_sigma} (adaptive_sigma_y={adaptive_enabled})")
-    print(f"[INFO] built-in PF_N_LIST={PF_N_LIST}")
+    print(f"[INFO] built-in PF_M_LIST={PF_M_LIST}")
 
-    grouped: Dict[int, List[PFFileMeta]] = {n: [] for n in PF_N_LIST}
+    grouped: Dict[int, List[PFFileMeta]] = {m: [] for m in PF_M_LIST}
     for path in sorted(pf_dir.glob("pf_results_sigma_y_*.pt")):
         meta = _parse_pf_file(path)
         if meta is None:
@@ -1129,22 +1165,22 @@ def main() -> None:
             continue
         if meta.obs_suffix not in accepted_suffixes:
             continue
-        if meta.pf_N not in grouped:
+        if meta.pf_M not in grouped:
             continue
-        grouped[meta.pf_N].append(meta)
+        grouped[meta.pf_M].append(meta)
 
     analysis_rows: Dict[int, Dict[str, Any]] = {}
     sigma_conflicts: Dict[int, List[str]] = {}
 
-    for n in PF_N_LIST:
-        records = grouped[n]
+    for m in PF_M_LIST:
+        records = grouped[m]
         if len(records) == 0:
-            # N not found in list -> skip directly.
+            # M not found in list -> skip directly.
             continue
 
         raw_sigma_values = sorted({r.sigma for r in records})
         seeds = sorted({r.seed for r in records})
-        print(f"[N={n}] found seeds={seeds}, sigma_y={raw_sigma_values}")
+        print(f"[M={m}] found seeds={seeds}, sigma_y={raw_sigma_values}")
 
         if target_sigma is not None:
             matched_records = [r for r in records if _sigma_matches(r.sigma, target_sigma)]
@@ -1152,16 +1188,16 @@ def main() -> None:
                 records = matched_records
                 used_sigma_values = sorted({r.sigma for r in records})
                 if used_sigma_values != raw_sigma_values:
-                    print(f"[N={n}] sigma_y filtered by args to: {used_sigma_values}")
+                    print(f"[M={m}] sigma_y filtered by args to: {used_sigma_values}")
 
         sigma_values = sorted({r.sigma for r in records})
         if len(sigma_values) == 0:
-            # Current N has no files with args.sigma_y -> skip.
+            # Current M has no files with args.sigma_y -> skip.
             continue
         if len(sigma_values) > 1:
-            sigma_conflicts[n] = sigma_values
+            sigma_conflicts[m] = sigma_values
             raise RuntimeError(
-                f"[ALARM] N={n} has multiple sigma_y values after filtering: {sigma_values}. "
+                f"[ALARM] M={m} has multiple sigma_y values after filtering: {sigma_values}. "
                 f"Please specify a unique --sigma_y (current args.sigma_y={target_sigma}, "
                 f"adaptive_sigma_y={adaptive_enabled})."
             )
@@ -1184,15 +1220,15 @@ def main() -> None:
 
         avg_payload, valid_records = _build_avg_payload_stream(records)
         if avg_payload is None or len(valid_records) == 0:
-            print(f"[N={n}] no loadable seed payload.")
+            print(f"[M={m}] no loadable seed payload.")
             continue
 
         valid_seeds = [r.seed for r in valid_records]
-        avg_name = f"pf_results_sigma_y_{sigma}_batch_{test_traj_num}_len_{test_steps}_pfN_{n}_avg"
+        avg_name = f"pf_results_sigma_y_{sigma}_batch_{test_traj_num}_len_{test_steps}_pfN_{m}_avg"
         avg_path = pf_dir / f"{avg_name}{canonical_suffix}.pt"
         avg_payload_cpu = _to_cpu_value(avg_payload)
         torch.save(avg_payload_cpu, avg_path)
-        print(f"[N={n}] saved avg file: {avg_path}")
+        print(f"[M={m}] saved avg file: {avg_path}")
         del avg_payload
         del avg_payload_cpu
 
@@ -1253,7 +1289,7 @@ def main() -> None:
             _update_running_scalar_minmax(abundance_minmax_state, abundance_mean_value)
 
         if len(metric_records) == 0:
-            print(f"[N={n}] no loadable seed payload on metrics pass.")
+            print(f"[M={m}] no loadable seed payload on metrics pass.")
             continue
 
         valid_seeds = [r.seed for r in metric_records]
@@ -1269,6 +1305,7 @@ def main() -> None:
         else:
             rmse_tb = torch.sqrt(torch.mean(se_mean_tensor * se_mean_tensor, dim=-1))
             se_mean_rmse = float(torch.nanmean(rmse_tb).item())
+            # Elementwise seed SE, averaged over timestep, trajectory, and state dimensions.
             se_mean_avg = float(torch.nanmean(se_mean_tensor).item())
 
         se_cov_fnorm: Optional[float]
@@ -1279,6 +1316,7 @@ def main() -> None:
         else:
             fnorm_tb = torch.linalg.norm(se_cov_tensor, ord="fro", dim=(-2, -1))
             se_cov_fnorm = float(torch.nanmean(fnorm_tb).item())
+            # Elementwise seed SE, averaged over timestep, trajectory, and covariance entries.
             se_cov_avg = float(torch.nanmean(se_cov_tensor).item())
 
         quantile_se, se_quantile_avg, quantile_se_avg_dim = _se_quantile_metrics(metric_records)
@@ -1299,8 +1337,10 @@ def main() -> None:
             "analysis_device": str(ANALYSIS_DEVICE),
             "se_mean_rmse": float("nan") if se_mean_rmse is None else float(se_mean_rmse),
             "se_mean_avg": float("nan") if se_mean_avg is None else float(se_mean_avg),
+            "se_mean_elementwise_avg": float("nan") if se_mean_avg is None else float(se_mean_avg),
             "se_cov_fnorm": float("nan") if se_cov_fnorm is None else float(se_cov_fnorm),
             "se_cov_avg": float("nan") if se_cov_avg is None else float(se_cov_avg),
+            "se_cov_elementwise_avg": float("nan") if se_cov_avg is None else float(se_cov_avg),
             "se_quantile_l2": float("nan") if se_quantile_l2 is None else float(se_quantile_l2),
             "se_quantile_avg": float("nan") if se_quantile_avg is None else float(se_quantile_avg),
             "mean_ess_mean": _finalize_running_scalar_mean(ess_mean_state),
@@ -1316,29 +1356,41 @@ def main() -> None:
             "se_quantile_avg_dim": _tensor_to_float_list(quantile_se_avg_dim),
             "mean_kurtosis_mean_dim": _tensor_to_float_list(kurt_mean_dims),
         }
-        analysis_rows[n] = row
+        analysis_rows[m] = row
 
-    available_n = sorted(analysis_rows.keys())
-    if len(available_n) == 0:
-        print("[INFO] no N has complete analysis outputs after filtering.")
+    available_m = sorted(analysis_rows.keys())
+    if len(available_m) == 0:
+        print("[INFO] no M has complete analysis outputs after filtering.")
         return
 
-    sigma_values_all = sorted({analysis_rows[n]["sigma_y"] for n in available_n})
+    sigma_values_all = sorted({analysis_rows[m]["sigma_y"] for m in available_m})
     sigma_tag = sigma_values_all[0] if len(sigma_values_all) == 1 else "mixed"
 
     analysis_dir = Path("save") / f"pf_analysis_{dataset}_{safe_obs}"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     base_tag = f"sigma_{sigma_tag}_batch_{test_traj_num}_len_{test_steps}"
 
-    se_mean_rmse = [_maybe_float(analysis_rows[n]["se_mean_rmse"]) for n in available_n]
-    se_mean_avg = [_maybe_float(analysis_rows[n]["se_mean_avg"]) for n in available_n]
-    se_cov_fnorm = [_maybe_float(analysis_rows[n]["se_cov_fnorm"]) for n in available_n]
-    se_cov_avg = [_maybe_float(analysis_rows[n]["se_cov_avg"]) for n in available_n]
-    se_quantile_l2 = [_maybe_float(analysis_rows[n]["se_quantile_l2"]) for n in available_n]
-    se_quantile_avg = [_maybe_float(analysis_rows[n]["se_quantile_avg"]) for n in available_n]
+    se_mean_rmse = [_maybe_float(analysis_rows[m]["se_mean_rmse"]) for m in available_m]
+    se_mean_avg = [_maybe_float(analysis_rows[m]["se_mean_elementwise_avg"]) for m in available_m]
+    se_cov_fnorm = [_maybe_float(analysis_rows[m]["se_cov_fnorm"]) for m in available_m]
+    se_cov_avg = [_maybe_float(analysis_rows[m]["se_cov_elementwise_avg"]) for m in available_m]
+    se_quantile_l2 = [_maybe_float(analysis_rows[m]["se_quantile_l2"]) for m in available_m]
+    se_quantile_avg = [_maybe_float(analysis_rows[m]["se_quantile_avg"]) for m in available_m]
 
     _plot_multi_line(
-        x=available_n,
+        x=available_m,
+        series={
+            "mean SE": [float("nan") if v is None else v for v in se_mean_avg],
+            "cov SE": [float("nan") if v is None else v for v in se_cov_avg],
+        },
+        title="",
+        ylabel="Standard Error",
+        save_path=analysis_dir / f"se_mean_cov_{base_tag}.png",
+        force_linear_y=True,
+    )
+
+    _plot_multi_line(
+        x=available_m,
         series={
             "mean RMSE SE": [float("nan") if v is None else v for v in se_mean_rmse],
             "mean avg SE": [float("nan") if v is None else v for v in se_mean_avg],
@@ -1349,7 +1401,7 @@ def main() -> None:
     )
 
     _plot_multi_line(
-        x=available_n,
+        x=available_m,
         series={
             "cov F-norm SE": [float("nan") if v is None else v for v in se_cov_fnorm],
             "cov avg SE": [float("nan") if v is None else v for v in se_cov_avg],
@@ -1360,7 +1412,7 @@ def main() -> None:
     )
 
     _plot_multi_line(
-        x=available_n,
+        x=available_m,
         series={
             "quantile L2[0,1] SE": [float("nan") if v is None else v for v in se_quantile_l2],
             "quantile avg SE": [float("nan") if v is None else v for v in se_quantile_avg],
@@ -1374,8 +1426,8 @@ def main() -> None:
     pca_quantile_dim_series: Dict[str, List[float]] = {}
     for q_dim, q_name in enumerate(["x1", "x2", "x3", "pca1", "pca2", "pca3"]):
         y: List[float] = []
-        for n in available_n:
-            arr = analysis_rows[n].get("se_quantile_avg_dim")
+        for m in available_m:
+            arr = analysis_rows[m].get("se_quantile_avg_dim")
             if isinstance(arr, list) and q_dim < len(arr):
                 y.append(float(arr[q_dim]))
             else:
@@ -1387,7 +1439,7 @@ def main() -> None:
 
     if len(state_quantile_dim_series) > 0:
         _plot_multi_line(
-            x=available_n,
+            x=available_m,
             series=state_quantile_dim_series,
             title="",
             ylabel="Quantile SE",
@@ -1396,7 +1448,7 @@ def main() -> None:
 
     if len(pca_quantile_dim_series) > 0:
         _plot_multi_line(
-            x=available_n,
+            x=available_m,
             series=pca_quantile_dim_series,
             title="",
             ylabel="Quantile SE",
@@ -1404,70 +1456,70 @@ def main() -> None:
         )
 
     _plot_ess_entropy_abundance(
-        x=available_n,
+        x=available_m,
         ess=[
             float("nan")
-            if _maybe_float(analysis_rows[n]["mean_ess_mean"]) is None
-            else float(analysis_rows[n]["mean_ess_mean"])
-            for n in available_n
+            if _maybe_float(analysis_rows[m]["mean_ess_mean"]) is None
+            else float(analysis_rows[m]["mean_ess_mean"])
+            for m in available_m
         ],
         entropy=[
             float("nan")
-            if _maybe_float(analysis_rows[n]["mean_weight_entropy_mean"]) is None
-            else float(analysis_rows[n]["mean_weight_entropy_mean"])
-            for n in available_n
+            if _maybe_float(analysis_rows[m]["mean_weight_entropy_mean"]) is None
+            else float(analysis_rows[m]["mean_weight_entropy_mean"])
+            for m in available_m
         ],
         abundance=[
             float("nan")
-            if _maybe_float(analysis_rows[n]["mean_weight_abundance_mean"]) is None
-            else float(analysis_rows[n]["mean_weight_abundance_mean"])
-            for n in available_n
+            if _maybe_float(analysis_rows[m]["mean_weight_abundance_mean"]) is None
+            else float(analysis_rows[m]["mean_weight_abundance_mean"])
+            for m in available_m
         ],
         save_path=analysis_dir / f"mean_ess_entropy_abundance_{base_tag}.png",
     )
 
     _plot_multi_line_with_band(
-        x=available_n,
+        x=available_m,
         centers={
             "ESS mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["mean_ess_mean"]) is None
-                else float(analysis_rows[n]["mean_ess_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["mean_ess_mean"]) is None
+                else float(analysis_rows[m]["mean_ess_mean"])
+                for m in available_m
             ],
             "weight abundance mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["mean_weight_abundance_mean"]) is None
-                else float(analysis_rows[n]["mean_weight_abundance_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["mean_weight_abundance_mean"]) is None
+                else float(analysis_rows[m]["mean_weight_abundance_mean"])
+                for m in available_m
             ],
         },
         lowers={
             "ESS mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["min_ess_mean"]) is None
-                else float(analysis_rows[n]["min_ess_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["min_ess_mean"]) is None
+                else float(analysis_rows[m]["min_ess_mean"])
+                for m in available_m
             ],
             "weight abundance mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["min_weight_abundance_mean"]) is None
-                else float(analysis_rows[n]["min_weight_abundance_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["min_weight_abundance_mean"]) is None
+                else float(analysis_rows[m]["min_weight_abundance_mean"])
+                for m in available_m
             ],
         },
         uppers={
             "ESS mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["max_ess_mean"]) is None
-                else float(analysis_rows[n]["max_ess_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["max_ess_mean"]) is None
+                else float(analysis_rows[m]["max_ess_mean"])
+                for m in available_m
             ],
             "weight abundance mean": [
                 float("nan")
-                if _maybe_float(analysis_rows[n]["max_weight_abundance_mean"]) is None
-                else float(analysis_rows[n]["max_weight_abundance_mean"])
-                for n in available_n
+                if _maybe_float(analysis_rows[m]["max_weight_abundance_mean"]) is None
+                else float(analysis_rows[m]["max_weight_abundance_mean"])
+                for m in available_m
             ],
         },
         title="",
@@ -1476,21 +1528,21 @@ def main() -> None:
     )
 
     kurt_dim_len = 0
-    for n in available_n:
-        arr = analysis_rows[n].get("mean_kurtosis_mean_dim")
+    for m in available_m:
+        arr = analysis_rows[m].get("mean_kurtosis_mean_dim")
         if isinstance(arr, list):
             kurt_dim_len = max(kurt_dim_len, min(3, len(arr)))
     if kurt_dim_len > 0:
         kurt_mean_series: Dict[str, List[float]] = {}
         for d in range(kurt_dim_len):
             y: List[float] = []
-            for n in available_n:
-                mean_arr = analysis_rows[n].get("mean_kurtosis_mean_dim")
+            for m in available_m:
+                mean_arr = analysis_rows[m].get("mean_kurtosis_mean_dim")
                 y.append(float(mean_arr[d]) if isinstance(mean_arr, list) and d < len(mean_arr) else float("nan"))
             kurt_mean_series[f"kurt dim {d + 1} mean"] = y
 
         _plot_multi_line(
-            x=available_n,
+            x=available_m,
             series=kurt_mean_series,
             title="",
             ylabel="Kurtosis mean",
@@ -1504,10 +1556,10 @@ def main() -> None:
         "analysis_device": str(ANALYSIS_DEVICE),
         "test_steps": test_steps,
         "test_traj_num": test_traj_num,
-        "built_in_pf_N_list": PF_N_LIST,
-        "available_N": available_n,
+        "built_in_pf_M_list": PF_M_LIST,
+        "available_M": available_m,
         "sigma_conflicts": {str(k): v for k, v in sigma_conflicts.items()},
-        "analysis": {str(k): analysis_rows[k] for k in available_n},
+        "analysis": {str(k): analysis_rows[k] for k in available_m},
     }
     summary_path = analysis_dir / f"summary_{base_tag}.json"
     with open(summary_path, "w", encoding="utf-8") as f:
