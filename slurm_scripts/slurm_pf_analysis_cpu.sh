@@ -5,12 +5,11 @@
 #SBATCH --time=03:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --partition=cpu
 #SBATCH -J "pf-analysis"
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o slurm.%N.%j.out
-#SBATCH -e slurm.%N.%j.err
+#SBATCH -o pf_analysis/slurm.%N.%j.out
+#SBATCH -e pf_analysis/slurm.%N.%j.err
 #SBATCH --chdir=/home/bhchen/LearnKalmanGain
 
 set -euo pipefail
