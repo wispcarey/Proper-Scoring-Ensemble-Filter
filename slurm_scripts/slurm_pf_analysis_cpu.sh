@@ -1,21 +1,23 @@
 #!/bin/bash
 
-# Submit this script with: sbatch slurm_scripts/slurm_pf_analysis_cpu.sh
+# Submit this script with: sbatch <this-filename>
 
-#SBATCH --time=08:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH -J "pf-analysis"
-#SBATCH --mail-user=bhchen@caltech.edu
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o pf_analysis/slurm.%N.%j.out
-#SBATCH -e pf_analysis/slurm.%N.%j.err
-#SBATCH --chdir=/home/bhchen/LearnKalmanGain
+#SBATCH --time=08:00:00     # walltime (8 hours)
+#SBATCH --nodes=1           # number of nodes (1 node)
+#SBATCH --ntasks=1          # 1 task
+#SBATCH -J "pf-analysis"    # job name
+#SBATCH --mail-user=bhchen@caltech.edu # email address
+#SBATCH --mail-type=BEGIN   # email notification at start
+#SBATCH --mail-type=END     # email notification at end
+#SBATCH --mail-type=FAIL    # email notification on failure
 
-set -euo pipefail
+# Optional: specify output and error files
+#SBATCH -o slurm.%N.%j.out  # STDOUT
+#SBATCH -e slurm.%N.%j.err  # STDERR
 
-# Slurm may execute a copied script from /var/spool/slurmd, so do not infer the
-# repository path from BASH_SOURCE. Override REPO_ROOT via sbatch --export if needed.
+set -e
+
+# Change to repo root
 REPO_ROOT="${REPO_ROOT:-/home/bhchen/LearnKalmanGain}"
 if [ ! -f "$REPO_ROOT/analyze_pf_results.py" ]; then
     echo "Error: REPO_ROOT='$REPO_ROOT' does not contain analyze_pf_results.py." >&2
@@ -25,8 +27,12 @@ cd "$REPO_ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "Error: Python command is not available in PATH: $PYTHON_BIN" >&2
-    exit 127
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="python3"
+    else
+        echo "Error: neither 'python' nor 'python3' is available in PATH." >&2
+        exit 127
+    fi
 fi
 
 echo "Date: $(date)"
