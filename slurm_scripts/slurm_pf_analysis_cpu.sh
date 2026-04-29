@@ -11,12 +11,17 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH -o slurm.%N.%j.out
 #SBATCH -e slurm.%N.%j.err
+#SBATCH --chdir=/home/bhchen/LearnKalmanGain
 
 set -euo pipefail
 
-# Change to repo root regardless of the directory used to submit the job.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Slurm may execute a copied script from /var/spool/slurmd, so do not infer the
+# repository path from BASH_SOURCE. Override REPO_ROOT via sbatch --export if needed.
+REPO_ROOT="${REPO_ROOT:-/home/bhchen/LearnKalmanGain}"
+if [ ! -f "$REPO_ROOT/analyze_pf_results.py" ]; then
+    echo "Error: REPO_ROOT='$REPO_ROOT' does not contain analyze_pf_results.py." >&2
+    exit 1
+fi
 cd "$REPO_ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/bhchen/miniconda3/bin/python}"
