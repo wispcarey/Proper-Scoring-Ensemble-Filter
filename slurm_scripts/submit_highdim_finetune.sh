@@ -7,7 +7,7 @@
 
 # Target Slurm script
 SLURM_SCRIPT="slurm_finetune.sh"
-GPU_TYPE="${1:-p100}"
+GPU_TYPE="${1:-h100}"
 
 # Global Configurations
 DEF_DATASET="lorenz96"
@@ -19,7 +19,8 @@ TRAIN_TRAJ_NUM="default"
 DEF_LEARNING_RATE="default"
 DEF_OBS_FN="default"
 ES_P=1
-NORMAL_OUTPUT="true"
+# false saves finetune.py stdout/stderr to args.save_folder/ft_output.txt.
+NORMAL_OUTPUT="false"
 
 # List of experiments
 # Format:
@@ -90,7 +91,7 @@ for exp in "${EXPERIMENTS[@]}"; do
 
     # Submit job with exported variables
     sbatch -J "$JOB_NAME" \
-           --time=20:00:00 \
+           --time=10:00:00 \
            --gres="gpu:${GPU_TYPE}:1" \
            --export=ALL,DATASET=$current_dataset,SEED=$SEED,EPOCHS=$EPOCHS,SAVE_EPOCH=$SAVE_EPOCH,TRAIN_STEPS=$TRAIN_STEPS,TRAIN_TRAJ_NUM=$TRAIN_TRAJ_NUM,LR=$current_lr,ES_P=$ES_P,VERSION=$v,CP_PATH=$cp_path,SIGMA_Y=$current_sigma_y,LOSS_TYPE=$loss_type,OBS_FN=$current_obs_fn,ADAPTIVE_SIGMA_Y=$adaptive_sigma_y,NORMAL_OUTPUT=$NORMAL_OUTPUT,NO_LOCALIZATION=$no_localization \
            $SLURM_SCRIPT

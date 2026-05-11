@@ -32,8 +32,9 @@ SIGMA_Y=${SIGMA_Y:-1.0}
 LOSS_TYPE=${LOSS_TYPE:-"es"}
 OBS_FN=${OBS_FN:-"default"}
 ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"}
-NORMAL_OUTPUT=${NORMAL_OUTPUT:-"true"}
+NORMAL_OUTPUT=${NORMAL_OUTPUT:-"false"}
 NO_LOCALIZATION=${NO_LOCALIZATION:-"false"}
+PYTHON_BIN=${PYTHON_BIN:-"/home/bhchen/miniconda3/bin/python"}
 
 ADAPTIVE_SIGMA_Y_FLAG=""
 case "${ADAPTIVE_SIGMA_Y,,}" in
@@ -71,7 +72,7 @@ module load cuda/12.2
 cd ..
 
 # 2. Execution
-python finetune.py \
+"$PYTHON_BIN" finetune.py \
     --epochs $EPOCHS \
     --save_epoch $SAVE_EPOCH \
     --dataset $DATASET \
