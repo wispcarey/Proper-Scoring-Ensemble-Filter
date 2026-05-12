@@ -113,7 +113,7 @@ EXPERIMENTS=(
     # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square_root 0.01 true None 5"
     # "lorenz96 1000 10 1.0 EtE-LRes es None default arctan 0 true None 5"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default arctan 0 true None 5"
-    "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0 true None 1"
+    # "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0 true None 1"
     # "lorenz96 1000 10 1.0 CorrTerms nl2 None default arctan 0 true None 5"
     # "lorenz96 1000 10 1.0 EtE-LRes es None default square 0 true None 5"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square 0 true None 5"
@@ -122,7 +122,7 @@ EXPERIMENTS=(
     # "lorenz96 1000 10 1.0 EtE-LRes es None default default 0 true None 5"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default default 0 true None 5"
     # "lorenz96 1000 10 1.0 CorrTerms es None default default 0.01 true None 5"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None 5"
+    "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None 1"
 )
 
 validate_adaptive_sigma_y() {
