@@ -14,7 +14,7 @@
 #SBATCH -e output_record/highdim_train.%N.%j.err      # STDERR (saved to output_record)
 
 # Description: Slurm script for train.py with configurable parameters for Lorenz63.
-# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX.
+# Input: Env vars DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX, DETACH_STEPS.
 # Output: Training logs/models.
 
 # 1. Configuration
@@ -30,6 +30,7 @@ OBS_FN=${OBS_FN:-"identity"}         # Default observation post-function
 WEIGHT_DECAY=${WEIGHT_DECAY:-"0"}    # Default weight decay
 ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"} # Set to "true" to enable --adaptive_sigma_y
 SUFFIX=${SUFFIX:-""}                 # Default suffix (empty string)
+DETACH_STEPS=${DETACH_STEPS:-5}      # Default detach interval
 
 ADAPTIVE_SIGMA_Y_FLAG=""
 case "${ADAPTIVE_SIGMA_Y,,}" in
@@ -38,7 +39,7 @@ case "${ADAPTIVE_SIGMA_Y,,}" in
         ;;
 esac
 
-echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, LR=$LEARNING_RATE, obs_fn=$OBS_FN, weight_decay=$WEIGHT_DECAY, adaptive_sigma_y=$ADAPTIVE_SIGMA_Y, SUFFIX='$SUFFIX'"
+echo "Config: DATASET=$DATASET, EPOCHS=$EPOCHS, N=$N, v=$VERSION, LR=$LEARNING_RATE, obs_fn=$OBS_FN, weight_decay=$WEIGHT_DECAY, adaptive_sigma_y=$ADAPTIVE_SIGMA_Y, SUFFIX='$SUFFIX', detach_steps=$DETACH_STEPS"
 
 # Load modules
 module load cuda/12.2
@@ -60,6 +61,7 @@ python train.py \
     --obs_fn $OBS_FN \
     --weight_decay $WEIGHT_DECAY \
     --suffix "$SUFFIX" \
+    --detach_steps $DETACH_STEPS \
     --loss_type $LOSS_TYPE \
     --loss_weights $LOSS_WEIGHTS \
     --es_p 1 \

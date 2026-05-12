@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Description: Batch submit Slurm jobs for train.py
-# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX)
+# Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX, DETACH_STEPS)
 
 SLURM_SCRIPT="slurm_highdim_train.sh"
 GPU_TYPE="${1:-h100}"
@@ -18,6 +18,7 @@ DEF_LR="default"
 DEF_OBS_FN="identity"
 DEF_WEIGHT_DECAY="0"
 DEF_SUFFIX=""
+DEF_DETACH_STEPS=5
 
 compute_time_limit() {
     local epochs="$1"
@@ -106,22 +107,22 @@ compute_time_limit() {
 # )
 
 EXPERIMENTS=(
-    # "lorenz96 1000 10 1.0 EtE-LRes es None default square_root 0 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square_root 0 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms es None default square_root 0.01 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square_root 0.01 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes es None default arctan 0 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default arctan 0 true None"
-    "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default arctan 0 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes es None default square 0 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square 0 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms es None default square 0.01 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square 0.01 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes es None default default 0 true None"
-    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default default 0 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms es None default default 0.01 true None"
-    "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None"
+    # "lorenz96 1000 10 1.0 EtE-LRes es None default square_root 0 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square_root 0 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms es None default square_root 0.01 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square_root 0.01 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes es None default arctan 0 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default arctan 0 true None 5"
+    "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0 true None 1"
+    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default arctan 0 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes es None default square 0 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square 0 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms es None default square 0.01 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square 0.01 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes es None default default 0 true None 5"
+    # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default default 0 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms es None default default 0.01 true None 5"
+    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None 5"
 )
 
 validate_adaptive_sigma_y() {
@@ -137,7 +138,7 @@ validate_adaptive_sigma_y() {
 
 for exp in "${EXPERIMENTS[@]}"; do
     # Parse the string into variables
-    read -r dataset epochs n sigma_y version loss_type loss_weights learning_rate obs_fn weight_decay adaptive_sigma_y suffix <<< "$exp"
+    read -r dataset epochs n sigma_y version loss_type loss_weights learning_rate obs_fn weight_decay adaptive_sigma_y suffix detach_steps <<< "$exp"
 
     if ! validate_adaptive_sigma_y "$adaptive_sigma_y"; then
         echo "Malformed experiment entry: $exp" >&2
@@ -157,6 +158,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     export WEIGHT_DECAY=${weight_decay:-$DEF_WEIGHT_DECAY}
     export ADAPTIVE_SIGMA_Y=$adaptive_sigma_y
     export SUFFIX=${suffix:-$DEF_SUFFIX}
+    export DETACH_STEPS=${detach_steps:-$DEF_DETACH_STEPS}
     TIME_LIMIT=$(compute_time_limit "$EPOCHS")
 
     # Construct Job Name
@@ -165,7 +167,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         JOB_NAME="${JOB_NAME}-${SUFFIX}" 
     fi
 
-    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, LR=$LEARNING_RATE, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY, Adaptive=$ADAPTIVE_SIGMA_Y, Time=$TIME_LIMIT)"
+    echo "Submitting job: $JOB_NAME (Loss=$LOSS_TYPE, Weights=$LOSS_WEIGHTS, LR=$LEARNING_RATE, ObsFn=$OBS_FN, WD=$WEIGHT_DECAY, Adaptive=$ADAPTIVE_SIGMA_Y, DetachSteps=$DETACH_STEPS, Time=$TIME_LIMIT)"
 
     # Submit using --export=ALL to pass the exported environment variables
     sbatch -J "$JOB_NAME" \
