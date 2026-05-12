@@ -6,6 +6,7 @@
 #SBATCH --nodes=1                       # number of nodes (1 node)
 #SBATCH --gres=gpu:1                    # 1 GPU
 #SBATCH --partition=gpu                 # use GPU partition
+#SBATCH --exclude=hpc-93-36             # avoid this node; any other node is allowed
 #SBATCH --ntasks=1                      # 1 task
 #SBATCH --mail-user=bhchen@caltech.edu
 #SBATCH --mail-type=BEGIN,END,FAIL

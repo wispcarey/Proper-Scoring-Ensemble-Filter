@@ -171,6 +171,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     sbatch -J "$JOB_NAME" \
            --time="$TIME_LIMIT" \
            --gres="gpu:${GPU_TYPE}:1" \
+           --exclude="hpc-93-36" \
            --export=ALL \
            "$SLURM_SCRIPT"
 done
