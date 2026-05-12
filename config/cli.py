@@ -395,6 +395,12 @@ def get_parameters(extra_arg_adder=None):
                         help='use the noise part hv + eta in the input of st')
     parser.add_argument('--mlp_y_type', type=str, default='obs', choices=['obs', 'innov', 'noise_innov'],
         help='the way dealing with the y-term in mlp')
+    parser.add_argument('--correction_init', type=str, default='zero_output', choices=['zero_output', 'default'],
+                        help='Initialization for correction/residual MLP outputs.')
+    parser.add_argument('--infl_init', type=str, default='zero_output', choices=['zero_output', 'default'],
+                        help='Initialization for inflation MLP outputs.')
+    parser.add_argument('--localization_init', type=str, default='large_output', choices=['large_output', 'default'],
+                        help='Initialization for localization MLP logits. large_output uses a fixed logit of 8.')
 
 
     # output setting

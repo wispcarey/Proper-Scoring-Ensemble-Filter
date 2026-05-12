@@ -37,7 +37,13 @@ from loss import (
     sample_projection_directions,
     wasserstein2_multivariate_gaussian,
 )
-from networks import NaiveNetwork, SetTransformer, Simple_MLP, ConditionTransformerNetwork
+from networks import (
+    NaiveNetwork,
+    SetTransformer,
+    Simple_MLP,
+    ConditionTransformerNetwork,
+    init_last_linear_constant_output,
+)
 from benchmark_analysis import ensemble_kalman_filter_analysis, bootstrap_particle_filter_analysis
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -2055,6 +2061,7 @@ def _build_ienks_model_args(args, forward_fun):
 
 
 def set_models(args):
+    localization_init_logit = 8.0
     has_loc_geometry = (
         getattr(args, 'num_dist', 0) > 0
         and getattr(args, 'Lvy', None) is not None
@@ -2107,6 +2114,12 @@ def set_models(args):
                 infl_model = Simple_MLP(d_input=args.ori_dim + 2 * args.st_output_dim, d_output=args.ori_dim, num_hidden_layers=2).to(args.device)
         else:
             st_model1, st_model2, infl_model, local_model = NaiveNetwork(1), NaiveNetwork(1), NaiveNetwork(1), NaiveNetwork(1)
+    if getattr(args, 'correction_init', 'zero_output') == 'zero_output' and args.v in ['CorrTerms', 'EtE-LRes']:
+        init_last_linear_constant_output(model, bias_value=0.0)
+    if getattr(args, 'infl_init', 'zero_output') == 'zero_output' and args.v == 'CorrTerms' and not isinstance(infl_model, NaiveNetwork):
+        init_last_linear_constant_output(infl_model, bias_value=0.0)
+    if getattr(args, 'localization_init', 'large_output') == 'large_output' and not isinstance(local_model, NaiveNetwork):
+        init_last_linear_constant_output(local_model, bias_value=localization_init_logit)
     if args.use_data_parallel:
         model, infl_model, local_model, st_model1, st_model2 = \
             nn.DataParallel(model), nn.DataParallel(infl_model), nn.DataParallel(local_model), nn.DataParallel(st_model1), nn.DataParallel(st_model2)

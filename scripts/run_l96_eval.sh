@@ -125,17 +125,10 @@ for exp in "${experiments[@]}"; do
             --obs_fn "$current_obs_fn"
             --adaptive_sigma_y
             --normal_output
-            --test_steps 500
+            --test_steps 1500
             --sigma_reg None
             --cp_load_path "$cp_path"
         )
-
-        if [ "$checkpoint_mode" = "finetuned" ]; then
-            cmd+=(
-                --sigma_ens 5
-                --suffix "sigma_ens_5"
-            )
-        fi
 
         "${cmd[@]}"
     done

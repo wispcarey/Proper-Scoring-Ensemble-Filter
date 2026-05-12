@@ -4,6 +4,17 @@ import time
 import torch
 import torch.nn as nn
 
+
+def init_last_linear_constant_output(module, bias_value=0.0):
+    """Make a module initially output a constant while keeping hidden layers random."""
+    for layer in reversed(list(module.modules())):
+        if isinstance(layer, nn.Linear):
+            nn.init.constant_(layer.weight, 0.0)
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, bias_value)
+            return layer
+    return None
+
 class Simple_MLP(nn.Module):
     def __init__(self, d_input, d_output, latent_dim=64, num_hidden_layers=2):
         super(Simple_MLP, self).__init__()
