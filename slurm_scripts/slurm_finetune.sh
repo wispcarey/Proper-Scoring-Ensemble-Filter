@@ -13,7 +13,7 @@
 #SBATCH -e output_record/ft.%x.%j.err      # STDERR
 
 # Description: Slurm execution script for finetune.py.
-# Input: Env vars defined in a submit wrapper (including optional OBS_FN and ADAPTIVE_SIGMA_Y).
+# Input: Env vars defined in a submit wrapper (including optional OBS_FN, ADAPTIVE_SIGMA_Y, and DETACH_STEPS).
 # Output: Fine-tuned model checkpoints and logs.
 
 # 1. Configuration (Defaults for safety)
@@ -34,6 +34,7 @@ OBS_FN=${OBS_FN:-"default"}
 ADAPTIVE_SIGMA_Y=${ADAPTIVE_SIGMA_Y:-"false"}
 NORMAL_OUTPUT=${NORMAL_OUTPUT:-"false"}
 NO_LOCALIZATION=${NO_LOCALIZATION:-"false"}
+DETACH_STEPS=${DETACH_STEPS:-5}
 PYTHON_BIN=${PYTHON_BIN:-"/home/bhchen/miniconda3/bin/python"}
 
 ADAPTIVE_SIGMA_Y_FLAG=""
@@ -62,7 +63,7 @@ case "${NO_LOCALIZATION,,}" in
         ;;
 esac
 
-echo "Starting Finetune: Dataset=$DATASET, Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y, LR=$LR, ObsFn=$OBS_FN, Adaptive=$ADAPTIVE_SIGMA_Y, NormalOutput=$NORMAL_OUTPUT, NoLocalization=$([ -n "$NO_LOCALIZATION_FLAG" ] && echo true || echo false)"
+echo "Starting Finetune: Dataset=$DATASET, Method=$VERSION, Loss=$LOSS_TYPE, Sig=$SIGMA_Y, LR=$LR, ObsFn=$OBS_FN, Adaptive=$ADAPTIVE_SIGMA_Y, DetachSteps=$DETACH_STEPS, NormalOutput=$NORMAL_OUTPUT, NoLocalization=$([ -n "$NO_LOCALIZATION_FLAG" ] && echo true || echo false)"
 echo "Checkpoint Load: $CP_PATH"
 
 # Load modules
@@ -89,4 +90,5 @@ cd ..
     --obs_fn $OBS_FN \
     --loss_type $LOSS_TYPE \
     --es_p $ES_P \
+    --detach_steps $DETACH_STEPS \
     --no_running_loss
