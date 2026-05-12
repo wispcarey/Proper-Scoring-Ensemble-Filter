@@ -7,24 +7,38 @@ cd "$REPO_ROOT" || exit 1
 PYTHON_BIN="/home/bhchen/miniconda3/bin/python"
 dataset="lorenz96"
 seed=42
+dt=0.3
+dt_iter=10
 ensemble_sizes=(5 10 15 20 40 60 100)
 obs_fn_suffixes=(square_root identity cos2pi square arctan tanh sin cube linear custom)
 
 # Define experiments as pairs: "Results_Subdir Trial_Dirname"
 # Format: "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
 experiments=(
-    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_CorrTermsNone_arctan"
-    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan"
-    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan"
-    "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan"
-    "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square"
-    "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square"
-    "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square"
-    "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square"
-    "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity"
-    "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity"
-    "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity"
-    "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_CorrTermsNone_arctan"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square"
+    # "lorenz96_results 2026-02-22_20-32lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square"
+    # "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square"
+    # "lorenz96_results 2026-02-22_20-33lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square"
+    # "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity"
+    # "lorenz96_results 2026-02-28_14-41lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity"
+    # "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity"
+    # "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
+    "lorenz96_results 2026-05-11_14-12lorenz96_0.27_20_60_8192_es_joint_CorrTerms_tuned_arctan"
+    "lorenz96_results 2026-05-11_14-12lorenz96_0.27_20_60_8192_es_joint_EtE-LRes_tuned_arctan"
+    "lorenz96_results 2026-05-11_14-12lorenz96_0.27_20_60_8192_nl2_joint_CorrTerms_tuned_arctan"
+    "lorenz96_results 2026-05-11_14-29lorenz96_0.27_20_60_8192_nl2_joint_EtE-LRes_tuned_arctan"
+    "lorenz96_results 2026-05-11_16-04lorenz96_6.69_20_60_8192_es_joint_CorrTerms_tuned_square"
+    "lorenz96_results 2026-05-11_16-04lorenz96_6.69_20_60_8192_es_joint_EtE-LRes_tuned_square"
+    "lorenz96_results 2026-05-11_16-04lorenz96_6.69_20_60_8192_nl2_joint_CorrTerms_tuned_square"
+    "lorenz96_results 2026-05-11_16-04lorenz96_6.69_20_60_8192_nl2_joint_EtE-LRes_tuned_square"
+    "lorenz96_results 2026-05-11_16-43lorenz96_1.0_20_60_8192_es_joint_EtE-LRes_tuned_identity"
+    "lorenz96_results 2026-05-11_16-48lorenz96_1.0_20_60_8192_nl2_joint_EtE-LRes_tuned_identity"
+    "lorenz96_results 2026-05-11_18-41lorenz96_1.0_20_60_8192_es_joint_CorrTerms_tuned_identity"
+    "lorenz96_results 2026-05-11_18-57lorenz96_1.0_20_60_8192_nl2_joint_CorrTerms_tuned_identity"
 )
 
 resolve_results_dir() {
@@ -101,6 +115,8 @@ for exp in "${experiments[@]}"; do
     echo "Trial Dir: $trial_dir"
     echo "Checkpoint Mode: $checkpoint_mode"
     echo "Sigma Y: default from config/dataset_info.py"
+    echo "dt: $dt"
+    echo "dt_iter: $dt_iter"
     echo "Obs Fn: $current_obs_fn"
     echo "=================================================="
 
@@ -121,6 +137,8 @@ for exp in "${experiments[@]}"; do
             --dataset "$dataset"
             --N "$N"
             --seed "$seed"
+            --dt "$dt"
+            --dt_iter "$dt_iter"
             --v "$v"
             --obs_fn "$current_obs_fn"
             --adaptive_sigma_y

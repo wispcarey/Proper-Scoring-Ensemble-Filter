@@ -4,7 +4,7 @@
 # Input: List of (DATASET, EPOCHS, N, SIGMA_Y, VERSION, LOSS_TYPE, LOSS_WEIGHTS, LEARNING_RATE, OBS_FN, WEIGHT_DECAY, ADAPTIVE_SIGMA_Y, SUFFIX)
 
 SLURM_SCRIPT="slurm_highdim_train.sh"
-GPU_TYPE="${1:-p100}"
+GPU_TYPE="${1:-h100}"
 
 # Default values
 DEF_DATASET="lorenz96"
@@ -112,16 +112,16 @@ EXPERIMENTS=(
     # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square_root 0.01 true None"
     # "lorenz96 1000 10 1.0 EtE-LRes es None default arctan 0 true None"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default arctan 0 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0.01 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default arctan 0.01 true None"
+    "lorenz96 1000 10 1.0 CorrTerms es None default arctan 0 true None"
+    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default arctan 0 true None"
     # "lorenz96 1000 10 1.0 EtE-LRes es None default square 0 true None"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default square 0 true None"
     # "lorenz96 1000 10 1.0 CorrTerms es None default square 0.01 true None"
     # "lorenz96 1000 10 1.0 CorrTerms nl2 None default square 0.01 true None"
-    "lorenz96 1000 10 1.0 EtE-LRes es None default default 0 true None"
+    # "lorenz96 1000 10 1.0 EtE-LRes es None default default 0 true None"
     # "lorenz96 1000 10 1.0 EtE-LRes nl2 None default default 0 true None"
     # "lorenz96 1000 10 1.0 CorrTerms es None default default 0.01 true None"
-    # "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None"
+    "lorenz96 1000 10 1.0 CorrTerms nl2 None default default 0.01 true None"
 )
 
 validate_adaptive_sigma_y() {
