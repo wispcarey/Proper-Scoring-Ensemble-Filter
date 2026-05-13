@@ -92,8 +92,8 @@ DATASET_INFO = {
         'colorbar_range': (-6,6)
     },
     'linear': {
-        'dim': 2,
-        'obs_dim': 1,
+        'dim': 20,
+        'obs_dim': 10,
         'obs_fn': 'identity',
         'test_plot_start_step': 100,
         'test_plot_step_interval': 100,
