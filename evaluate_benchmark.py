@@ -405,12 +405,14 @@ if __name__ == "__main__":
         # test
         t_start = time.time()
         loss_list_nn = []
+        save_suffix = str(getattr(args, 'suffix', '') or '')
+
         test_results = \
             test_ClassicFilter(test_loader, 
                             args, 
                             H_info=H_info, 
                             plot_figures=args.save_test_figures,
-                            fig_name=f'{folder_name}/test_{args.N}_0',
+                            fig_name=f'{folder_name}/test_{args.N}_0{save_suffix}',
                             infl=infl, 
                             loc_radius=loc_radius, 
                             # save_pdf=True
@@ -482,4 +484,4 @@ if __name__ == "__main__":
             'test_results': test_results,
         }
         
-        torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
+        torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}{save_suffix}.pt"))

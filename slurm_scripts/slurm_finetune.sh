@@ -23,7 +23,7 @@ EPOCHS=${EPOCHS:-20}
 SAVE_EPOCH=${SAVE_EPOCH:-20}
 TRAIN_STEPS=${TRAIN_STEPS:-"default"}
 TRAIN_TRAJ_NUM=${TRAIN_TRAJ_NUM:-"default"}
-LR=${LR:-"default"}
+LR=${LR:-"default_ft"}
 ES_P=${ES_P:-1}
 # These must be passed by submit script, but defaults provided to prevent crash
 VERSION=${VERSION:-"EtE-LRes"}

@@ -61,6 +61,7 @@ DATASET_INFO = {
         'hidden_dim': 64,
         'clamp': 20,
         'learning_rate': 1e-3, 
+        'finetune_learning_rate': 1e-4,
         'batch_size': 512,
         'train_steps': 60,
         'train_traj_num': 8192,

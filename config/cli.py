@@ -42,8 +42,8 @@ def float_or_default(value):
     try:
         return float(value)
     except ValueError:
-        if value == "default":
-            return "default"
+        if value in ["default", "default_ft", "default_finetune"]:
+            return value
         raise argparse.ArgumentTypeError(f"Invalid value: {value}")
 
 def float_or_none_or_default(value):
@@ -581,6 +581,9 @@ def get_parameters(extra_arg_adder=None):
 
     if args.learning_rate == 'default':
         args.learning_rate = dataset_config.get('learning_rate')
+    elif args.learning_rate in ['default_ft', 'default_finetune']:
+        base_learning_rate = dataset_config.get('learning_rate')
+        args.learning_rate = dataset_config.get('finetune_learning_rate', base_learning_rate / 10)
 
     if args.batch_size == 'default':
         ori_batch_size = dataset_config.get('batch_size')

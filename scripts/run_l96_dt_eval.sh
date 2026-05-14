@@ -7,40 +7,21 @@ cd "$REPO_ROOT" || exit 1
 PYTHON_BIN="/home/bhchen/miniconda3/bin/python"
 dataset="lorenz96"
 seed=42
-dt=0.15
-dt_iter=5
-ensemble_sizes=(5 10 15 20 40 60 100)
+dt_settings=(
+    # "0.15 5"
+    # "0.18 6"
+    # "0.21 7"
+    # "0.24 8"
+    "0.27 9"
+    "0.30 10"
+    "0.33 11"
+    "0.36 12"
+    "0.39 13"
+    "0.42 14"
+    "0.45 15"
+)
+ensemble_sizes=(10)
 obs_fn_suffixes=(square_root identity cos2pi square arctan tanh sin cube linear custom)
-
-# Define experiments as pairs: "Results_Subdir Trial_Dirname"
-# Format: "lorenz96_results 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
-# Previous 0.3 dt / 10 iter experiments live under save/lorenz96_results_0.3.
-# experiments=(
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_CorrTermsNone_arctan"
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan"
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan"
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan"
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square"
-#     "lorenz96_results_0.3 2026-02-22_20-32lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square"
-#     "lorenz96_results_0.3 2026-02-22_20-33lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square"
-#     "lorenz96_results_0.3 2026-02-22_20-33lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square"
-#     "lorenz96_results_0.3 2026-02-28_14-41lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity"
-#     "lorenz96_results_0.3 2026-02-28_14-41lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity"
-#     "lorenz96_results_0.3 2026-02-28_14-42lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity"
-#     "lorenz96_results_0.3 2026-02-28_14-42lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity"
-#     "lorenz96_results_0.3 2026-05-11_14-12lorenz96_0.27_20_60_8192_es_joint_CorrTerms_tuned_arctan"
-#     "lorenz96_results_0.3 2026-05-11_14-12lorenz96_0.27_20_60_8192_es_joint_EtE-LRes_tuned_arctan"
-#     "lorenz96_results_0.3 2026-05-11_14-12lorenz96_0.27_20_60_8192_nl2_joint_CorrTerms_tuned_arctan"
-#     "lorenz96_results_0.3 2026-05-11_14-29lorenz96_0.27_20_60_8192_nl2_joint_EtE-LRes_tuned_arctan"
-#     "lorenz96_results_0.3 2026-05-11_16-04lorenz96_6.69_20_60_8192_es_joint_CorrTerms_tuned_square"
-#     "lorenz96_results_0.3 2026-05-11_16-04lorenz96_6.69_20_60_8192_es_joint_EtE-LRes_tuned_square"
-#     "lorenz96_results_0.3 2026-05-11_16-04lorenz96_6.69_20_60_8192_nl2_joint_CorrTerms_tuned_square"
-#     "lorenz96_results_0.3 2026-05-11_16-04lorenz96_6.69_20_60_8192_nl2_joint_EtE-LRes_tuned_square"
-#     "lorenz96_results_0.3 2026-05-11_16-43lorenz96_1.0_20_60_8192_es_joint_EtE-LRes_tuned_identity"
-#     "lorenz96_results_0.3 2026-05-11_16-48lorenz96_1.0_20_60_8192_nl2_joint_EtE-LRes_tuned_identity"
-#     "lorenz96_results_0.3 2026-05-11_18-41lorenz96_1.0_20_60_8192_es_joint_CorrTerms_tuned_identity"
-#     "lorenz96_results_0.3 2026-05-11_18-57lorenz96_1.0_20_60_8192_nl2_joint_CorrTerms_tuned_identity"
-# )
 
 experiments=(
     "lorenz96_results 2026-05-11_20-52lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan"
@@ -137,45 +118,52 @@ for exp in "${experiments[@]}"; do
         checkpoint_mode="base"
     fi
 
-    echo "=================================================="
-    echo "Evaluating Method: $v"
-    echo "Results Dir: $results_dir"
-    echo "Trial Dir: $trial_dir"
-    echo "Checkpoint Mode: $checkpoint_mode"
-    echo "Sigma Y: default from config/dataset_info.py"
-    echo "dt: $dt"
-    echo "dt_iter: $dt_iter"
-    echo "Obs Fn: $current_obs_fn"
-    echo "=================================================="
+    for dt_setting in "${dt_settings[@]}"; do
+        read -r dt dt_iter <<< "$dt_setting"
+        output_suffix="_dt${dt}"
 
-    for N in "${ensemble_sizes[@]}"; do
-        if [ "$checkpoint_mode" = "finetuned" ]; then
-            cp_path="${trial_dir}/ft_cp_${N}_20.pth"
-        else
-            cp_path="${trial_dir}/cp_1000.pth"
-        fi
+        echo "=================================================="
+        echo "Evaluating Method: $v"
+        echo "Results Dir: $results_dir"
+        echo "Trial Dir: $trial_dir"
+        echo "Checkpoint Mode: $checkpoint_mode"
+        echo "Sigma Y: default from config/dataset_info.py"
+        echo "dt: $dt"
+        echo "dt_iter: $dt_iter"
+        echo "Obs Fn: $current_obs_fn"
+        echo "Output Suffix: $output_suffix"
+        echo "=================================================="
 
-        if [ ! -f "$cp_path" ]; then
-            echo "Skipping missing checkpoint: $cp_path" >&2
-            continue
-        fi
+        for N in "${ensemble_sizes[@]}"; do
+            if [ "$checkpoint_mode" = "finetuned" ]; then
+                cp_path="${trial_dir}/ft_cp_${N}_20.pth"
+            else
+                cp_path="${trial_dir}/cp_1000.pth"
+            fi
 
-        cmd=(
-            "$PYTHON_BIN" evaluate.py
-            --dataset "$dataset"
-            --N "$N"
-            --seed "$seed"
-            --dt "$dt"
-            --dt_iter "$dt_iter"
-            --v "$v"
-            --obs_fn "$current_obs_fn"
-            --adaptive_sigma_y
-            --normal_output
-            --test_steps 1500
-            --sigma_reg None
-            --cp_load_path "$cp_path"
-        )
+            if [ ! -f "$cp_path" ]; then
+                echo "Skipping missing checkpoint: $cp_path" >&2
+                continue
+            fi
 
-        "${cmd[@]}"
+            cmd=(
+                "$PYTHON_BIN" evaluate.py
+                --dataset "$dataset"
+                --N "$N"
+                --seed "$seed"
+                --dt "$dt"
+                --dt_iter "$dt_iter"
+                --v "$v"
+                --obs_fn "$current_obs_fn"
+                --adaptive_sigma_y
+                --normal_output
+                --test_steps 1500
+                --sigma_reg None
+                --cp_load_path "$cp_path"
+                --suffix "$output_suffix"
+            )
+
+            "${cmd[@]}"
+        done
     done
 done

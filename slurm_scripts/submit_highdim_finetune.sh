@@ -16,7 +16,9 @@ EPOCHS=20
 SAVE_EPOCH=20
 TRAIN_STEPS="default"
 TRAIN_TRAJ_NUM="default"
-DEF_LEARNING_RATE="default"
+# Fine-tuning default: use dataset_info.py finetune_learning_rate,
+# falling back to the dataset base learning_rate / 10.
+DEF_LEARNING_RATE="default_ft"
 DEF_OBS_FN="default"
 DEF_DETACH_STEPS=5
 ES_P=1
@@ -73,12 +75,19 @@ dataset_requires_no_localization() {
     esac
 }
 
+resolve_finetune_lr() {
+    case "${1,,}" in
+        ""|default) echo "$DEF_LEARNING_RATE" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 # Loop: Iterate through configuration
 for exp in "${EXPERIMENTS[@]}"; do
     # Parse experiment string
     read -r dataset v cp_path current_sigma_y loss_type learning_rate current_obs_fn adaptive_sigma_y detach_steps <<< "$exp"
     current_dataset=${dataset:-$DEF_DATASET}
-    current_lr=${learning_rate:-$DEF_LEARNING_RATE}
+    current_lr=$(resolve_finetune_lr "$learning_rate")
     current_obs_fn=${current_obs_fn:-$DEF_OBS_FN}
     adaptive_sigma_y=${adaptive_sigma_y:-false}
     detach_steps=${detach_steps:-$DEF_DETACH_STEPS}
