@@ -44,18 +44,18 @@ NORMAL_OUTPUT="false"
 # )
 
 EXPERIMENTS=(
-    # "lorenz96 EtE-LRes save/2026-05-11_21-42lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity/cp_1000.pth default es default identity true 5"
-    # "lorenz96 CorrTerms save/2026-05-11_20-53lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity/cp_1000.pth default es default identity true 5"
-    # "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity/cp_1000.pth default nl2 default identity true 5"
-    # "lorenz96 CorrTerms save/2026-05-12_11-31lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity/cp_1000.pth default nl2 default identity true 5"
-    # "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square/cp_1000.pth default es default square true 5"
-    # "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square/cp_1000.pth default es default square true 5"
-    # "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square/cp_1000.pth default nl2 default square true 5"
-    # "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square/cp_1000.pth default nl2 default square true 5"
-    # "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan/cp_1000.pth default es default arctan true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_21-42lorenz96_1.0_10_60_8192_es_joint_EtE-LResNone_identity/cp_1000.pth default es default identity true 5"
+    "lorenz96 CorrTerms save/2026-05-11_20-53lorenz96_1.0_10_60_8192_es_joint_CorrTermsNone_identity/cp_1000.pth default es default identity true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_1.0_10_60_8192_nl2_joint_EtE-LResNone_identity/cp_1000.pth default nl2 default identity true 5"
+    "lorenz96 CorrTerms save/2026-05-12_11-31lorenz96_1.0_10_60_8192_nl2_joint_CorrTermsNone_identity/cp_1000.pth default nl2 default identity true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_6.69_10_60_8192_es_joint_EtE-LResNone_square/cp_1000.pth default es default square true 5"
+    "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_6.69_10_60_8192_es_joint_CorrTermsNone_square/cp_1000.pth default es default square true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_6.69_10_60_8192_nl2_joint_EtE-LResNone_square/cp_1000.pth default nl2 default square true 5"
+    "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_6.69_10_60_8192_nl2_joint_CorrTermsNone_square/cp_1000.pth default nl2 default square true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_0.27_10_60_8192_es_joint_EtE-LResNone_arctan/cp_1000.pth default es default arctan true 5"
     "lorenz96 CorrTerms save/2026-05-12_11-44lorenz96_0.27_10_60_8192_es_joint_CorrTermsNone_arctan/cp_1000.pth default es default arctan true 5"
-    # "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan/cp_1000.pth default nl2 default arctan true 5"
-    # "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan/cp_1000.pth default nl2 default arctan true 5"
+    "lorenz96 EtE-LRes save/2026-05-11_20-52lorenz96_0.27_10_60_8192_nl2_joint_EtE-LResNone_arctan/cp_1000.pth default nl2 default arctan true 5"
+    "lorenz96 CorrTerms save/2026-05-11_20-52lorenz96_0.27_10_60_8192_nl2_joint_CorrTermsNone_arctan/cp_1000.pth default nl2 default arctan true 5"
 )
 
 validate_adaptive_sigma_y() {
