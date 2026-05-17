@@ -27,6 +27,10 @@ if __name__ == "__main__":
             folder_name = "."
 
     os.makedirs(folder_name, exist_ok=True)
+    if args.suffix.endswith('_tuned'):
+        save_suffix = args.suffix[:-6]
+    else:
+        save_suffix = args.suffix
     
     # redirect output
     with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
@@ -64,7 +68,7 @@ if __name__ == "__main__":
             args,
             H_info=H_info,
             plot_figures=args.save_test_figures,
-            fig_name=f'{folder_name}/test_{args.N}_0',
+            fig_name=f'{folder_name}/test_{args.N}_0{save_suffix}',
             save_pdf=False,
         )
         print_test_results(test_results)
@@ -144,11 +148,6 @@ if __name__ == "__main__":
         
         # print(torch.mean((ens_tensor_enkf.mean(dim=2) - ens_tensor_nn.mean(dim=2))**2, dim=(1,2))[:100])
         
-        # Remove '_tuned' suffix if present
-        if args.suffix.endswith('_tuned'):
-            save_suffix = args.suffix[:-6]
-        else:
-            save_suffix = args.suffix
         if args.zero_infl:
             torch.save(tensor_dict, os.path.join(folder_name, f"output_records_zero_infl_{args.N}{save_suffix}.pt"))
         else:

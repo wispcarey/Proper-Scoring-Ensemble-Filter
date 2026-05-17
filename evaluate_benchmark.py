@@ -5,6 +5,10 @@ import pandas as pd
 import numpy as np
 import time
 
+# Force a non-GUI backend before importing modules that may import matplotlib.
+# Batch benchmark runs save figures to disk and should not touch Qt/Wayland.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from config.benchmark_gridsearch_info import get_benchmark_gridsearch_config
 from config.cli import get_parameters
 from grid_search_benchmark import (
