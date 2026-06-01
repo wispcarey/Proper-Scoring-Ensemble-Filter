@@ -28,6 +28,12 @@ PF_FIXED_RANGES_3D = {
 }
 
 
+def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
 def _save_horizontal_legend_image(
     prefix: str,
     handles: List,
@@ -1818,7 +1824,7 @@ def _quantile_implied_density_curve(
     dqdp = np.gradient(q_mono, p)
     dqdp = np.clip(dqdp, float(min_dqdp), None)
     density = 1.0 / dqdp
-    area = np.trapz(density, q_mono)
+    area = _trapezoid_integral(density, q_mono)
     if np.isfinite(area) and area > 1e-12:
         density = density / area
     return q_mono, density
@@ -3110,7 +3116,7 @@ def _wrapped_kde_pdf_01(samples: np.ndarray, grid: np.ndarray, std: float) -> np
     norm = 1.0 / (np.sqrt(2.0 * np.pi) * std)
     density = norm * np.mean(kernel, axis=1)
 
-    area = np.trapz(density, grid)
+    area = _trapezoid_integral(density, grid)
     if area > 0:
         density = density / area
     return density
