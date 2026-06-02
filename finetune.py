@@ -7,9 +7,9 @@ import torch.nn as nn
 
 from config.cli import get_parameters
 
-from utils import setup_optimizer_and_scheduler, save_checkpoint, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
-from train_test_utils import train_model, test_model, set_models, print_test_results
+from psef.utils.legacy import setup_optimizer_and_scheduler, save_checkpoint, load_checkpoint
+from psef.utils.legacy import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
+from psef.training.legacy import train_model, test_model, set_models, print_test_results
 
 
 if __name__ == "__main__":
@@ -45,10 +45,7 @@ if __name__ == "__main__":
             if N == 40 or N == 60:
                 args.batch_size = ori_batch_size // 4
             elif N == 100:
-                if args.dataset == 'ks':
-                    args.batch_size = ori_batch_size // 16
-                else:
-                    args.batch_size = ori_batch_size // 8
+                args.batch_size = ori_batch_size // 8
             else:
                 args.batch_size = ori_batch_size 
             args.print_batch = math.ceil(args.train_traj_num / args.batch_size)

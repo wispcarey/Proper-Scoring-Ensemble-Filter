@@ -162,3 +162,5 @@ cython_debug/
 
 # Project-local agent config
 AGENTS.md
+.agents/
+.codex/

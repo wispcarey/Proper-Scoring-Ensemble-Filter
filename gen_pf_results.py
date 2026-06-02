@@ -7,10 +7,10 @@ import torch.nn as nn
 from config.cli import get_parameters
 from config.dataset_info import DATASET_INFO
 
-from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output
+from psef.utils.legacy import setup_optimizer_and_scheduler, load_checkpoint
+from psef.utils.legacy import build_observation_operator, get_dataloader, redirect_output
 
-from train_test_utils import generate_and_cache_pf_results, print_test_results
+from psef.training.legacy import generate_and_cache_pf_results, print_test_results
 
 
 if __name__ == "__main__":

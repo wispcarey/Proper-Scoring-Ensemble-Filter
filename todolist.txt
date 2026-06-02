@@ -1,3 +1,0 @@
-1. 整合多个random seed的pf结果的.py，这个文件还需要可以处理pf的结果，生成crps的se，还有其他统计信息
-2. 计算各个维度的CRPS然后取mean，基于对PF的quantile计算
-3. 

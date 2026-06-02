@@ -31,27 +31,6 @@ L96_IENKS_LOCAL_SEARCH_SPECS_BY_N = {
     100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
 }
 
-KS_LOCAL_SEARCH_SPECS_BY_N = {
-    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
-}
-
-KS_IENKS_LOCAL_SEARCH_SPECS_BY_N = {
-    5: {"infl_num": 8, "infl_step": 0.05, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    10: {"infl_num": 8, "infl_step": 0.04, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    15: {"infl_num": 8, "infl_step": 0.03, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    20: {"infl_num": 8, "infl_step": 0.025, "loc_num": 6, "loc_step": 1.0, "loc_min": 0.001},
-    40: {"infl_num": 8, "infl_step": 0.02, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    60: {"infl_num": 8, "infl_step": 0.015, "loc_num": 6, "loc_step": 2.0, "loc_min": 0.001},
-    100: {"infl_num": 8, "infl_step": 0.01, "loc_num": 6, "loc_step": 3.0, "loc_min": 0.001},
-}
-
-
 LOW_DIM_METHOD_GRIDSEARCH_INFO = {
     "EnKF": {
         "use_localization": False,
@@ -113,50 +92,11 @@ L96_METHOD_GRIDSEARCH_INFO = {
     },
 }
 
-KS_METHOD_GRIDSEARCH_INFO = {
-    "EnKF": {
-        "use_localization": True,
-        "localization_fn": "GC",
-        "search_specs_by_N": copy.deepcopy(KS_LOCAL_SEARCH_SPECS_BY_N),
-    },
-    "ESRF": {
-        "use_localization": False,
-        "localization_fn": None,
-        "search_specs_by_N": copy.deepcopy(LOW_DIM_SEARCH_SPECS_BY_N),
-    },
-    "iEnKS-PertObs": {
-        "use_localization": True,
-        "localization_fn": "GC",
-        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
-    },
-    "iEnKS-Sqrt": {
-        "use_localization": True,
-        "localization_fn": "GC",
-        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
-    },
-    "iEnKS-Order1": {
-        "use_localization": True,
-        "localization_fn": "GC",
-        "search_specs_by_N": copy.deepcopy(KS_IENKS_LOCAL_SEARCH_SPECS_BY_N),
-    },
-    "LETKF": {
-        "use_localization": True,
-        "localization_fn": "GC",
-        "search_specs_by_N": copy.deepcopy(KS_LOCAL_SEARCH_SPECS_BY_N),
-    },
-}
-
-
 BENCHMARK_GRIDSEARCH_INFO = {
     "lorenz63": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
-    "rossler": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
     "linear": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
-    "circle": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
-    "hdoublewell": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
     "doubling1d": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
-    "complex2d": copy.deepcopy(LOW_DIM_METHOD_GRIDSEARCH_INFO),
     "lorenz96": copy.deepcopy(L96_METHOD_GRIDSEARCH_INFO),
-    "ks": copy.deepcopy(KS_METHOD_GRIDSEARCH_INFO),
 }
 
 

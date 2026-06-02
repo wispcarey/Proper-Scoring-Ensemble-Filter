@@ -9,7 +9,7 @@ import datetime
 from .dataset_info import DATASET_INFO
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from localization import pairwise_distances
+from psef.filters.localization import pairwise_distances
 
 def parse_obs_inds(value):
     """
@@ -209,7 +209,7 @@ def _load_default_snr_row(dataset, csv_path):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"--adaptive_sigma_y is enabled but CSV file was not found: {csv_path}. "
-            "Please generate it first with test_notebooks/print_default_snr_table.py."
+            "Please generate it first with scripts/print_default_snr_table.py."
         )
 
     with open(csv_path, "r", newline="") as f:
@@ -291,8 +291,8 @@ def _apply_adaptive_sigma_y_if_needed(args, dataset_config):
 def get_parameters(extra_arg_adder=None):
     parser = argparse.ArgumentParser()
     # dataset setting
-    parser.add_argument('--dataset', type=str, default='lorenz96', 
-                        choices=['lorenz63', 'rossler','lorenz96', 'ks', 'linear', 'circle', 'Hdoublewell', 'doubling1d', 'complex2d'],
+    parser.add_argument('--dataset', type=str, default='lorenz96',
+                        choices=['lorenz63', 'lorenz96', 'linear', 'doubling1d'],
                         help='Dataset name')
     parser.add_argument('--num_loader_workers', type=int, default=16,
                         help='number of workers for the data loader')
@@ -346,14 +346,11 @@ def get_parameters(extra_arg_adder=None):
     parser.add_argument('--loss_warm_up', action='store_true',
                         help='warm-up the loss according to epochs')
     parser.add_argument('--loss_type', type=parse_list_type, default=["nl2"],
-                        help='the type of loss function, split by comma, e.g., "l2,rmse,crps"')
+                        help='Loss type(s), comma separated. Public training losses are es,nl2,l2.')
     parser.add_argument('--loss_weights', type=str, default=None,
                         help='Weights for each loss type, comma separated e.g., "1.0,0.5"')
     parser.add_argument('--es_p', type=float, default=1,
                         help='the power of energy score')
-    parser.add_argument('--kes_sigma', type=lambda x: float(x) if x.lower() != 'none' else None,
-                        default=1e-2,
-                        help='the power of energy score (can be float or None)')
 
     # training setting
     parser.add_argument('--cp_load_path', type=str, default="no",
@@ -438,7 +435,9 @@ def get_parameters(extra_arg_adder=None):
                         help='use SGD optimizer, otherwise use Adam')
     parser.add_argument('--no_running_loss', action='store_true',
                         help='Do not use an accumulative loss in training. Calculate the loss once finishing the entire trajectory')
-    # parser.set_defaults(no_running_loss=True)
+    parser.add_argument('--running_loss', dest='no_running_loss', action='store_false',
+                        help='Use accumulative running loss during training')
+    parser.set_defaults(no_running_loss=True)
     parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'],
                         help='Training precision. fp32 is default (no precision loss). bf16/fp16 enable mixed precision on CUDA.')
     
@@ -495,7 +494,7 @@ def get_parameters(extra_arg_adder=None):
 
     # grid search settings
     parser.add_argument('--grid_search_cpu_workers', type=int, default=32,
-                        help='Number of CPU worker processes used by benchmark grid search when --device cpu.')
+                        help='Number of CPU worker processes used by CPU benchmark grid searches.')
     parser.add_argument('--grid_search_num_seeds', type=int, default=4,
                         help='Number of random seeds averaged for each benchmark grid-search parameter pair. '
                              'Seeds are generated as base --seed, --seed+1, ... and do not affect --pf_verification_seed.')
@@ -544,6 +543,14 @@ def get_parameters(extra_arg_adder=None):
         args.lr_decay_rate = 1
 
     dataset_config = DATASET_INFO.get(args.dataset, {})
+
+    if args.dataset in {"doubling1d", "lorenz63"}:
+        if not args.no_localization:
+            print(f"[INFO] Forcing --no_localization for dataset={args.dataset}.")
+        args.no_localization = True
+
+    if "es" in args.loss_type and args.es_p != 1:
+        raise ValueError("--loss_type es requires --es_p 1.")
 
     if args.dt == 'default':
         args.dt = dataset_config.get('dt')

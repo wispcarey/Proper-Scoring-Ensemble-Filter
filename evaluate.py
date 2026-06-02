@@ -9,10 +9,10 @@ import time
 
 from config.cli import get_parameters
 
-from utils import setup_optimizer_and_scheduler, load_checkpoint
-from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
+from psef.utils.legacy import setup_optimizer_and_scheduler, load_checkpoint
+from psef.utils.legacy import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
 
-from train_test_utils import test_model, set_models, print_test_results
+from psef.training.legacy import test_model, set_models, print_test_results
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-#!/usr/bin/env /home/bhchen/miniconda3/bin/python
+#!/usr/bin/env python
 """
 Create paper-style grid-search visualizations for Lorenz63 and Lorenz96.
 

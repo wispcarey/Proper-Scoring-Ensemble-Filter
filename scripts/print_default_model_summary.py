@@ -1,4 +1,4 @@
-#!/usr/bin/env /home/bhchen/miniconda3/bin/python
+#!/usr/bin/env python
 """
 Print default model/training settings for selected datasets and NN methods.
 
@@ -27,8 +27,8 @@ if REPO_ROOT not in sys.path:
 warnings.filterwarnings("ignore", message="Keyboard interaction.*")
 
 from config.cli import get_parameters
-from networks import NaiveNetwork, SetTransformer
-from train_test_utils import set_models
+from psef.models.architectures import NaiveNetwork, SetTransformer
+from psef.training.legacy import set_models
 
 
 DEFAULT_DATASETS = ("linear", "doubling1d", "lorenz63", "lorenz96")

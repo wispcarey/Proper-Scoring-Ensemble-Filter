@@ -17,8 +17,31 @@ from grid_search_benchmark import (
     _make_setting_id,
     _serialize_obs_inds,
 )
-from utils import build_observation_operator, get_dataloader, redirect_output, should_redirect_output
-from train_test_utils import test_ClassicFilter, print_test_results
+from psef.utils.legacy import (
+    build_observation_operator,
+    get_dataloader,
+    load_checkpoint,
+    redirect_output,
+    setup_optimizer_and_scheduler,
+    should_redirect_output,
+)
+from psef.training.legacy import (
+    print_test_results,
+    print_test_results_v2,
+    set_models,
+    test_ClassicFilter,
+    test_linear_sampling_error,
+    test_model_v2,
+)
+
+
+LINEAR_UNCERTAINTY_ALIASES = {
+    "linear_unc",
+    "linear_uncertainty",
+    "linear_sampling_error",
+    "inherent_uncertainty",
+    "sampling_error",
+}
 
 
 def _safe_int_or_none(value):
@@ -197,19 +220,19 @@ def _find_matching_torch_grid_row(df, signature, setting_id):
 
     return matches.iloc[0], "settings"
 
-def get_benchmarks(args, source='dapper'):
+def get_benchmarks(args, source='csv'):
     """
     Retrieve benchmark parameters and metrics.
     
     Args:
         args: Argument namespace.
-        source (str): 'dapper' to read from CSV, 'torch' to read from grid search .pt file.
+        source (str): 'csv' to read from benchmark CSV, 'torch' to read from grid search .pt file.
         
     Returns:
-        If source is 'dapper': Returns (sigma_y_1_array, sigma_y_0_7_array)
+        If source is 'csv': Returns (sigma_y_1_array, sigma_y_0_7_array)
         If source is 'torch': Returns (infl, loc_radius)
     """
-    if source == 'dapper':
+    if source == 'csv':
         # --- Original CSV Reading Logic ---
         file_path = f'save/benchmark/benchmarks_{args.dataset}.csv'
         df = pd.read_csv(file_path, usecols=['method', 'N', 'sigma_y', 'best_loc_rad','best_infl','rmse', 'rrmse_mean'])
@@ -314,11 +337,126 @@ def write_benchmark_row(args, loc_radius, infl, rmse, rrmse, rmse_std=None, rrms
     df_full.to_csv(file_path, index=False)
 
 
-if __name__ == "__main__":
-    args = get_parameters()
-    
+def _is_linear_uncertainty_request(args):
+    method = str(getattr(args, "v", "") or "").strip().lower().replace("-", "_")
+    return args.dataset == "linear" and method in LINEAR_UNCERTAINTY_ALIASES
+
+
+def _run_linear_evaluation(args):
+    if args.v in ["EnKF", "LETKF"]:
+        folder_name = os.path.join("save", f"benchmark_{args.dataset}_{args.sigma_y}_{args.v}")
+        if not os.path.isdir(folder_name):
+            os.makedirs(folder_name)
+    else:
+        folder_name = os.path.dirname(args.cp_load_path)
+        if args.cp_load_path == "no":
+            raise ValueError("The parameter cp_load_path is invalid.")
+
+    with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
+        if args.seed is not None and args.seed != "None":
+            torch.manual_seed(int(args.seed))
+
+        _, test_loader = get_dataloader(args)
+
+        print(
+            f"Test on {args.test_traj_num} trajectories with the length {args.test_steps} "
+            f"and ensemble size {args.N}. Observation noise sigma_y={args.sigma_y}."
+        )
+
+        model_list = set_models(args)
+        optimizer, scheduler = setup_optimizer_and_scheduler(model_list, args)
+        if args.cp_load_path != "no":
+            load_checkpoint(
+                model_list,
+                None,
+                None,
+                filename=args.cp_load_path,
+                use_data_parallel=args.use_data_parallel,
+            )
+
+        print("Test NN Results")
+        t_start = time.time()
+        test_results = test_model_v2(
+            test_loader,
+            model_list,
+            args,
+            plot_figures=args.save_test_figures,
+            fig_name=f'{folder_name}/test_{args.N}_0',
+            save_pdf=False,
+            infl=1,
+            loc_radius=5,
+        )
+        print_test_results_v2(test_results)
+        t_inference = time.time() - t_start
+        print(f"Inference finished with time {t_inference: .2f}s.")
+
+        tensor_dict = {
+            'nn': {
+                'mean_rmse': test_results.get('mean_rmse', float('nan')),
+                'std_rmse': test_results.get('std_rmse', float('nan')),
+                'mean_rrmse': test_results.get('mean_rrmse', float('nan')),
+                'std_rrmse': test_results.get('std_rrmse', float('nan')),
+                'mean_rmv': test_results.get('mean_rmv', float('nan')),
+                'std_rmv': test_results.get('std_rmv', float('nan')),
+                'mean_es1': test_results.get('mean_es1', float('nan')),
+                'std_es1': test_results.get('std_es1', float('nan')),
+                'mean_res1': test_results.get('mean_res1', float('nan')),
+                'std_res1': test_results.get('std_res1', float('nan')),
+                'mean_w2_diff': test_results.get('mean_w2_diff', float('nan')),
+                'std_w2_diff': test_results.get('std_w2_diff', float('nan')),
+                'valid_percent': test_results.get('no_nan_percent', 0.0),
+                'min_m_norm': test_results.get('min_m_norm', float('nan')),
+                'max_m_norm': test_results.get('max_m_norm', float('nan')),
+                'loc_diff_dist': getattr(args, 'diff_dist', None),
+                'mean_assim_time_w': test_results.get('assim_step_time_mean_weighted', float('nan')),
+                'std_assim_time_w': test_results.get('assim_step_time_std_weighted', float('nan')),
+                'mean_assim_time': test_results.get('assim_step_time_mean', float('nan')),
+                'std_assim_time': test_results.get('assim_step_time_std', float('nan')),
+            },
+            'cp_load_path': getattr(args, 'cp_load_path', None),
+            'sigma_y': getattr(args, 'sigma_y', None),
+            'time': t_inference,
+            'test_results': test_results,
+        }
+
+        torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}.pt"))
+
+
+def _run_linear_uncertainty(args):
+    folder_name = os.path.join("save", f"linear_unc_{args.sigma_y}")
+    os.makedirs(folder_name, exist_ok=True)
+    os.makedirs(os.path.join("save", "benchmark"), exist_ok=True)
+
+    with redirect_output(save_output=should_redirect_output(args), save_folder=folder_name, filename="test_output.txt"):
+        if args.seed is not None and args.seed != "None":
+            torch.manual_seed(int(args.seed))
+
+        test_loader = get_dataloader(args, test_only=True)
+        num_resamples = 100
+
+        print(
+            f"Test inherent linear sampling error on {args.test_traj_num} trajectories "
+            f"with length {args.test_steps} and ensemble size {args.N}. "
+            f"Averaging over {num_resamples} resamples per step. "
+            f"Observation noise sigma_y={args.sigma_y}."
+        )
+
+        test_results = test_linear_sampling_error(test_loader, args, num_resamples)
+        print_test_results_v2(test_results)
+
+        torch.save(
+            test_results,
+            os.path.join(
+                "save",
+                "benchmark",
+                f"linear_inherent_unc_N{args.N}_resample{num_resamples}_len{args.test_steps}_10rand.pt",
+            ),
+        )
+
+
+def _run_classical_benchmark(args):
     # === Configuration ===
-    # Set the benchmark source here: 'dapper' (CSV) or 'torch' (Grid Search .pt)
+    # Set the benchmark source here: 'csv' or 'torch' (Grid Search .pt)
     BENCHMARK_SOURCE = 'torch' 
     # =====================
 
@@ -334,9 +472,6 @@ if __name__ == "__main__":
         # H_info
         H_info = build_observation_operator(args)
 
-        # modify test_batch_size
-        if args.N == 100 and args.dataset == 'ks':
-            args.test_batch_size = args.test_batch_size // 2
         test_loader = get_dataloader(args, test_only=True)
         
         print(f"Test on {args.test_traj_num} trajectories with the length {args.test_steps} and ensemble size {args.N}. Observation noise sigma_y={args.sigma_y}.\n"
@@ -348,26 +483,26 @@ if __name__ == "__main__":
         infl = default_infl
         loc_radius = default_loc_radius
 
-        if BENCHMARK_SOURCE == 'dapper':
+        if BENCHMARK_SOURCE == 'csv':
             try:
-                sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args, source='dapper')
+                sigma_y_1_array, sigma_y_0_7_array = get_benchmarks(args, source='csv')
                 
                 # Select appropriate array based on sigma_y
                 if np.isclose(args.sigma_y, 1.0):
-                    dapper_array = sigma_y_1_array
+                    csv_array = sigma_y_1_array
                 elif np.isclose(args.sigma_y, 0.7):
-                    dapper_array = sigma_y_0_7_array
+                    csv_array = sigma_y_0_7_array
                 else:
-                    dapper_array = np.empty((0, 4))
-                    print(f"Warning: DAPPER benchmark not configured for sigma_y={args.sigma_y}. "
+                    csv_array = np.empty((0, 4))
+                    print(f"Warning: CSV benchmark not configured for sigma_y={args.sigma_y}. "
                           f"Falling back to default infl={default_infl}, loc={default_loc_radius}.")
                 
                 # Unpack array [best_loc_rad, best_infl, rmse, rrmse_mean]
-                if dapper_array.shape[0] > 0:
-                    loc_radius_candidate = dapper_array[0, 0]
-                    infl_candidate = dapper_array[0, 1]
-                    rmse_baseline = dapper_array[0, 2]
-                    rrmse_baseline = dapper_array[0, 3]
+                if csv_array.shape[0] > 0:
+                    loc_radius_candidate = csv_array[0, 0]
+                    infl_candidate = csv_array[0, 1]
+                    rmse_baseline = csv_array[0, 2]
+                    rrmse_baseline = csv_array[0, 3]
 
                     if pd.notna(infl_candidate):
                         infl = float(infl_candidate)
@@ -375,18 +510,18 @@ if __name__ == "__main__":
                         loc_radius = float(loc_radius_candidate)
 
                     if pd.notna(rmse_baseline):
-                        print(f"RMSE from DAPPER: {rmse_baseline:.3f}.")
+                        print(f"RMSE from benchmark CSV: {rmse_baseline:.3f}.")
                     if pd.notna(rrmse_baseline):
-                        print(f"RRMSE from DAPPER: {rrmse_baseline:.3f}.")
+                        print(f"RRMSE from benchmark CSV: {rrmse_baseline:.3f}.")
                 else:
-                    print(f"Warning: No DAPPER benchmark found for dataset={args.dataset}, "
+                    print(f"Warning: no CSV benchmark found for dataset={args.dataset}, "
                           f"N={args.N}, sigma_y={args.sigma_y}. "
                           f"Using default infl={default_infl}, loc={default_loc_radius}.")
             except FileNotFoundError:
                 print(f"Warning: benchmark file for dataset={args.dataset} is missing. "
                       f"Using default infl={default_infl}, loc={default_loc_radius}.")
             except Exception as e:
-                print(f"Warning: failed to load DAPPER benchmark ({e}). "
+                print(f"Warning: failed to load CSV benchmark ({e}). "
                       f"Using default infl={default_infl}, loc={default_loc_radius}.")
 
         elif BENCHMARK_SOURCE == 'torch':
@@ -489,3 +624,17 @@ if __name__ == "__main__":
         }
         
         torch.save(tensor_dict, os.path.join(folder_name, f"output_records_{args.N}{save_suffix}.pt"))
+
+
+def main():
+    args = get_parameters()
+    if _is_linear_uncertainty_request(args):
+        _run_linear_uncertainty(args)
+    elif args.dataset == "linear":
+        _run_linear_evaluation(args)
+    else:
+        _run_classical_benchmark(args)
+
+
+if __name__ == "__main__":
+    main()

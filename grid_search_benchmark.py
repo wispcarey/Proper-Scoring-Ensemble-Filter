@@ -20,8 +20,14 @@ import torch
 
 from config.benchmark_gridsearch_info import get_benchmark_gridsearch_config
 from config.cli import get_parameters
-from train_test_utils import print_test_results, test_ClassicFilter
-from utils import build_observation_operator, get_dataloader, redirect_output
+from psef.training.legacy import (
+    print_test_results,
+    print_test_results_v2,
+    set_models,
+    test_ClassicFilter,
+    test_model_v2,
+)
+from psef.utils.legacy import build_observation_operator, get_dataloader, redirect_output
 
 
 SAVE_ROOT = os.path.join("save", "torch_grid_search")
@@ -251,8 +257,6 @@ def _is_cpu_device(device):
 
 def _adjust_eval_args(args):
     args_copy = copy.deepcopy(args)
-    if args_copy.N == 100 and str(args_copy.dataset).lower() == "ks":
-        args_copy.test_batch_size = args_copy.test_batch_size // 2
     if _is_cpu_device(args_copy.device):
         args_copy.device = torch.device("cpu")
         args_copy.num_loader_workers = 0
@@ -699,8 +703,110 @@ def _csv_has_setting_id(csv_path, setting_id):
     return bool((existing_df["setting_id"].astype(str) == str(setting_id)).any())
 
 
-if __name__ == "__main__":
-    args = get_parameters()
+def _run_linear_grid_search_loop(args, test_loader, model_list, infl_candidates, loc_candidates):
+    if args.v not in ["EnKF", "LETKF"]:
+        raise ValueError("Linear grid search is only implemented for EnKF and LETKF.")
+
+    best_w2 = float('inf')
+    best_results = None
+    best_params = (None, None)
+    grid_history = []
+
+    print(f"Starting Linear Grid Search for {args.v}...")
+    print(f"Inflation candidates: {infl_candidates}")
+    print(f"Localization candidates: {loc_candidates}\n")
+
+    for infl in infl_candidates:
+        for loc in loc_candidates:
+            print(f"Testing [infl={infl}, loc={loc}]...")
+            results = test_model_v2(
+                test_loader,
+                model_list,
+                args,
+                plot_figures=False,
+                fig_name=None,
+                save_pdf=False,
+                infl=infl,
+                loc_radius=loc,
+            )
+
+            current_w2 = results.get('mean_w2_diff', float('inf'))
+            grid_history.append(
+                {
+                    'params': {'infl': infl, 'loc': loc},
+                    'w2_diff': current_w2,
+                    'rmse': results.get('mean_rmse', float('nan')),
+                    'rrmse': results.get('mean_rrmse', float('nan')),
+                    'es1': results.get('mean_es1', float('nan')),
+                }
+            )
+            print(f"  -> W2: {current_w2:.4f}")
+
+            if current_w2 < best_w2:
+                best_w2 = current_w2
+                best_results = results
+                best_params = (infl, loc)
+
+    print(f"\nLinear grid search finished. Best W2: {best_w2:.4f} with infl={best_params[0]}, loc={best_params[1]}")
+    return best_results, best_params, grid_history
+
+
+def _run_linear_grid_search(args):
+    infl_list = [1.0, 1.01, 1.02, 1.03, 1.04, 1.05]
+    loc_list = [1, 2, 3, 5, 7, 9]
+
+    if args.v not in ["EnKF", "LETKF"]:
+        raise ValueError("Linear grid search is only implemented for EnKF/LETKF.")
+
+    folder_name = os.path.join("save", f"grid_search_{args.dataset}_{args.sigma_y}_{args.v}")
+    os.makedirs(folder_name, exist_ok=True)
+
+    with redirect_output(save_output=not args.normal_output, save_folder=folder_name, filename="grid_search_output.txt"):
+        if args.seed is not None and args.seed != "None":
+            torch.manual_seed(int(args.seed))
+
+        _, test_loader = get_dataloader(args)
+        print(f"Test on {args.test_traj_num} trajectories with length {args.test_steps}, ensemble size {args.N}.")
+
+        model_list = set_models(args)
+
+        t_start = time.time()
+        best_full_results, best_params, history = _run_linear_grid_search_loop(
+            args,
+            test_loader,
+            model_list,
+            infl_list,
+            loc_list,
+        )
+        t_inference = time.time() - t_start
+
+        print("\n=== Best Test Results ===")
+        print_test_results_v2(best_full_results)
+
+        tensor_dict = {
+            'best_params': {
+                'infl': best_params[0],
+                'loc_radius': best_params[1],
+            },
+            'best_metrics': {
+                'mean_rmse': best_full_results.get('mean_rmse', float('nan')),
+                'std_rmse': best_full_results.get('std_rmse', float('nan')),
+                'mean_rrmse': best_full_results.get('mean_rrmse', float('nan')),
+                'std_rrmse': best_full_results.get('std_rrmse', float('nan')),
+                'mean_w2_diff': best_full_results.get('mean_w2_diff', float('nan')),
+                'std_w2_diff': best_full_results.get('std_w2_diff', float('nan')),
+                'valid_percent': best_full_results.get('no_nan_percent', 0.0),
+            },
+            'grid_history': history,
+            'sigma_y': getattr(args, 'sigma_y', None),
+            'time': t_inference,
+            'test_results': best_full_results,
+        }
+
+        torch.save(tensor_dict, os.path.join(folder_name, f"best_output_{args.N}.pt"))
+
+
+def _run_benchmark_grid_search(args):
     eval_args = _adjust_eval_args(args)
     search_metric_key, search_metric_label = _get_search_metric_info(eval_args)
 
@@ -866,3 +972,15 @@ if __name__ == "__main__":
                 )
             except Exception as exc:
                 print(f"[Plotting Warning] Final plotting pass failed after results were saved: {exc}")
+
+
+def main():
+    args = get_parameters()
+    if args.dataset == "linear":
+        _run_linear_grid_search(args)
+    else:
+        _run_benchmark_grid_search(args)
+
+
+if __name__ == "__main__":
+    main()
