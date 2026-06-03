@@ -56,45 +56,44 @@ ENTRYPOINT=pf_generate scripts/cli_help.sh
 ENTRYPOINT=pf_process scripts/cli_help.sh
 ```
 
-Check the public CUDA command templates without launching training or evaluation:
+Check a public CUDA command template without launching training or evaluation:
 
 ```bash
 DRY_RUN=true scripts/train_example.sh
 DRY_RUN=true scripts/benchmark_example.sh
-DRY_RUN=true scripts/grid_search_example.sh
 ```
 
-More dry-run training examples:
+Training examples:
 
 ```bash
-DATASET=lorenz96 MODEL=CorrTerms LOSS=nl2 DRY_RUN=true scripts/train_example.sh
-DATASET=linear MODEL=EtE-LRes LOSS=es DRY_RUN=true scripts/train_example.sh
-DATASET=doubling1d MODEL=EtE-LRes LOSS=l2 DRY_RUN=true scripts/train_example.sh
+DATASET=lorenz96 MODEL=CorrTerms LOSS=nl2 scripts/train_example.sh
+DATASET=linear MODEL=EtE-LRes LOSS=es scripts/train_example.sh
+DATASET=doubling1d MODEL=EtE-LRes LOSS=l2 scripts/train_example.sh
 ```
 
-More dry-run benchmark examples:
+Benchmark examples:
 
 ```bash
-DATASET=lorenz96 METHOD=LETKF DRY_RUN=true scripts/benchmark_example.sh
-DATASET=linear METHOD=EnKF DRY_RUN=true scripts/benchmark_example.sh
-DATASET=doubling1d METHOD=ESRF DRY_RUN=true scripts/benchmark_example.sh
+DATASET=lorenz96 METHOD=LETKF scripts/benchmark_example.sh
+DATASET=linear METHOD=EnKF scripts/benchmark_example.sh
+DATASET=doubling1d METHOD=ESRF scripts/benchmark_example.sh
 ```
 
-Dry-run grid-search examples:
+Grid-search examples:
 
 ```bash
-DATASET=linear METHOD=EnKF DRY_RUN=true scripts/grid_search_example.sh
-DATASET=lorenz96 METHOD=LETKF DRY_RUN=true scripts/grid_search_example.sh
-DATASET=doubling1d METHOD=ESRF DRY_RUN=true scripts/grid_search_example.sh
+DATASET=linear METHOD=EnKF scripts/grid_search_example.sh
+DATASET=lorenz96 METHOD=LETKF scripts/grid_search_example.sh
+DATASET=doubling1d METHOD=ESRF scripts/grid_search_example.sh
 ```
 
-To run one of these templates for real, remove `DRY_RUN=true`. Training,
-evaluation, and grid-search scripts use `--device cuda` by default. To evaluate a
-trained neural PSEF checkpoint, pass the checkpoint path through the evaluation
-script:
+Training, evaluation, and grid-search scripts use `--device cuda` by default.
+Training templates run for `EPOCHS=100` unless overridden; direct `train.py`
+runs use the CLI default `--epochs 1000`. To evaluate a trained neural PSEF
+checkpoint, pass the checkpoint path through the evaluation script:
 
 ```bash
-CP_LOAD_PATH=save/path/to/checkpoint.pth DRY_RUN=true scripts/evaluate_example.sh
+CP_LOAD_PATH=save/path/to/checkpoint.pth scripts/evaluate_example.sh
 ```
 
 Checkpoints are produced under `save/` by training runs and are not bundled in
@@ -107,6 +106,7 @@ The public scripts encode the intended defaults:
 - `lorenz63` and `doubling1d` automatically use `--no_localization`.
 - `LOSS=es` in training/evaluation scripts explicitly uses `--es_p 1`.
 - Training scripts use `--no_running_loss`; the CLI default also disables running loss.
+- Training `EPOCHS` defaults to `100`.
 - `SAVE_EPOCH` defaults to `25`, matching the CLI default.
 
 Use `LOCALIZATION=false` to force `--no_localization` on other datasets, or leave
@@ -121,27 +121,27 @@ function, `sigma_y`, test trajectory count/length, `PF_N`, and seed settings.
 Generate per-seed PF caches:
 
 ```bash
-DATASET=lorenz63 SEED=42 PF_N=1000 DRY_RUN=true scripts/gen_pf_results_example.sh
-DATASET=lorenz63 SEED=43 PF_N=1000 DRY_RUN=true scripts/gen_pf_results_example.sh
+DATASET=lorenz63 SEED=42 PF_N=1000 scripts/gen_pf_results_example.sh
+DATASET=lorenz63 SEED=43 PF_N=1000 scripts/gen_pf_results_example.sh
 ```
 
 Process the saved PF caches and write the averaged cache:
 
 ```bash
-DATASET=lorenz63 PF_N=1000 DRY_RUN=true scripts/process_pf_results_example.sh
+DATASET=lorenz63 PF_N=1000 scripts/process_pf_results_example.sh
 ```
 
 Run benchmark or neural evaluation with PF verification:
 
 ```bash
-DATASET=lorenz63 METHOD=ESRF PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 DRY_RUN=true scripts/benchmark_example.sh
-DATASET=lorenz63 CP_LOAD_PATH=save/path/to/checkpoint.pth PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 DRY_RUN=true scripts/evaluate_example.sh
+DATASET=lorenz63 METHOD=ESRF PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 scripts/benchmark_example.sh
+DATASET=lorenz63 CP_LOAD_PATH=save/path/to/checkpoint.pth PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 scripts/evaluate_example.sh
 ```
 
 Grid-search with PF verification also uses the script entry point:
 
 ```bash
-DATASET=lorenz63 METHOD=ESRF PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 DRY_RUN=true scripts/grid_search_example.sh
+DATASET=lorenz63 METHOD=ESRF PF_VERIFICATION=true PF_VERIFICATION_SEED=none PF_N=1000 scripts/grid_search_example.sh
 ```
 
 Grid-search and paper plotting helpers remain in `scripts/` and `psef/plotting/`.

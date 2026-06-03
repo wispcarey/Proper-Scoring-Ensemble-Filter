@@ -25,4 +25,5 @@ Script defaults intentionally match the public experiment setup:
 - `lorenz63` and `doubling1d` use `--no_localization`.
 - Energy-score training/evaluation uses `--es_p 1`.
 - Training/evaluation templates use `--no_running_loss`.
+- Training `EPOCHS` defaults to `100`.
 - Training `SAVE_EPOCH` defaults to `25`.

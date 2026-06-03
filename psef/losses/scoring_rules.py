@@ -469,7 +469,10 @@ def compute_ensemble_rank_histogram(
             - total_samples: int
             - num_bins: int
             - num_projections: int
-            - freq_var: float
+            - freq_var: float, mean normalized per-projection rank-frequency variance
+            - counts_by_projection: Tensor [P, N+1] (CPU, int64)
+            - projection_sample_counts: Tensor [P] (CPU, int64)
+            - freq_var_by_projection: Tensor [P] (CPU, float32)
     """
     if ens_states.ndim != 4 or true_states.ndim != 3:
         raise ValueError(
@@ -511,6 +514,9 @@ def compute_ensemble_rank_histogram(
     if not finite_mask.any():
         empty_counts = torch.zeros(N + 1, dtype=torch.int64)
         empty_probs = torch.full((N + 1,), float("nan"), dtype=torch.float32)
+        empty_counts_by_projection = torch.zeros((P, N + 1), dtype=torch.int64)
+        empty_projection_sample_counts = torch.zeros(P, dtype=torch.int64)
+        empty_freq_var_by_projection = torch.full((P,), float("nan"), dtype=torch.float32)
         return {
             "counts": empty_counts,
             "probabilities": empty_probs,
@@ -518,6 +524,9 @@ def compute_ensemble_rank_histogram(
             "num_bins": int(N + 1),
             "num_projections": P,
             "freq_var": float("nan"),
+            "counts_by_projection": empty_counts_by_projection,
+            "projection_sample_counts": empty_projection_sample_counts,
+            "freq_var_by_projection": empty_freq_var_by_projection,
         }
 
     ens_valid = ens_states[finite_mask]    # [K, N, D]
@@ -530,6 +539,7 @@ def compute_ensemble_rank_histogram(
         tie_gen.manual_seed(int(seed))
 
     counts = torch.zeros(N + 1, device=ens_states.device, dtype=torch.int64)
+    counts_by_projection = torch.zeros(P, N + 1, device=ens_states.device, dtype=torch.int64)
 
     for p in range(P):
         direction = projection_directions[p]                  # [D]
@@ -548,14 +558,23 @@ def compute_ensemble_rank_histogram(
         else:
             ranks = torch.div(rank_low + rank_high, 2, rounding_mode="floor")
 
-        counts += torch.bincount(ranks, minlength=N + 1)
+        counts_p = torch.bincount(ranks, minlength=N + 1)
+        counts_by_projection[p] = counts_p
+        counts += counts_p
 
     total_samples = int(counts.sum().item())
     probs = counts.to(torch.float32) / max(total_samples, 1)
-    if total_samples <= 0:
+    projection_sample_counts = torch.full((P,), K, device=ens_states.device, dtype=torch.int64)
+    freq_var_by_projection = compute_normalized_rank_freq_var_by_projection(
+        counts_by_projection=counts_by_projection,
+        projection_sample_counts=projection_sample_counts,
+        ensemble_size=N,
+    )
+    finite_freq_var = freq_var_by_projection[torch.isfinite(freq_var_by_projection)]
+    if finite_freq_var.numel() == 0:
         freq_var = float("nan")
     else:
-        freq_var = float(torch.var(probs, unbiased=False).item())
+        freq_var = float(torch.mean(finite_freq_var).item())
 
     return {
         "counts": counts.detach().cpu(),
@@ -564,7 +583,50 @@ def compute_ensemble_rank_histogram(
         "num_bins": int(N + 1),
         "num_projections": P,
         "freq_var": freq_var,
+        "counts_by_projection": counts_by_projection.detach().cpu(),
+        "projection_sample_counts": projection_sample_counts.detach().cpu(),
+        "freq_var_by_projection": freq_var_by_projection.detach().cpu(),
     }
+
+
+def compute_normalized_rank_freq_var_by_projection(
+    counts_by_projection,
+    projection_sample_counts,
+    ensemble_size,
+):
+    """
+    Compute per-projection normalized rank-histogram frequency variance.
+
+    For each projection p with N_s valid samples and ensemble size N:
+        Var(counts_p / N_s) * N_s * (N + 1)^2 / N
+    """
+    if counts_by_projection.ndim != 2:
+        raise ValueError(
+            f"counts_by_projection must have shape [P, N+1], got {tuple(counts_by_projection.shape)}"
+        )
+    if projection_sample_counts.ndim != 1 or projection_sample_counts.shape[0] != counts_by_projection.shape[0]:
+        raise ValueError(
+            "projection_sample_counts must have shape [P] matching counts_by_projection"
+        )
+
+    N = int(ensemble_size)
+    if N <= 0:
+        return torch.full(
+            (counts_by_projection.shape[0],),
+            float("nan"),
+            device=counts_by_projection.device,
+            dtype=torch.float32,
+        )
+
+    counts = counts_by_projection.to(torch.float64)
+    samples = projection_sample_counts.to(device=counts.device, dtype=torch.float64)
+    valid = samples > 0
+    out = torch.full((counts.shape[0],), float("nan"), device=counts.device, dtype=torch.float64)
+    if valid.any():
+        probs = counts[valid] / samples[valid].unsqueeze(1)
+        raw_var = torch.var(probs, dim=1, unbiased=False)
+        out[valid] = raw_var * samples[valid] * float((N + 1) ** 2) / float(N)
+    return out.to(torch.float32)
 
 def compute_loss(ens_tensor, batch_v, loss_type, ignore_first=0, end_ind=None, 
                  valid_B_mask=None, norm_p=1, return_sum=False, 

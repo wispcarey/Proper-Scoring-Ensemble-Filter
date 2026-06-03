@@ -2,6 +2,7 @@
 
 from .scoring_rules import (
     compute_ensemble_rank_histogram,
+    compute_normalized_rank_freq_var_by_projection,
     compute_projected_quantile_crps,
     compute_projected_quantile_crps_components,
     compute_quantile_crps_1d,
@@ -14,6 +15,7 @@ from .scoring_rules import (
 
 __all__ = [
     "compute_ensemble_rank_histogram",
+    "compute_normalized_rank_freq_var_by_projection",
     "compute_projected_quantile_crps",
     "compute_projected_quantile_crps_components",
     "compute_quantile_crps_1d",

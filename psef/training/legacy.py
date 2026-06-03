@@ -33,6 +33,7 @@ from psef.losses.scoring_rules import (
     compute_spread_error_ratio,
     compute_spread_error_ratio_minus_1,
     compute_ensemble_rank_histogram,
+    compute_normalized_rank_freq_var_by_projection,
     sample_projection_directions,
     wasserstein2_multivariate_gaussian,
 )
@@ -59,6 +60,36 @@ DYNAMIC_FIXED_LIMITS_3D = {
 }
 PF_CRPS_STATE_DIMS = 3
 PF_CRPS_PCA_DIMS = 3
+
+
+def _accumulate_rank_histogram_stats(
+    rank_stats: Dict[str, Any],
+    rank_counts_total: torch.Tensor,
+    rank_counts_by_projection_total: torch.Tensor,
+    rank_projection_sample_counts_total: torch.Tensor,
+) -> int:
+    """Accumulate aggregate and per-projection rank-histogram counts."""
+    rank_counts_total += rank_stats["counts"].to(dtype=torch.int64)
+    rank_counts_by_projection_total += rank_stats["counts_by_projection"].to(dtype=torch.int64)
+    rank_projection_sample_counts_total += rank_stats["projection_sample_counts"].to(dtype=torch.int64)
+    return int(rank_stats["total_samples"])
+
+
+def _finalize_normalized_rank_freq_var(
+    rank_counts_by_projection_total: torch.Tensor,
+    rank_projection_sample_counts_total: torch.Tensor,
+    ensemble_size: int,
+) -> Tuple[float, List[float]]:
+    """Finalize RHVar as the mean normalized per-projection frequency variance."""
+    rank_freq_var_by_projection = compute_normalized_rank_freq_var_by_projection(
+        counts_by_projection=rank_counts_by_projection_total,
+        projection_sample_counts=rank_projection_sample_counts_total,
+        ensemble_size=ensemble_size,
+    )
+    finite_mask = torch.isfinite(rank_freq_var_by_projection)
+    if not finite_mask.any():
+        return float("nan"), rank_freq_var_by_projection.tolist()
+    return float(rank_freq_var_by_projection[finite_mask].mean().item()), rank_freq_var_by_projection.tolist()
 
 
 def _sample_true_obs_noise_like(ref_tensor: torch.Tensor, test_noise_gen: torch.Generator) -> torch.Tensor:
@@ -3306,6 +3337,8 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
         seed=rank_projection_seed,
     )
     rank_counts_total = torch.zeros(int(args.N) + 1, dtype=torch.int64)
+    rank_counts_by_projection_total = torch.zeros(rank_num_projections, int(args.N) + 1, dtype=torch.int64)
+    rank_projection_sample_counts_total = torch.zeros(rank_num_projections, dtype=torch.int64)
     rank_total_samples = 0
 
     with torch.no_grad():
@@ -3386,8 +3419,12 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     tie_break=rank_tie_break,
                     seed=rank_projection_seed + batch_ind * max(1, len(batch_v)),
                 )
-                rank_counts_total += rank_stats_step0["counts"].to(dtype=torch.int64)
-                rank_total_samples += int(rank_stats_step0["total_samples"])
+                rank_total_samples += _accumulate_rank_histogram_stats(
+                    rank_stats=rank_stats_step0,
+                    rank_counts_total=rank_counts_total,
+                    rank_counts_by_projection_total=rank_counts_by_projection_total,
+                    rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                )
 
             # Time loop
             for i in range(len(batch_v) - 1):
@@ -3541,8 +3578,12 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                         tie_break=rank_tie_break,
                         seed=rank_projection_seed + batch_ind * max(1, len(batch_v)) + (i + 1),
                     )
-                    rank_counts_total += rank_stats_step["counts"].to(dtype=torch.int64)
-                    rank_total_samples += int(rank_stats_step["total_samples"])
+                    rank_total_samples += _accumulate_rank_histogram_stats(
+                        rank_stats=rank_stats_step,
+                        rank_counts_total=rank_counts_total,
+                        rank_counts_by_projection_total=rank_counts_by_projection_total,
+                        rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                    )
 
             # Stack ensembles over time: [T, B, N, d]
             ens_tensor = torch.stack(ens_list) if need_trajectory_cache else None
@@ -3617,8 +3658,12 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
                     tie_break=rank_tie_break,
                     seed=rank_projection_seed + batch_ind,
                 )
-                rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
-                rank_total_samples += int(rank_stats_batch["total_samples"])
+                rank_total_samples += _accumulate_rank_histogram_stats(
+                    rank_stats=rank_stats_batch,
+                    rank_counts_total=rank_counts_total,
+                    rank_counts_by_projection_total=rank_counts_by_projection_total,
+                    rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                )
             
             # Aggregate metrics
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
@@ -3880,18 +3925,26 @@ def test_model(loader, model_list, args, infl=1, H_info=None, plot_figures=True,
 
     if rank_total_samples > 0:
         rank_probs = rank_counts_total.to(torch.float64) / float(rank_total_samples)
-        rank_freq_var = torch.var(rank_probs, unbiased=False)
+        rank_freq_var, rank_freq_var_by_projection = _finalize_normalized_rank_freq_var(
+            rank_counts_by_projection_total=rank_counts_by_projection_total,
+            rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+            ensemble_size=int(args.N),
+        )
 
         final_metrics['rank_hist_counts'] = rank_counts_total.tolist()
         final_metrics['rank_hist_probs'] = rank_probs.to(torch.float32).tolist()
         final_metrics['rank_total_samples'] = int(rank_total_samples)
         final_metrics['rank_num_projections'] = int(rank_num_projections)
-        final_metrics['rank_freq_var'] = float(rank_freq_var.item())
+        final_metrics['rank_projection_sample_counts'] = rank_projection_sample_counts_total.tolist()
+        final_metrics['rank_freq_var_by_projection'] = rank_freq_var_by_projection
+        final_metrics['rank_freq_var'] = rank_freq_var
     else:
         final_metrics['rank_hist_counts'] = [0 for _ in range(int(args.N) + 1)]
         final_metrics['rank_hist_probs'] = [float('nan') for _ in range(int(args.N) + 1)]
         final_metrics['rank_total_samples'] = 0
         final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_projection_sample_counts'] = [0 for _ in range(int(rank_num_projections))]
+        final_metrics['rank_freq_var_by_projection'] = [float('nan') for _ in range(int(rank_num_projections))]
         final_metrics['rank_freq_var'] = float('nan')
 
     # ---- NEW: compute analysis-step timing stats and attach to final_metrics ----
@@ -4030,7 +4083,16 @@ def print_test_results(results):
         rank_total = results.get('rank_total_samples', 0)
         rank_proj = results.get('rank_num_projections', None)
         rank_proj_str = f", projections={rank_proj}" if rank_proj is not None else ""
-        print(f"Rank-Hist FreqVar: {results['rank_freq_var']:.4f}{rank_proj_str}, samples={rank_total}")
+        rank_projection_samples = results.get('rank_projection_sample_counts', None)
+        if isinstance(rank_projection_samples, (list, tuple)) and len(rank_projection_samples) > 0:
+            unique_samples = sorted({int(x) for x in rank_projection_samples})
+            if len(unique_samples) == 1:
+                sample_str = f", samples_per_projection={unique_samples[0]}, total_rank_entries={rank_total}"
+            else:
+                sample_str = f", samples_per_projection={list(rank_projection_samples)}, total_rank_entries={rank_total}"
+        else:
+            sample_str = f", total_rank_entries={rank_total}"
+        print(f"Rank-Hist FreqVar: {results['rank_freq_var']:.4f}{rank_proj_str}{sample_str}")
     if 'rank_hist_probs' in results:
         probs = results['rank_hist_probs']
         if isinstance(probs, (list, tuple)) and len(probs) <= 32:
@@ -4208,6 +4270,8 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
         seed=rank_projection_seed,
     )
     rank_counts_total = torch.zeros(int(args.N) + 1, dtype=torch.int64)
+    rank_counts_by_projection_total = torch.zeros(rank_num_projections, int(args.N) + 1, dtype=torch.int64)
+    rank_projection_sample_counts_total = torch.zeros(rank_num_projections, dtype=torch.int64)
     rank_total_samples = 0
 
     with torch.no_grad():
@@ -4288,8 +4352,12 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     tie_break=rank_tie_break,
                     seed=rank_projection_seed + batch_ind * max(1, len(batch_v)),
                 )
-                rank_counts_total += rank_stats_step0["counts"].to(dtype=torch.int64)
-                rank_total_samples += int(rank_stats_step0["total_samples"])
+                rank_total_samples += _accumulate_rank_histogram_stats(
+                    rank_stats=rank_stats_step0,
+                    rank_counts_total=rank_counts_total,
+                    rank_counts_by_projection_total=rank_counts_by_projection_total,
+                    rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                )
 
             # Time loop
             for i in tqdm(
@@ -4473,8 +4541,12 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                         tie_break=rank_tie_break,
                         seed=rank_projection_seed + batch_ind * max(1, len(batch_v)) + (i + 1),
                     )
-                    rank_counts_total += rank_stats_step["counts"].to(dtype=torch.int64)
-                    rank_total_samples += int(rank_stats_step["total_samples"])
+                    rank_total_samples += _accumulate_rank_histogram_stats(
+                        rank_stats=rank_stats_step,
+                        rank_counts_total=rank_counts_total,
+                        rank_counts_by_projection_total=rank_counts_by_projection_total,
+                        rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                    )
 
                 # ---- NEW: stop timing and record ----
                 t1 = time.perf_counter()
@@ -4558,8 +4630,12 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
                     tie_break=rank_tie_break,
                     seed=rank_projection_seed + batch_ind,
                 )
-                rank_counts_total += rank_stats_batch["counts"].to(dtype=torch.int64)
-                rank_total_samples += int(rank_stats_batch["total_samples"])
+                rank_total_samples += _accumulate_rank_histogram_stats(
+                    rank_stats=rank_stats_batch,
+                    rank_counts_total=rank_counts_total,
+                    rank_counts_by_projection_total=rank_counts_by_projection_total,
+                    rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+                )
 
             all_results['rmse'] = torch.cat((all_results['rmse'], rmse_val))
             all_results['rrmse'] = torch.cat((all_results['rrmse'], rrmse_val))
@@ -4791,18 +4867,26 @@ def test_ClassicFilter(loader, args, infl=1, H_info=None, plot_figures=True, fig
 
     if rank_total_samples > 0:
         rank_probs = rank_counts_total.to(torch.float64) / float(rank_total_samples)
-        rank_freq_var = torch.var(rank_probs, unbiased=False)
+        rank_freq_var, rank_freq_var_by_projection = _finalize_normalized_rank_freq_var(
+            rank_counts_by_projection_total=rank_counts_by_projection_total,
+            rank_projection_sample_counts_total=rank_projection_sample_counts_total,
+            ensemble_size=int(args.N),
+        )
 
         final_metrics['rank_hist_counts'] = rank_counts_total.tolist()
         final_metrics['rank_hist_probs'] = rank_probs.to(torch.float32).tolist()
         final_metrics['rank_total_samples'] = int(rank_total_samples)
         final_metrics['rank_num_projections'] = int(rank_num_projections)
-        final_metrics['rank_freq_var'] = float(rank_freq_var.item())
+        final_metrics['rank_projection_sample_counts'] = rank_projection_sample_counts_total.tolist()
+        final_metrics['rank_freq_var_by_projection'] = rank_freq_var_by_projection
+        final_metrics['rank_freq_var'] = rank_freq_var
     else:
         final_metrics['rank_hist_counts'] = [0 for _ in range(int(args.N) + 1)]
         final_metrics['rank_hist_probs'] = [float('nan') for _ in range(int(args.N) + 1)]
         final_metrics['rank_total_samples'] = 0
         final_metrics['rank_num_projections'] = int(rank_num_projections)
+        final_metrics['rank_projection_sample_counts'] = [0 for _ in range(int(rank_num_projections))]
+        final_metrics['rank_freq_var_by_projection'] = [float('nan') for _ in range(int(rank_num_projections))]
         final_metrics['rank_freq_var'] = float('nan')
 
     # ---- NEW: compute timing stats and attach to final_metrics ----

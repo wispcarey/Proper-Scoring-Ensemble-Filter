@@ -64,6 +64,8 @@ LEGACY_ALIAS_METRIC_KEYS = {
 NON_SCALAR_RESULT_KEYS = {
     "rank_hist_counts",
     "rank_hist_probs",
+    "rank_projection_sample_counts",
+    "rank_freq_var_by_projection",
 }
 NON_CSV_NUMERIC_RESULT_KEYS = {
     "valid_traj_count",
